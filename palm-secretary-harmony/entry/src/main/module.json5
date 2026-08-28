@@ -27,10 +27,10 @@
             "entities": ["entity.system.default"],
             "actions": ["ohos.want.action.sendData"],
             "uris": [
-              { "type": "general.file" },
-              { "type": "general.image" },
-              { "type": "general.video" },
-              { "type": "general.text" }
+              { "scheme": "file", "utd": "general.object", "maxFileSupported": 1 },
+              { "scheme": "file", "utd": "general.image", "maxFileSupported": 1 },
+              { "scheme": "file", "utd": "general.video", "maxFileSupported": 1 },
+              { "scheme": "file", "utd": "general.plain-text", "maxFileSupported": 1 }
             ]
           }
         ]

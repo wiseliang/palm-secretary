@@ -6,7 +6,7 @@ HarmonyOS NEXT 原生 HAP 客户端，使用 ArkTS、ArkUI 与 ArkWeb，连接�
 
 ## 当前版本
 
-`0.1.0` 工程骨架，已实现：
+`0.1.1`，已实现：
 
 - HarmonyOS Stage 模型与 EntryAbility
 - ArkWeb 安全加载 HTTPS 页面
@@ -15,17 +15,19 @@ HarmonyOS NEXT 原生 HAP 客户端，使用 ArkTS、ArkUI 与 ArkWeb，连接�
 - 原生加载进度、离线页、重试
 - 返回键浏览历史
 - 回到前台时触发网页 `palm-resume` 同步
-- 声明接收系统分享的文件/图片/视频/文本入口
+- 接收系统分享的单个文件/图片/视频/文本
+- 通过受限原生临时资源把分享文件送入网页附件区
+- 分享文件读取失败与超过 100MB 时显示明确提示
 
 ## 尚需 DevEco Studio 真机完成
 
 本机尚未安装 DevEco Studio/HarmonyOS SDK，因此以下能力已预留但必须在 DevEco 中按目标 API 校准并真机验证：
 
 1. ArkWeb `onShowFileSelector` 与 Core File Kit 多文件选择。
-2. 系统分享 Want 中的单/多 URI 解析，并通过安全原生桥交给网页上传。
+2. 系统分享 Want 中的多 URI 解析（单文件分享已实现）。
 3. 下载流写入应用沙箱，再通过 SaveButton/文档选择器保存到用户指定位置。
 4. Push Kit 或本地通知显示任务完成/失败。
-5. 应用签名、HAP/APP 打包及真机安装。
+5. 分享与下载仍需真机覆盖不同来源应用进行验证。
 
 ## 打开方式
 

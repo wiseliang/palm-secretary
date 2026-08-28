@@ -745,9 +745,17 @@ export default function Home() {
       }
     };
     const listener = (event: Event) => { void consumeSharedFiles(event); };
+    const errorListener = (event: Event) => {
+      const detail = event instanceof CustomEvent ? event.detail : undefined;
+      setNotice(typeof detail === 'string' && detail ? detail : '接收外部分享文件失败，请重试');
+    };
     window.addEventListener('palm-share', listener);
+    window.addEventListener('palm-share-error', errorListener);
     void consumeSharedFiles();
-    return () => window.removeEventListener('palm-share', listener);
+    return () => {
+      window.removeEventListener('palm-share', listener);
+      window.removeEventListener('palm-share-error', errorListener);
+    };
   }, [authenticated, projectId, uploadFiles]);
 
   function dragEnter(event: DragEvent<HTMLElement>) {
