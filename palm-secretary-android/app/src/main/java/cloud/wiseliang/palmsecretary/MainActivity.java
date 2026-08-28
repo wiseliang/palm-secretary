@@ -2,6 +2,10 @@ package cloud.wiseliang.palmsecretary;
 
 import android.app.Activity;
 import android.app.DownloadManager;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.app.PendingIntent;
+import android.Manifest;
 import android.content.ActivityNotFoundException;
 import android.content.ClipData;
 import android.content.Context;
@@ -13,11 +17,13 @@ import android.net.NetworkCapabilities;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.Environment;
+import android.content.pm.PackageManager;
 import android.provider.Settings;
 import android.provider.OpenableColumns;
 import android.view.View;
 import android.webkit.CookieManager;
 import android.webkit.DownloadListener;
+import android.webkit.JavascriptInterface;
 import android.webkit.SslErrorHandler;
 import android.webkit.MimeTypeMap;
 import android.webkit.URLUtil;
@@ -51,10 +57,13 @@ public final class MainActivity extends Activity {
     private static final String APP_URL = "https://ai.wiseliang.cloud/";
     private static final String APP_HOST = "ai.wiseliang.cloud";
     private static final int FILE_CHOOSER_REQUEST = 1001;
+    private static final int NOTIFICATION_PERMISSION_REQUEST = 1002;
+    private static final String TASK_CHANNEL_ID = "palm_tasks";
 
     private WebView webView;
     private ProgressBar progress;
     private ValueCallback<Uri[]> fileCallback;
+    private boolean resumed;
     private final Map<String, SharedFile> sharedFiles = new LinkedHashMap<>();
 
     private static final class SharedFile {
@@ -80,6 +89,7 @@ public final class MainActivity extends Activity {
         webView = findViewById(R.id.web_view);
         progress = findViewById(R.id.progress);
         configureWebView();
+        configureNotifications();
         receiveSharedIntent(getIntent());
 
         if (savedInstanceState == null) {
@@ -103,10 +113,11 @@ public final class MainActivity extends Activity {
         settings.setAllowContentAccess(true);
         settings.setMixedContentMode(WebSettings.MIXED_CONTENT_NEVER_ALLOW);
         settings.setMediaPlaybackRequiresUserGesture(true);
-        settings.setUserAgentString(settings.getUserAgentString() + " PalmSecretaryAndroid/0.3.0");
+        settings.setUserAgentString(settings.getUserAgentString() + " PalmSecretaryAndroid/0.3.2");
         if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
             settings.setSafeBrowsingEnabled(true);
         }
+        webView.addJavascriptInterface(new TaskNotificationBridge(), "PalmNative");
 
         webView.setWebViewClient(new WebViewClient() {
             @Override
@@ -197,6 +208,43 @@ public final class MainActivity extends Activity {
         });
 
         webView.setDownloadListener(createDownloadListener());
+    }
+
+    private void configureNotifications() {
+        NotificationManager manager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+        manager.createNotificationChannel(new NotificationChannel(TASK_CHANNEL_ID, "任务进度", NotificationManager.IMPORTANCE_DEFAULT));
+        if (android.os.Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, NOTIFICATION_PERMISSION_REQUEST);
+        }
+    }
+
+    private final class TaskNotificationBridge {
+        @JavascriptInterface
+        public void notifyTask(String status) {
+            if (resumed) return;
+            String title = "任务已完成";
+            String message = "掌心助理已完成服务器任务";
+            if ("failed".equals(status)) {
+                title = "任务执行失败";
+                message = "打开掌心助理查看错误并重试";
+            } else if ("interrupted".equals(status)) {
+                title = "任务已停止";
+                message = "打开掌心助理查看当前结果";
+            }
+            Intent intent = new Intent(MainActivity.this, MainActivity.class)
+                .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+            PendingIntent pendingIntent = PendingIntent.getActivity(MainActivity.this, 0, intent,
+                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+            android.app.Notification notification = new android.app.Notification.Builder(MainActivity.this, TASK_CHANNEL_ID)
+                .setSmallIcon(R.drawable.app_icon)
+                .setContentTitle(title)
+                .setContentText(message)
+                .setContentIntent(pendingIntent)
+                .setAutoCancel(true)
+                .build();
+            NotificationManager manager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+            manager.notify((int) (System.currentTimeMillis() & 0x7fffffff), notification);
+        }
     }
 
     private DownloadListener createDownloadListener() {
@@ -397,6 +445,7 @@ public final class MainActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
+        resumed = true;
         if (webView != null) {
             webView.onResume();
             webView.resumeTimers();
@@ -407,6 +456,7 @@ public final class MainActivity extends Activity {
 
     @Override
     protected void onPause() {
+        resumed = false;
         if (webView != null) webView.onPause();
         super.onPause();
     }

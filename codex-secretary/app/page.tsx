@@ -20,6 +20,7 @@ type DeliveryState = 'idle' | 'sending' | 'accepted';
 declare global {
   interface Window {
     __PALM_SHARED_FILES__?: NativeSharedFile[];
+    PalmNative?: { notifyTask?: (status: 'completed' | 'failed' | 'interrupted') => void };
   }
 }
 
@@ -516,6 +517,8 @@ export default function Home() {
           });
         }
         if (['turn/completed', 'turn/failed', 'turn/interrupted'].includes(String(rpc.method))) {
+          const notificationStatus = rpc.method === 'turn/failed' ? 'failed' : rpc.method === 'turn/interrupted' ? 'interrupted' : 'completed';
+          try { window.PalmNative?.notifyTask?.(notificationStatus); } catch { /* 原生桥不可用时保持网页流程 */ }
           setDeliveryState('idle');
           runningRef.current = false; setRunning(false); setTurnId(undefined);
           const terminalText = rpc.method === 'turn/interrupted' ? '任务已停止。' : rpc.method === 'turn/failed' ? '任务执行失败，请在记录中重试。' : '';
