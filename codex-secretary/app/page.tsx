@@ -2,7 +2,8 @@
 
 import { DragEvent, FormEvent, ReactNode, useCallback, useEffect, useRef, useState } from 'react';
 
-type ChatMessage = { id: string; role: 'user' | 'assistant'; text: string; pending?: boolean; attachments?: UploadedFile[] };
+type ExecutionStep = { id: string; label: string; detail?: string; status: 'running' | 'completed' | 'failed' };
+type ChatMessage = { id: string; role: 'user' | 'assistant'; text: string; pending?: boolean; attachments?: UploadedFile[]; steps?: ExecutionStep[] };
 type UploadedFile = { name: string; path: string; size?: number; modifiedAt?: string };
 type Project = { id: string; name: string; createdAt: string; updatedAt: string; model?: string; reasoningEffort?: string };
 type ProjectThread = { threadId: string; title: string; updatedAt: string };
@@ -265,24 +266,58 @@ function textFromContent(value: unknown): string {
   }).filter(Boolean).join('\n');
 }
 
+function executionStep(itemValue: unknown, completed = false): ExecutionStep | undefined {
+  if (!itemValue || typeof itemValue !== 'object') return;
+  const item = itemValue as Record<string, unknown>;
+  const type = String(item.type ?? '');
+  const id = String(item.id ?? item.itemId ?? crypto.randomUUID());
+  const command = Array.isArray(item.command) ? item.command.join(' ') : String(item.command ?? '');
+  const changes = Array.isArray(item.changes) ? item.changes as Array<Record<string, unknown>> : [];
+  const fileDetail = changes.map((change) => String(change.path ?? '')).filter(Boolean).join('、');
+  const labels: Record<string, string> = {
+    commandExecution: '执行命令', fileChange: '修改文件', mcpToolCall: '调用工具', webSearch: '搜索资料',
+    imageGeneration: '生成图片', reasoning: '分析任务', dynamicToolCall: '调用扩展工具', plan: '更新计划',
+  };
+  const label = labels[type];
+  if (!label) return;
+  const exitCode = typeof item.exitCode === 'number' ? item.exitCode : undefined;
+  const status = completed ? exitCode !== undefined && exitCode !== 0 ? 'failed' : 'completed' : 'running';
+  const detail = command || fileDetail || String(item.tool ?? item.server ?? item.query ?? '');
+  return { id, label, detail: detail || undefined, status };
+}
+
+function mergeExecutionStep(steps: ExecutionStep[] | undefined, step: ExecutionStep): ExecutionStep[] {
+  const current = steps ?? [];
+  const index = current.findIndex((item) => item.id === step.id);
+  return index < 0 ? [...current, step] : current.map((item, itemIndex) => itemIndex === index ? { ...item, ...step } : item);
+}
+
 function messagesFromThread(value: unknown): ChatMessage[] {
   const root = (value && typeof value === 'object' ? value : {}) as Record<string, unknown>;
   const thread = (root.thread && typeof root.thread === 'object' ? root.thread : root) as Record<string, unknown>;
   const turns = Array.isArray(thread.turns) ? thread.turns : [];
   const result: ChatMessage[] = [];
   for (const turn of turns) {
+    const turnStart = result.length;
+    let turnSteps: ExecutionStep[] = [];
     const items = turn && typeof turn === 'object' && Array.isArray((turn as Record<string, unknown>).items) ? (turn as Record<string, unknown>).items as unknown[] : [];
     for (const item of items) {
       if (!item || typeof item !== 'object') continue;
       const record = item as Record<string, unknown>;
       const type = String(record.type ?? '');
       const text = String(record.text ?? record.message ?? '') || textFromContent(record.content);
+      const step = executionStep(record, true);
+      if (step) turnSteps = mergeExecutionStep(turnSteps, step);
       if (!text) continue;
       if (type === 'userMessage') {
         const parsed = parseUserMessage(text);
         result.push({ id: crypto.randomUUID(), role: 'user', text: parsed.text, attachments: parsed.attachments });
       }
       if (type === 'agentMessage') result.push({ id: crypto.randomUUID(), role: 'assistant', text });
+    }
+    if (turnSteps.length) {
+      const assistantIndex = result.findLastIndex((message, index) => index >= turnStart && message.role === 'assistant');
+      if (assistantIndex >= turnStart) result[assistantIndex] = { ...result[assistantIndex], steps: turnSteps };
     }
   }
   return result;
@@ -504,6 +539,18 @@ export default function Home() {
         }
         if (message.type !== 'codex.event' || !message.payload) return;
         const rpc = message.payload as { method?: string; params?: Record<string, unknown> };
+        if (rpc.method === 'item/started' || rpc.method === 'item/completed') {
+          const step = executionStep(rpc.params?.item, rpc.method === 'item/completed');
+          if (step) setMessages((items) => {
+            let updated = false;
+            const next = items.map((item) => {
+              if (item.role !== 'assistant' || !item.pending) return item;
+              updated = true;
+              return { ...item, steps: mergeExecutionStep(item.steps, step) };
+            });
+            return updated ? next : [...items, { id: crypto.randomUUID(), role: 'assistant', text: '', pending: true, steps: [step] }];
+          });
+        }
         if (rpc.method === 'item/agentMessage/delta') {
           const delta = String(rpc.params?.delta ?? '');
           setMessages((items) => {
@@ -812,7 +859,7 @@ export default function Home() {
       {(connection !== '已连接' || status.disk?.warning) && <section className={`system-alert ${status.disk?.tasksPaused ? 'critical' : ''}`} role="status"><strong>{connection !== '已连接' ? `Codex ${connection}` : status.disk?.tasksPaused ? '服务器空间不足，已暂停新任务和上传' : '服务器磁盘空间偏低'}</strong><span>{connection !== '已连接' ? '连接恢复后会自动同步当前任务' : `${bytes(status.disk?.freeBytes)} 可用 · 建议尽快清理旧版本`}</span></section>}
       {view === 'history' && <div className="panel-stage"><div className="panel-title"><div><p className="eyebrow">任务中心</p><h2>{activeProject?.name ?? '当前项目'}</h2></div><div className="panel-title-actions"><button className="secondary" onClick={() => void renameProject()}>重命名</button><button onClick={newConversation}>＋ 新对话</button></div></div><div className="panel-search"><input value={recordSearch} onChange={(event) => setRecordSearch(event.target.value)} placeholder="搜索任务或对话" aria-label="搜索任务或对话" /><span>{matchingTasks.length} 个任务</span></div>{matchingTasks.length > 0 && <section className="task-section"><div className="section-heading"><strong>最近任务</strong><span>点击后定位到对应消息</span></div><div className="task-list">{matchingTasks.map((task) => <article key={task.taskId} className={`task-card ${task.status}`}><button className="task-main" onClick={() => { const thread = threads.find((item) => item.threadId === task.threadId); if (thread) void openThread(thread, task.title); }}><span className="task-state">{task.status === 'running' ? <i /> : task.status === 'completed' ? '✓' : task.status === 'interrupted' ? '■' : '!'}</span><span className="task-copy"><strong>{task.title}</strong><small>{new Date(task.startedAt).toLocaleString('zh-CN')} · {taskDuration(task)} · 附件 {task.attachments?.length ?? 0} · 成果 {task.outputPaths?.length ?? 0}{task.errorMessage ? ` · ${task.errorMessage}` : ''}</small></span><b>{taskStatusLabel(task.status)}</b></button>{((task.outputPaths?.length ?? 0) > 0 || ['failed', 'interrupted'].includes(task.status)) && <div className="task-actions">{task.outputPaths?.map((outputPath) => { const query = new URLSearchParams({ projectId, path: outputPath }); return <a key={outputPath} href={`/api/files/download?${query}`}>↓ {outputPath.split('/').pop()}</a>; })}{['failed', 'interrupted'].includes(task.status) && <button onClick={() => void retryTask(task)}>重新执行</button>}</div>}</article>)}</div></section>}<section className="thread-section"><div className="section-heading"><strong>对话记录</strong><span>{recordSearch.trim() ? `${matchingThreads.length} 条匹配` : `最近 ${visibleThreads.length} 条`} · 点击或双击均可定位</span></div>{visibleThreads.length ? <div className="record-list">{visibleThreads.map((thread) => <button key={thread.threadId} onClick={() => void openThread(thread)}><strong>{thread.title}</strong><span>{new Date(thread.updatedAt).toLocaleString('zh-CN')}</span></button>)}</div> : <div className="empty-panel">没有匹配的对话。</div>}</section></div>}
       {view === 'files' && <div className="panel-stage"><div className="panel-title"><div><p className="eyebrow">项目文件</p><h2>{activeProject?.name ?? '当前项目'}的文件</h2></div><button onClick={() => fileRef.current?.click()} disabled={uploading}>{uploading ? '上传中…' : '＋ 上传'}</button></div><div className="file-toolbar"><div className="file-filters"><button className={fileKind === 'all' ? 'active' : ''} onClick={() => setFileKind('all')}>全部</button><button className={fileKind === 'inbox' ? 'active' : ''} onClick={() => setFileKind('inbox')}>上传</button><button className={fileKind === 'outbox' ? 'active' : ''} onClick={() => setFileKind('outbox')}>成果</button></div><input value={fileSearch} onChange={(event) => setFileSearch(event.target.value)} placeholder="搜索文件" aria-label="搜索文件" /></div>{notice && <button className="panel-notice" onClick={() => setNotice('')}>✓ {notice}<span>×</span></button>}{uploadFeedbacks.length > 0 && <div className="panel-upload-feedback">{uploadFeedbacks.map((item) => <UploadCard key={item.uploadId} item={item} onRetry={() => void upload(item.file, item.uploadId)} onDismiss={() => setUploadFeedbacks((items) => items.filter((entry) => entry.uploadId !== item.uploadId))} />)}</div>}{matchingFiles.length ? <div className="file-list">{matchingFiles.map((file) => { const query = new URLSearchParams({ projectId, path: file.path }); return <article key={file.path}><div><span className={`file-kind ${file.path.startsWith('outbox/') ? 'output' : ''}`}>{file.path.startsWith('outbox/') ? '成果' : '上传'}</span><strong>{file.name}</strong><span>{bytes(file.size)}{file.modifiedAt ? ` · ${new Date(file.modifiedAt).toLocaleString('zh-CN')}` : ''}</span></div><div>{canPreview(file.name) && <a href={`/api/files/preview?${query}`} target="_blank" rel="noreferrer">预览</a>}<a href={`/api/files/download?${query}`}>下载</a><button onClick={() => void deleteFile(file)}>删除</button></div></article>; })}</div> : <div className="empty-panel">没有匹配的文件。</div>}</div>}
-      {view === 'chat' && <div className="message-stage"><div className="date-divider"><span>{activeProject?.name ?? '当前项目'}</span></div>{messages.length === 0 ? <><article className="assistant-message"><div className="assistant-seal">掌</div><div className="message-copy"><p className="eyebrow">独立项目工作台</p><h2>今天想先处理什么？</h2><p className="lede">上传的文件会真实保存到当前项目，并把服务器路径交给 Codex 读取。不同项目拥有独立目录和对话记录。</p><div className="starter-grid">{starterTasks.map((task) => <button key={task} onClick={() => { setDraft(task); window.localStorage.setItem(`palm:draft:${projectId}`, task); }}>{task}<span>↗</span></button>)}</div></div></article><section className={`status-card ${status.disk?.warning ? "warning" : ""}`} aria-label="服务器状态"><div><span className="status-icon">{status.disk?.warning ? "!" : "✓"}</span><div><strong>{status.disk?.tasksPaused ? "空间不足，已暂停新任务" : status.disk?.warning ? "磁盘空间偏低" : "完全访问模式已启用"}</strong><p>{bytes(status.disk?.freeBytes)} 可用 · {status.disk?.warning ? "建议清理旧版本" : "常规操作无需审批"}</p></div></div><button onClick={() => void loadDashboard()}>刷新</button></section></> : <section className="chat-list" aria-live="polite">{messages.map((message) => <article key={message.id} data-message-id={message.id} className={`chat-bubble ${message.role} ${focusedMessageId === message.id ? 'message-focus' : ''}`}><span>{message.role === 'assistant' ? '掌' : '我'}</span><div>{message.text ? <MessageContent text={message.text} projectId={projectId} files={files} /> : message.pending ? '正在思考…' : ''}{message.attachments?.length ? <div className="message-files">{message.attachments.map((file) => <SentFileCard key={file.path} file={file} projectId={projectId} />)}</div> : null}{message.pending && <i className="typing-dot" />}{message.role === 'assistant' && message.text && !message.pending && <button type="button" className="copy-message" onClick={() => void copyMessage(message.text)}>复制</button>}</div></article>)}</section>}</div>}
+      {view === 'chat' && <div className="message-stage"><div className="date-divider"><span>{activeProject?.name ?? '当前项目'}</span></div>{messages.length === 0 ? <><article className="assistant-message"><div className="assistant-seal">掌</div><div className="message-copy"><p className="eyebrow">独立项目工作台</p><h2>今天想先处理什么？</h2><p className="lede">上传的文件会真实保存到当前项目，并把服务器路径交给 Codex 读取。不同项目拥有独立目录和对话记录。</p><div className="starter-grid">{starterTasks.map((task) => <button key={task} onClick={() => { setDraft(task); window.localStorage.setItem(`palm:draft:${projectId}`, task); }}>{task}<span>↗</span></button>)}</div></div></article><section className={`status-card ${status.disk?.warning ? "warning" : ""}`} aria-label="服务器状态"><div><span className="status-icon">{status.disk?.warning ? "!" : "✓"}</span><div><strong>{status.disk?.tasksPaused ? "空间不足，已暂停新任务" : status.disk?.warning ? "磁盘空间偏低" : "完全访问模式已启用"}</strong><p>{bytes(status.disk?.freeBytes)} 可用 · {status.disk?.warning ? "建议清理旧版本" : "常规操作无需审批"}</p></div></div><button onClick={() => void loadDashboard()}>刷新</button></section></> : <section className="chat-list" aria-live="polite">{messages.map((message) => <article key={message.id} data-message-id={message.id} className={`chat-bubble ${message.role} ${focusedMessageId === message.id ? 'message-focus' : ''}`}><span>{message.role === 'assistant' ? '掌' : '我'}</span><div>{message.steps?.length ? <details className="execution-card"><summary><span>执行过程</span><small>{message.steps.filter((step) => step.status === 'completed').length}/{message.steps.length} 步</small></summary><div>{message.steps.map((step) => <article key={step.id} className={`execution-step ${step.status}`}><b>{step.status === 'running' ? '·' : step.status === 'failed' ? '!' : '✓'}</b><span><strong>{step.label}</strong>{step.detail && <small title={step.detail}>{step.detail}</small>}</span></article>)}</div></details> : null}{message.text ? <MessageContent text={message.text} projectId={projectId} files={files} /> : message.pending && !message.steps?.length ? '正在思考…' : ''}{message.attachments?.length ? <div className="message-files">{message.attachments.map((file) => <SentFileCard key={file.path} file={file} projectId={projectId} />)}</div> : null}{message.pending && <i className="typing-dot" />}{message.role === 'assistant' && message.text && !message.pending && <button type="button" className="copy-message" onClick={() => void copyMessage(message.text)}>复制</button>}</div></article>)}</section>}</div>}
       <footer className={`composer-wrap ${view !== 'chat' ? 'composer-hidden' : ''}`}>{notice && <button className="notice" onClick={() => setNotice('')}>{notice} ×</button>}{recentOutputs.length > 0 && <div className="output-row"><span>最新成果</span>{recentOutputs.map((file) => { const query = new URLSearchParams({ projectId, path: file.path }); return <a key={file.path} href={`/api/files/download?${query}`}>↓ {file.name}</a>; })}</div>}{(uploadFeedbacks.length > 0 || attachments.length > 0) && <div className="attachment-tray">{uploadFeedbacks.map((item) => <UploadCard key={item.uploadId} item={item} onRetry={() => void upload(item.file, item.uploadId)} onDismiss={() => setUploadFeedbacks((items) => items.filter((entry) => entry.uploadId !== item.uploadId))} />)}{attachments.map((file) => <AttachedFileCard key={file.path} file={file} onRemove={() => setAttachments((items) => items.filter((item) => item.path !== file.path))} />)}</div>}<form className="composer" onSubmit={sendTask}><input ref={fileRef} type="file" multiple hidden disabled={uploading} onChange={(event) => { void uploadFiles(event.target.files); event.target.value = ''; }} /><div className="composer-actions"><button type="button" className="round-button" aria-label="添加文件" title="选择文件或直接拖入" onClick={() => fileRef.current?.click()} disabled={uploading}>＋</button><button type="button" className="round-button camera-button" aria-label="选择图片" onClick={() => fileRef.current?.click()} disabled={uploading}>▣</button></div><textarea value={draft} onChange={(event) => { const value = event.target.value; setDraft(value); if (value) window.localStorage.setItem(`palm:draft:${projectId}`, value); else window.localStorage.removeItem(`palm:draft:${projectId}`); }} placeholder={running ? '任务执行中…' : '交代一个任务……'} rows={1} aria-label="任务内容" />{running ? <button type="button" className="stop-button" aria-label="停止任务" onClick={interrupt}>■</button> : <button type="submit" className="send-button" disabled={uploading || (!draft.trim() && !attachments.length) || connection !== '已连接'} aria-label="发送">↑</button>}</form><p className={`composer-note delivery-${deliveryState}`}><span className="desktop-upload-hint">可拖入文件 · </span>{deliveryState === 'sending' ? '正在发送，断线后会安全续传' : deliveryState === 'accepted' ? '服务器已接收，Codex 正在执行' : '草稿按项目保存 · 附件发送时会交给 Codex 读取'}</p></footer>
     </section>
   </main>;

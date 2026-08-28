@@ -464,6 +464,21 @@ button:not(:disabled):active, a[href]:active { transform: translateY(1px) scale(
 .chat-list { width: min(100%, 800px); margin-inline: auto; }
 .chat-bubble.assistant > div { padding-right: 28px; }
 .chat-bubble.user > div { padding: 12px 15px; }
+.execution-card { margin: 0 0 12px; border: 1px solid rgba(31,42,68,.1); border-radius: 12px; background: rgba(255,255,255,.58); overflow: hidden; }
+.execution-card summary { display: flex; align-items: center; justify-content: space-between; min-height: 38px; padding: 8px 11px; cursor: pointer; color: var(--ink); font-size: 11px; font-weight: 750; list-style: none; }
+.execution-card summary::-webkit-details-marker { display: none; }
+.execution-card summary::before { content: '›'; margin-right: 7px; color: var(--muted); transform: rotate(0); transition: transform .15s ease; }
+.execution-card[open] summary::before { transform: rotate(90deg); }
+.execution-card summary span { margin-right: auto; }
+.execution-card summary small { color: var(--muted); font-weight: 600; }
+.execution-card > div { border-top: 1px solid rgba(31,42,68,.08); padding: 4px 10px 8px; }
+.execution-step { display: grid; grid-template-columns: 16px minmax(0,1fr); gap: 6px; align-items: start; padding: 7px 0; }
+.execution-step b { color: var(--jade); text-align: center; }
+.execution-step.running b { animation: pulse 1.1s ease-in-out infinite; }
+.execution-step.failed b { color: #b54747; }
+.execution-step span { min-width: 0; display: grid; gap: 2px; }
+.execution-step strong { font-size: 11px; font-weight: 700; }
+.execution-step small { overflow: hidden; color: var(--muted); font: 10px/1.45 ui-monospace, SFMono-Regular, Consolas, monospace; text-overflow: ellipsis; white-space: nowrap; }
 .copy-message { opacity: 0; transform: translateY(-2px); }
 .chat-bubble:hover .copy-message, .copy-message:focus-visible { opacity: 1; transform: none; }
 .panel-stage { max-width: 1040px; }
