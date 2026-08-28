@@ -8,6 +8,7 @@ import { mkdir, readdir, rename, rm, stat, statfs } from 'node:fs/promises';
 import path from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { randomUUID } from 'node:crypto';
+import { isIP } from 'node:net';
 import { z } from 'zod';
 import { config } from './config.js';
 import { createSession, verifyPassword, verifySession } from './auth.js';
@@ -21,6 +22,8 @@ const sockets = new Set<SocketLike>();
 const threadSockets = new Map<string, Set<SocketLike>>();
 const loadedThreads = new Set<string>();
 const loginAttempts = new Map<string, { count: number; resetAt: number }>();
+type TurnAcceptance = { threadId: string; payload: { turn?: { id?: string } }; replayed?: boolean; clientRequestId: string };
+const pendingTurnRequests = new Map<string, Promise<TurnAcceptance | undefined>>();
 const projects = new ProjectStore(config.workspace);
 const OUTPUT_INSTRUCTIONS = `你运行在掌心助理的独立项目工作区。用户不需要知道目录约定。只要任务产生可下载成果（文档、表格、演示文稿、PDF、图片、压缩包、代码包或其他文件），你必须主动把最终版本保存到当前工作目录的 outbox/，使用清晰中文文件名，并在最终回复中说明文件名。若成果是需要直接查看或扫码的图片，最终回复中还必须单独写一行 Markdown 图片语法：![图片说明](outbox/实际文件名.png)，路径必须与真实文件完全一致；掌心助理会在聊天中直接显示该图片。不要要求用户说出 outbox，也不要只在聊天中声称已生成而不实际写入。纯问答无需强行创建文件。用户上传的附件位于 inbox/。`;
 type CodexModel = { id: string; model: string; displayName: string; description: string; isDefault: boolean; hidden?: boolean; supportedReasoningEfforts: Array<{ reasoningEffort: string; description: string }>; defaultReasoningEffort: string };
@@ -59,6 +62,12 @@ function requireOwner(request: FastifyRequest, reply: FastifyReply): boolean {
     return false;
   }
   return true;
+}
+
+function loginRateLimitKey(request: FastifyRequest): string {
+  const cloudflareIp = request.headers['cf-connecting-ip'];
+  if (typeof cloudflareIp === 'string' && isIP(cloudflareIp.trim())) return cloudflareIp.trim();
+  return request.ip;
 }
 
 async function diskInfo() {
@@ -134,7 +143,7 @@ app.get('/api/health', async () => ({ ok: true }));
 app.post('/api/auth/login', async (request, reply) => {
   if (!originAllowed(request)) return reply.code(403).send({ error: '来源校验失败' });
   if (!config.passwordHash) return reply.code(403).send({ error: '密码登录未启用，请通过 Tailscale 私网访问' });
-  const ip = request.ip;
+  const ip = loginRateLimitKey(request);
   const now = Date.now();
   const attempt = loginAttempts.get(ip);
   if (attempt && attempt.resetAt > now && attempt.count >= 8) {
@@ -366,7 +375,7 @@ app.delete<{ Querystring: { path?: string; projectId?: string } }>('/api/files',
 });
 
 const clientMessage = z.discriminatedUnion('type', [
-  z.object({ type: z.literal('turn.start'), projectId: z.string().min(1).max(64), threadId: z.string().optional(), text: z.string().min(1).max(50_000), attachments: z.array(z.string()).max(10).optional() }),
+  z.object({ type: z.literal('turn.start'), clientRequestId: z.string().uuid().optional(), projectId: z.string().min(1).max(64), threadId: z.string().optional(), text: z.string().min(1).max(50_000), attachments: z.array(z.string()).max(10).optional() }),
   z.object({ type: z.literal('turn.interrupt'), threadId: z.string(), turnId: z.string() }),
   z.object({ type: z.literal('thread.subscribe'), projectId: z.string().min(1).max(64), threadId: z.string() }),
 ]);
@@ -380,10 +389,12 @@ app.get('/api/ws', { websocket: true }, (socket, request) => {
   socket.send(JSON.stringify({ type: 'ready' }));
 
   socket.on('message', async (raw) => {
+    let clientRequestId: string | undefined;
     try {
       const parsed = clientMessage.safeParse(JSON.parse(raw.toString()));
       if (!parsed.success) throw new Error('消息格式无效');
       const message = parsed.data;
+      clientRequestId = message.type === 'turn.start' ? message.clientRequestId : undefined;
       app.log.info({ event: message.type }, '收到已认证的 WebSocket 操作');
       if (message.type === 'thread.subscribe') {
         projects.assertThreadProject(message.threadId, message.projectId);
@@ -396,6 +407,29 @@ app.get('/api/ws', { websocket: true }, (socket, request) => {
         await bridge.call('turn/interrupt', { threadId: message.threadId, turnId: message.turnId });
         return;
       }
+      const requestId = message.clientRequestId ?? randomUUID();
+      clientRequestId = requestId;
+      const requestKey = `${message.projectId}:${requestId}`;
+      const completedRequest = projects.findTaskByClientRequestId(message.projectId, requestId);
+      if (completedRequest) {
+        attachSocketToThread(socket, completedRequest.threadId);
+        socket.send(JSON.stringify({
+          type: 'turn.accepted', clientRequestId: requestId, replayed: true,
+          threadId: completedRequest.threadId, payload: { turn: { id: completedRequest.turnId } },
+        }));
+        return;
+      }
+      const pendingRequest = pendingTurnRequests.get(requestKey);
+      if (pendingRequest) {
+        const accepted = await pendingRequest;
+        if (!accepted) throw new Error('原请求执行失败，请检查任务记录后再试');
+        attachSocketToThread(socket, accepted.threadId);
+        socket.send(JSON.stringify({ type: 'turn.accepted', ...accepted, replayed: true }));
+        return;
+      }
+      let settlePending!: (value: TurnAcceptance | undefined) => void;
+      pendingTurnRequests.set(requestKey, new Promise<TurnAcceptance | undefined>((resolve) => { settlePending = resolve; }));
+      try {
       const disk = await diskInfo();
       if (disk.tasksPaused) throw new Error('磁盘可用空间低于安全线，已暂停新任务');
       let threadId = message.threadId;
@@ -439,10 +473,18 @@ app.get('/api/ws', { websocket: true }, (socket, request) => {
         approvalPolicy: 'never',
         sandboxPolicy: { type: 'dangerFullAccess' },
       }) as { turn?: { id?: string } };
-      if (turn.turn?.id) await projects.rememberTask(turn.turn.id, threadId, message.projectId, message.text, message.attachments ?? [], outputBaseline);
-      socket.send(JSON.stringify({ type: 'turn.accepted', threadId, payload: turn }));
+      if (turn.turn?.id) await projects.rememberTask(turn.turn.id, threadId, message.projectId, message.text, message.attachments ?? [], outputBaseline, requestId);
+      const accepted: TurnAcceptance = { threadId, payload: turn, clientRequestId: requestId };
+      settlePending(accepted);
+      socket.send(JSON.stringify({ type: 'turn.accepted', ...accepted }));
+      } catch (error) {
+        settlePending(undefined);
+        throw error;
+      } finally {
+        pendingTurnRequests.delete(requestKey);
+      }
     } catch (error) {
-      socket.send(JSON.stringify({ type: 'error', message: error instanceof Error ? error.message : '任务执行失败' }));
+      socket.send(JSON.stringify({ type: 'error', clientRequestId, message: error instanceof Error ? error.message : '任务执行失败' }));
     }
   });
   socket.on('close', () => {

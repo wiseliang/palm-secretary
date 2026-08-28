@@ -58,7 +58,7 @@ export class CodexBridge extends EventEmitter {
     });
 
     await this.call('initialize', {
-      clientInfo: { name: 'palm_secretary', title: '掌心助理', version: '0.11.0' },
+      clientInfo: { name: 'palm_secretary', title: '掌心助理', version: '0.11.1' },
       capabilities: {},
     });
     this.notify('initialized', {});

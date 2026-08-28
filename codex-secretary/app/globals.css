@@ -101,6 +101,8 @@ button { color: inherit; }
 .send-button { width: 36px; height: 36px; flex: 0 0 auto; border: 0; border-radius: 13px; background: var(--ink); color: white; font-size: 18px; transition: opacity .2s; }
 .send-button:disabled { opacity: .24; }
 .composer-note { margin: 7px auto 0; text-align: center; color: #969992; font-size: 9px; }
+.composer-note.delivery-sending { color: #8a641d; font-weight: 700; }
+.composer-note.delivery-accepted { color: var(--jade); font-weight: 700; }
 .desktop-upload-hint { display: none; }
 .composer-hidden { display: none; }
 .panel-stage { width: 100%; max-width: 820px; margin: 0 auto; flex: 1; padding: 30px 18px 80px; }
@@ -529,6 +531,7 @@ button:not(:disabled):active, a[href]:active { transform: translateY(1px) scale(
   .file-toolbar { align-items: stretch; flex-direction: column; }
   .file-list article { min-height: 0; }
   .composer-note { display: none; }
+  .composer-note.delivery-sending, .composer-note.delivery-accepted { display: block; }
 }
 
 @media (prefers-color-scheme: dark) {

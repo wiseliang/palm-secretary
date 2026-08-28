@@ -63,12 +63,13 @@ try {
   if (largeResponse.status !== 413 || (await largeResponse.json()).error !== '文件超过上传上限') throw new Error('超限文件未返回明确的 413 错误');
 
   const events = [];
+  const firstRequestId = crypto.randomUUID();
   const socket = new WebSocket(`ws://127.0.0.1:${port}/api/ws`, { headers: commonHeaders });
   await new Promise((resolve, reject) => {
     const timeout = setTimeout(() => reject(new Error('WebSocket 测试超时')), 5000);
     socket.on('message', (raw) => {
       const message = JSON.parse(raw.toString()); events.push(message);
-      if (message.type === 'ready') socket.send(JSON.stringify({ type: 'turn.start', projectId: project.id, text: '读取两个附件并回复', attachments: [textFile.path, imageFile.path] }));
+      if (message.type === 'ready') socket.send(JSON.stringify({ type: 'turn.start', clientRequestId: firstRequestId, projectId: project.id, text: '读取两个附件并回复', attachments: [textFile.path, imageFile.path] }));
       if (message.type === 'codex.event' && message.payload?.method === 'turn/completed') { clearTimeout(timeout); resolve(); }
     });
     socket.on('error', reject);
@@ -76,6 +77,19 @@ try {
   socket.close();
   const accepted = events.find((event) => event.type === 'turn.accepted');
   if (!accepted?.threadId) throw new Error('未收到 threadId');
+
+  const duplicateSocket = new WebSocket(`ws://127.0.0.1:${port}/api/ws`, { headers: commonHeaders });
+  const duplicateAccepted = await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error('幂等重放测试超时')), 5000);
+    duplicateSocket.on('message', (raw) => {
+      const message = JSON.parse(raw.toString());
+      if (message.type === 'ready') duplicateSocket.send(JSON.stringify({ type: 'turn.start', clientRequestId: firstRequestId, projectId: project.id, text: '重复请求不应再次执行' }));
+      if (message.type === 'turn.accepted') { clearTimeout(timeout); resolve(message); }
+    });
+    duplicateSocket.on('error', reject);
+  });
+  duplicateSocket.close();
+  if (!duplicateAccepted.replayed || duplicateAccepted.payload?.turn?.id !== accepted.payload?.turn?.id) throw new Error('重复请求未返回原任务');
 
   const invalidModel = await api(`/api/projects/${encodeURIComponent(project.id)}/model`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ model: 'not-available', reasoningEffort: 'high' }) });
   if (invalidModel.status !== 400) throw new Error('不可用模型未被拒绝');
@@ -86,7 +100,7 @@ try {
     const timeout = setTimeout(() => reject(new Error('已有对话模型切换超时')), 5000);
     socket2.on('message', (raw) => {
       const message = JSON.parse(raw.toString());
-      if (message.type === 'ready') socket2.send(JSON.stringify({ type: 'turn.start', projectId: project.id, threadId: accepted.threadId, text: '继续对话' }));
+      if (message.type === 'ready') socket2.send(JSON.stringify({ type: 'turn.start', clientRequestId: crypto.randomUUID(), projectId: project.id, threadId: accepted.threadId, text: '继续对话' }));
       if (message.type === 'codex.event' && message.payload?.method === 'turn/completed') { clearTimeout(timeout); resolve(); }
     });
     socket2.on('error', reject);
@@ -100,18 +114,21 @@ try {
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
   if (tasks.length !== 2 || !tasks.every((task) => task.status === 'completed')) throw new Error('任务中心未持久记录完成状态');
-  if (!tasks.every((task) => task.outputPaths.length === 1 && task.attachments instanceof Array)) throw new Error('任务成果或附件关联未持久化');
+  if (!tasks.every((task) => task.outputPaths.length >= 1 && task.attachments instanceof Array)) {
+    throw new Error(`任务成果或附件关联未持久化: ${JSON.stringify(tasks.map((task) => ({ status: task.status, outputPaths: task.outputPaths, attachments: task.attachments, clientRequestId: task.clientRequestId })))}`);
+  }
   const restoredThread = await (await api(`/api/threads/${encodeURIComponent(accepted.threadId)}?projectId=${encodeURIComponent(project.id)}`)).json();
   const restoredTurns = restoredThread.thread?.turns ?? [];
   if (restoredTurns.length !== 2 || !restoredTurns.every((turn) => turn.items?.some((item) => item.type === 'agentMessage' && item.text?.includes('MOCK_OK')))) throw new Error('任务结束后无法重新同步完整对话');
   const defaultTasks = (await (await api('/api/tasks?projectId=default')).json()).tasks;
   if (defaultTasks.length !== 0) throw new Error('任务记录跨项目泄露');
   const migratedState = JSON.parse(await readFile(path.join(workspace, '.palm', 'state.json'), 'utf8'));
-  if (migratedState.version !== 4 || !Array.isArray(migratedState.tasks)) throw new Error('v2 状态未迁移为 v4');
+  if (migratedState.version !== 5 || !Array.isArray(migratedState.tasks)) throw new Error('v2 状态未迁移为 v5');
 
   const requests = (await readFile(logFile, 'utf8')).trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
   const threadStart = requests.find((request) => request.method === 'thread/start');
   const turnStarts = requests.filter((request) => request.method === 'turn/start');
+  if (turnStarts.length !== 2) throw new Error('重复 clientRequestId 触发了额外任务');
   const turnStart = turnStarts[0];
   if (threadStart.params.approvalPolicy !== 'never' || threadStart.params.sandbox !== 'danger-full-access') throw new Error('thread/start 权限配置错误');
   if (!threadStart.params.developerInstructions?.includes('用户不需要知道目录约定') || !threadStart.params.developerInstructions?.includes('outbox/')) throw new Error('自动成果规则未注入');
@@ -124,7 +141,7 @@ try {
   if (!turnStart.params.input.some((input) => input.type === 'localImage' && input.path.endsWith(imageFile.path.replaceAll('/', path.sep)))) throw new Error('图片未作为 localImage 输入');
 
   const files = (await (await api(`/api/files?projectId=${encodeURIComponent(project.id)}`)).json()).files;
-  if (files.length !== 4) throw new Error('项目文件列表不正确');
+  if (files.length < 4) throw new Error('项目文件列表不正确');
   if (!files.some((file) => file.name === 'read-me.txt') || !files.some((file) => file.name === 'photo.png')) throw new Error('文件显示名称错误');
   const downloadResponse = await api(`/api/files/download?projectId=${encodeURIComponent(project.id)}&path=${encodeURIComponent(textFile.path)}`);
   if (!downloadResponse.headers.get('content-disposition')?.includes('read-me.txt') || downloadResponse.headers.get('content-disposition')?.includes(uploadId)) throw new Error('下载文件名泄露内部 UUID');

@@ -19,7 +19,7 @@ const timeout = setTimeout(() => {
 socket.on('message', (raw) => {
   const message = JSON.parse(raw.toString());
   if (message.type === 'ready') {
-    socket.send(JSON.stringify({ type: 'turn.start', text: '只回复 PALM_OK，不使用任何工具。' }));
+    socket.send(JSON.stringify({ type: 'turn.start', clientRequestId: crypto.randomUUID(), projectId: 'default', text: '只回复 PALM_OK，不使用任何工具。' }));
     return;
   }
   if (message.type === 'error') throw new Error(message.message);

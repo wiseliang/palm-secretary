@@ -34,16 +34,17 @@ export type ProjectTask = {
   outputPaths: string[];
   errorMessage?: string;
   outputBaseline?: Record<string, string>;
+  clientRequestId?: string;
 };
 
-type StoreState = { version: 4; projects: Project[]; threads: ProjectThread[]; tasks: ProjectTask[] };
+type StoreState = { version: 5; projects: Project[]; threads: ProjectThread[]; tasks: ProjectTask[] };
 
 const PROJECT_ID = /^[a-z0-9][a-z0-9-]{0,63}$/;
 
 export class ProjectStore {
   private readonly stateDir: string;
   private readonly stateFile: string;
-  private state: StoreState = { version: 4, projects: [], threads: [], tasks: [] };
+  private state: StoreState = { version: 5, projects: [], threads: [], tasks: [] };
   private writeQueue: Promise<void> = Promise.resolve();
 
   constructor(private readonly workspace: string) {
@@ -54,20 +55,20 @@ export class ProjectStore {
   async initialize(): Promise<void> {
     await mkdir(this.stateDir, { recursive: true, mode: 0o700 });
     try {
-      const parsed = JSON.parse(await readFile(this.stateFile, 'utf8')) as StoreState | (Omit<StoreState, 'version'> & { version: 3 }) | (Omit<StoreState, 'version' | 'tasks'> & { version: 2 });
-      if (![2, 3, 4].includes(parsed.version) || !Array.isArray(parsed.projects) || !Array.isArray(parsed.threads)) throw new Error('版本不兼容');
+      const parsed = JSON.parse(await readFile(this.stateFile, 'utf8')) as StoreState | (Omit<StoreState, 'version'> & { version: 3 | 4 }) | (Omit<StoreState, 'version' | 'tasks'> & { version: 2 });
+      if (![2, 3, 4, 5].includes(parsed.version) || !Array.isArray(parsed.projects) || !Array.isArray(parsed.threads)) throw new Error('版本不兼容');
       const parsedTasks = parsed.version === 2 ? [] : parsed.tasks;
       const tasks: ProjectTask[] = Array.isArray(parsedTasks)
         ? parsedTasks.map((task: ProjectTask) => ({ ...task, attachments: Array.isArray(task.attachments) ? task.attachments : [], outputPaths: Array.isArray(task.outputPaths) ? task.outputPaths : [] }))
         : [];
-      this.state = { version: 4, projects: parsed.projects, threads: parsed.threads, tasks };
-      if (parsed.version !== 4) await this.persist();
+      this.state = { version: 5, projects: parsed.projects, threads: parsed.threads, tasks };
+      if (parsed.version !== 5) await this.persist();
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
         await writeFile(`${this.stateFile}.invalid-${Date.now()}`, await readFile(this.stateFile), { mode: 0o600 }).catch(() => undefined);
       }
       const now = new Date().toISOString();
-      this.state = { version: 4, projects: [{ id: 'default', name: '默认项目', directory: 'default', createdAt: now, updatedAt: now }], threads: [], tasks: [] };
+      this.state = { version: 5, projects: [{ id: 'default', name: '默认项目', directory: 'default', createdAt: now, updatedAt: now }], threads: [], tasks: [] };
       await this.persist();
     }
     if (!this.state.projects.some((project) => project.id === 'default')) {
@@ -142,11 +143,16 @@ export class ProjectStore {
     return this.state.tasks.filter((task) => task.projectId === projectId).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)).slice(0, 200);
   }
 
+  findTaskByClientRequestId(projectId: string, clientRequestId: string): ProjectTask | undefined {
+    this.getProject(projectId);
+    return this.state.tasks.find((task) => task.projectId === projectId && task.clientRequestId === clientRequestId);
+  }
+
   async outputBaseline(projectId: string): Promise<Record<string, string>> {
     return this.snapshotOutbox(projectId);
   }
 
-  async rememberTask(turnId: string, threadId: string, projectId: string, title: string, attachments: string[] = [], outputBaseline?: Record<string, string>): Promise<ProjectTask> {
+  async rememberTask(turnId: string, threadId: string, projectId: string, title: string, attachments: string[] = [], outputBaseline?: Record<string, string>, clientRequestId?: string): Promise<ProjectTask> {
     this.assertThreadProject(threadId, projectId);
     const now = new Date().toISOString();
     let task = this.state.tasks.find((item) => item.turnId === turnId);
@@ -154,7 +160,7 @@ export class ProjectStore {
       task = {
         taskId: turnId, turnId, threadId, projectId,
         title: title.trim().slice(0, 120) || '新任务', status: 'running', startedAt: now, updatedAt: now,
-        attachments: [...attachments], outputPaths: [], outputBaseline: outputBaseline ?? await this.snapshotOutbox(projectId),
+        attachments: [...attachments], outputPaths: [], outputBaseline: outputBaseline ?? await this.snapshotOutbox(projectId), clientRequestId,
       };
       this.state.tasks.push(task);
     }
