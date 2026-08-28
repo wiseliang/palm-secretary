@@ -123,7 +123,7 @@ try {
   const defaultTasks = (await (await api('/api/tasks?projectId=default')).json()).tasks;
   if (defaultTasks.length !== 0) throw new Error('任务记录跨项目泄露');
   const migratedState = JSON.parse(await readFile(path.join(workspace, '.palm', 'state.json'), 'utf8'));
-  if (migratedState.version !== 5 || !Array.isArray(migratedState.tasks)) throw new Error('v2 状态未迁移为 v5');
+  if (migratedState.version !== 6 || !Array.isArray(migratedState.tasks)) throw new Error('旧状态未迁移为 v6');
 
   const requests = (await readFile(logFile, 'utf8')).trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
   const threadStart = requests.find((request) => request.method === 'thread/start');
@@ -154,6 +154,19 @@ try {
   const apiUnit = await readFile(path.join(root, 'deploy', 'palm-secretary-api.service'), 'utf8');
   if (!apiUnit.includes('NoNewPrivileges=false') || !apiUnit.includes('RestrictSUIDSGID=false')) throw new Error('API systemd 单元仍阻止 sudo 提权');
   if (/^CapabilityBoundingSet=/m.test(apiUnit) || !apiUnit.includes('ProtectSystem=false') || !apiUnit.includes('ProtectHome=false')) throw new Error('API systemd 单元仍限制完整 root 运维');
+
+  const renamedThread = await api(`/api/threads/${encodeURIComponent(accepted.threadId)}?projectId=${encodeURIComponent(project.id)}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title: '已重命名对话' }) });
+  if (!renamedThread.ok || (await renamedThread.json()).thread?.title !== '已重命名对话') throw new Error('对话重命名失败');
+  const archivedThread = await api(`/api/threads/${encodeURIComponent(accepted.threadId)}?projectId=${encodeURIComponent(project.id)}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ archived: true }) });
+  if (!archivedThread.ok) throw new Error('对话归档失败');
+  const activeThreads = (await (await api(`/api/threads?projectId=${encodeURIComponent(project.id)}`)).json()).threads;
+  const archivedThreads = (await (await api(`/api/threads?projectId=${encodeURIComponent(project.id)}&archived=1`)).json()).threads;
+  if (activeThreads.some((thread) => thread.threadId === accepted.threadId) || !archivedThreads.some((thread) => thread.threadId === accepted.threadId)) throw new Error('归档筛选失败');
+  const restoredRecord = await api(`/api/threads/${encodeURIComponent(accepted.threadId)}?projectId=${encodeURIComponent(project.id)}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ archived: false }) });
+  if (!restoredRecord.ok) throw new Error('归档恢复失败');
+  const deletedRecord = await api(`/api/threads/${encodeURIComponent(accepted.threadId)}?projectId=${encodeURIComponent(project.id)}`, { method: 'DELETE' });
+  if (deletedRecord.status !== 204) throw new Error('对话记录删除失败');
+  if (((await (await api(`/api/tasks?projectId=${encodeURIComponent(project.id)}`)).json()).tasks).some((task) => task.threadId === accepted.threadId)) throw new Error('删除对话后关联任务仍残留');
   console.log('PALM_V06_INTEGRATION_OK');
 } finally {
   child.kill('SIGTERM');

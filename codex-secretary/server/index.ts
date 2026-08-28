@@ -207,10 +207,24 @@ app.get<{ Querystring: { refresh?: string } }>('/api/models', async (request, re
   catch { return reply.code(503).send({ error: '暂时无法读取可用模型，请稍后刷新' }); }
 });
 
-app.get<{ Querystring: { projectId?: string } }>('/api/threads', async (request, reply) => {
+app.get<{ Querystring: { projectId?: string; archived?: string } }>('/api/threads', async (request, reply) => {
   if (!requireOwner(request, reply)) return;
   const projectId = request.query.projectId ?? 'default';
-  return { threads: projects.listThreads(projectId) };
+  return { threads: projects.listThreads(projectId, request.query.archived === '1') };
+});
+
+app.patch<{ Params: { id: string }; Querystring: { projectId?: string } }>('/api/threads/:id', async (request, reply) => {
+  if (!requireOwner(request, reply)) return;
+  const parsed = z.object({ title: z.string().min(1).max(80).optional(), archived: z.boolean().optional() }).refine((value) => value.title !== undefined || value.archived !== undefined).safeParse(request.body);
+  if (!parsed.success) return reply.code(400).send({ error: '对话更新内容无效' });
+  try { return { thread: await projects.updateThread(request.params.id, request.query.projectId ?? 'default', parsed.data) }; }
+  catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : '对话更新失败' }); }
+});
+
+app.delete<{ Params: { id: string }; Querystring: { projectId?: string } }>('/api/threads/:id', async (request, reply) => {
+  if (!requireOwner(request, reply)) return;
+  try { await projects.deleteThread(request.params.id, request.query.projectId ?? 'default'); return reply.code(204).send(); }
+  catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : '对话删除失败' }); }
 });
 
 app.get<{ Querystring: { projectId?: string } }>('/api/tasks', async (request, reply) => {

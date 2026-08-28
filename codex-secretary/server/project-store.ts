@@ -18,6 +18,7 @@ export type ProjectThread = {
   title: string;
   createdAt: string;
   updatedAt: string;
+  archivedAt?: string;
 };
 
 export type ProjectTask = {
@@ -37,14 +38,14 @@ export type ProjectTask = {
   clientRequestId?: string;
 };
 
-type StoreState = { version: 5; projects: Project[]; threads: ProjectThread[]; tasks: ProjectTask[] };
+type StoreState = { version: 6; projects: Project[]; threads: ProjectThread[]; tasks: ProjectTask[] };
 
 const PROJECT_ID = /^[a-z0-9][a-z0-9-]{0,63}$/;
 
 export class ProjectStore {
   private readonly stateDir: string;
   private readonly stateFile: string;
-  private state: StoreState = { version: 5, projects: [], threads: [], tasks: [] };
+  private state: StoreState = { version: 6, projects: [], threads: [], tasks: [] };
   private writeQueue: Promise<void> = Promise.resolve();
 
   constructor(private readonly workspace: string) {
@@ -55,20 +56,20 @@ export class ProjectStore {
   async initialize(): Promise<void> {
     await mkdir(this.stateDir, { recursive: true, mode: 0o700 });
     try {
-      const parsed = JSON.parse(await readFile(this.stateFile, 'utf8')) as StoreState | (Omit<StoreState, 'version'> & { version: 3 | 4 }) | (Omit<StoreState, 'version' | 'tasks'> & { version: 2 });
-      if (![2, 3, 4, 5].includes(parsed.version) || !Array.isArray(parsed.projects) || !Array.isArray(parsed.threads)) throw new Error('版本不兼容');
+      const parsed = JSON.parse(await readFile(this.stateFile, 'utf8')) as StoreState | (Omit<StoreState, 'version'> & { version: 3 | 4 | 5 }) | (Omit<StoreState, 'version' | 'tasks'> & { version: 2 });
+      if (![2, 3, 4, 5, 6].includes(parsed.version) || !Array.isArray(parsed.projects) || !Array.isArray(parsed.threads)) throw new Error('版本不兼容');
       const parsedTasks = parsed.version === 2 ? [] : parsed.tasks;
       const tasks: ProjectTask[] = Array.isArray(parsedTasks)
         ? parsedTasks.map((task: ProjectTask) => ({ ...task, attachments: Array.isArray(task.attachments) ? task.attachments : [], outputPaths: Array.isArray(task.outputPaths) ? task.outputPaths : [] }))
         : [];
-      this.state = { version: 5, projects: parsed.projects, threads: parsed.threads, tasks };
-      if (parsed.version !== 5) await this.persist();
+      this.state = { version: 6, projects: parsed.projects, threads: parsed.threads, tasks };
+      if (parsed.version !== 6) await this.persist();
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
         await writeFile(`${this.stateFile}.invalid-${Date.now()}`, await readFile(this.stateFile), { mode: 0o600 }).catch(() => undefined);
       }
       const now = new Date().toISOString();
-      this.state = { version: 5, projects: [{ id: 'default', name: '默认项目', directory: 'default', createdAt: now, updatedAt: now }], threads: [], tasks: [] };
+      this.state = { version: 6, projects: [{ id: 'default', name: '默认项目', directory: 'default', createdAt: now, updatedAt: now }], threads: [], tasks: [] };
       await this.persist();
     }
     if (!this.state.projects.some((project) => project.id === 'default')) {
@@ -133,9 +134,30 @@ export class ProjectStore {
     return project;
   }
 
-  listThreads(projectId: string): ProjectThread[] {
+  listThreads(projectId: string, archived = false): ProjectThread[] {
     this.getProject(projectId);
-    return this.state.threads.filter((thread) => thread.projectId === projectId).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+    return this.state.threads.filter((thread) => thread.projectId === projectId && Boolean(thread.archivedAt) === archived).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  }
+
+  async updateThread(threadId: string, projectId: string, update: { title?: string; archived?: boolean }): Promise<ProjectThread> {
+    this.assertThreadProject(threadId, projectId);
+    const thread = this.state.threads.find((item) => item.threadId === threadId)!;
+    if (update.title !== undefined) {
+      const title = update.title.trim().replace(/[\u0000-\u001f]/g, '').slice(0, 80);
+      if (!title) throw new Error('对话名称不能为空');
+      thread.title = title;
+    }
+    if (update.archived !== undefined) thread.archivedAt = update.archived ? new Date().toISOString() : undefined;
+    thread.updatedAt = new Date().toISOString();
+    await this.persist();
+    return thread;
+  }
+
+  async deleteThread(threadId: string, projectId: string): Promise<void> {
+    this.assertThreadProject(threadId, projectId);
+    this.state.threads = this.state.threads.filter((item) => item.threadId !== threadId);
+    this.state.tasks = this.state.tasks.filter((item) => item.threadId !== threadId);
+    await this.persist();
   }
 
   listTasks(projectId: string): ProjectTask[] {
