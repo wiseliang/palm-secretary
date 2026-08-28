@@ -1,0 +1,9 @@
+{
+  "name": "entry",
+  "version": "0.1.0",
+  "description": "掌心助理 HarmonyOS NEXT entry module",
+  "main": "",
+  "author": "",
+  "license": "",
+  "dependencies": {}
+}

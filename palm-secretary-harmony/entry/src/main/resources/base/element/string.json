@@ -1,0 +1,7 @@
+{
+  "string": [
+    { "name": "app_name", "value": "掌心助理" },
+    { "name": "module_desc", "value": "掌心助理 HarmonyOS NEXT 客户端" },
+    { "name": "ability_desc", "value": "安全访问服务器上的 Codex" }
+  ]
+}

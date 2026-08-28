@@ -1,0 +1,50 @@
+{
+  "app": {
+    "signingConfigs": [
+      {
+        "name": "release",
+        "type": "HarmonyOS",
+        "material": {
+          "storeFile": "F:/codex_cloud/palm-secretary-harmony/signing/wiseliang.p12",
+          "storePassword": "00000019B6971FA0CD9F40FBA68AB2579466D361ABB43B2198BABF2015EDADC1CDD61FCA87BE4BF5B6",
+          "keyAlias": "wiseliang",
+          "keyPassword": "00000019B6971FA0CD9F40FBA68AB2579466D361ABB43B2198BABF2015EDADC1CDD61FCA87BE4BF5B6",
+          "signAlg": "SHA256withECDSA",
+          "profile": "F:/codex_cloud/palm-secretary-harmony/signing/palm-secretary-releaseRelease.p7b",
+          "certpath": "F:/codex_cloud/palm-secretary-harmony/signing/wiseliang.cer"
+        }
+      }
+    ],
+    "products": [
+      {
+        "name": "default",
+        "signingConfig": "release",
+        "compatibleSdkVersion": "5.0.0(12)",
+        "runtimeOS": "HarmonyOS",
+        "targetSdkVersion": "6.1.1(24)"
+      }
+    ],
+    "buildModeSet": [
+      {
+        "name": "debug"
+      },
+      {
+        "name": "release"
+      }
+    ]
+  },
+  "modules": [
+    {
+      "name": "entry",
+      "srcPath": "./entry",
+      "targets": [
+        {
+          "name": "default",
+          "applyToProducts": [
+            "default"
+          ]
+        }
+      ]
+    }
+  ]
+}

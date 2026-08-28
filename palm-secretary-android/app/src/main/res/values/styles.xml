@@ -1,0 +1,11 @@
+<resources>
+    <style name="Theme.PalmSecretary" parent="android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:windowActionModeOverlay">true</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:statusBarColor">@color/palm_background</item>
+        <item name="android:navigationBarColor">@color/palm_background</item>
+        <item name="android:windowBackground">@color/palm_background</item>
+        <item name="android:colorAccent">@color/palm_ink</item>
+    </style>
+</resources>
