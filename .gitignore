@@ -2,6 +2,8 @@
 *
 !.gitignore
 !README.md
+!.github/
+!.github/**
 !codex-secretary/
 !codex-secretary/**
 !palm-secretary-android/
@@ -49,4 +51,3 @@
 **/*.idsig
 **/local.properties
 **/*.log
-
