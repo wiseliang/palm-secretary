@@ -489,7 +489,15 @@ export default function Home() {
         ? restored.map((item, index) => index === restored.length - 1 && item.role === 'assistant' ? { ...item, pending: true } : item)
         : [...restored, { id: crypto.randomUUID(), role: 'assistant' as const, text: '', pending: true }]
       : restored;
-    setMessages((current) => (!force && (runningRef.current || current.some((item) => item.pending))) ? current : synced);
+    setMessages((current) => {
+      if (!force && (runningRef.current || current.some((item) => item.pending))) return current;
+      const liveAssistant = current.findLast((item) => item.role === 'assistant' && item.text.trim())?.text.trim() ?? '';
+      const storedAssistant = synced.findLast((item) => item.role === 'assistant' && item.text.trim())?.text.trim() ?? '';
+      const wouldDowngradeLongOutput = liveAssistant.length >= 80
+        && storedAssistant.length < liveAssistant.length
+        && !storedAssistant.includes(liveAssistant);
+      return wouldDowngradeLongOutput ? current : synced;
+    });
     return true;
   }, []);
 
@@ -564,6 +572,7 @@ export default function Home() {
             pendingTurnRef.current = undefined;
           }
           setDeliveryState('accepted');
+          threadIdRef.current = message.threadId;
           setThreadId(message.threadId);
           const turn = (message.payload?.turn ?? {}) as { id?: string };
           if (turn.id) setTurnId(turn.id);
@@ -587,6 +596,8 @@ export default function Home() {
         }
         if (message.type !== 'codex.event' || !message.payload) return;
         const rpc = message.payload as { method?: string; params?: Record<string, unknown> };
+        const eventThreadId = typeof rpc.params?.threadId === 'string' ? rpc.params.threadId : undefined;
+        if (eventThreadId && eventThreadId !== threadIdRef.current) return;
         if (rpc.method === 'item/started' || rpc.method === 'item/completed') {
           const step = executionStep(rpc.params?.item, rpc.method === 'item/completed');
           if (step) setMessages((items) => {
@@ -613,17 +624,19 @@ export default function Home() {
         }
         if (['turn/completed', 'turn/failed', 'turn/interrupted'].includes(String(rpc.method))) {
           const notificationStatus = rpc.method === 'turn/failed' ? 'failed' : rpc.method === 'turn/interrupted' ? 'interrupted' : 'completed';
-          try { if (threadIdRef.current) window.PalmNative?.notifyTask?.(notificationStatus, projectId, threadIdRef.current); } catch { /* 原生桥不可用时保持网页流程 */ }
+          const completedThreadId = eventThreadId ?? threadIdRef.current;
+          const completedProjectId = projectIdRef.current;
+          try { if (completedThreadId) window.PalmNative?.notifyTask?.(notificationStatus, completedProjectId, completedThreadId); } catch { /* 原生桥不可用时保持网页流程 */ }
           setDeliveryState('idle');
           runningRef.current = false; setRunning(false); setTurnId(undefined);
           const terminalText = rpc.method === 'turn/interrupted' ? '任务已停止。' : rpc.method === 'turn/failed' ? '任务执行失败，请在记录中重试。' : '';
           setMessages((items) => items.map((item) => item.pending ? { ...item, pending: false, text: item.text || terminalText } : item));
           if (terminalText) setNotice(terminalText);
-          void loadDashboard(); void loadProjectData(projectId);
-          const completedThreadId = threadIdRef.current;
+          void loadDashboard(); void loadProjectData(completedProjectId);
           if (completedThreadId) {
-            window.setTimeout(() => void refreshThreadMessages(completedThreadId, projectId, true), 120);
-            window.setTimeout(() => void refreshThreadMessages(completedThreadId, projectId, true), 900);
+            window.setTimeout(() => void refreshThreadMessages(completedThreadId, completedProjectId, true), 250);
+            window.setTimeout(() => void refreshThreadMessages(completedThreadId, completedProjectId, true), 1_500);
+            window.setTimeout(() => void refreshThreadMessages(completedThreadId, completedProjectId, true), 4_500);
           }
         }
       };

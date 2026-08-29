@@ -21,6 +21,7 @@ const bridge = new CodexBridge();
 type SocketLike = { send: (value: string) => void; close: (code?: number, reason?: string) => void; readyState: number };
 const sockets = new Set<SocketLike>();
 const threadSockets = new Map<string, Set<SocketLike>>();
+const socketThreads = new Map<SocketLike, string>();
 const loadedThreads = new Set<string>();
 const loginAttempts = new Map<string, { count: number; resetAt: number }>();
 type TurnAcceptance = { threadId: string; payload: { turn?: { id?: string } }; replayed?: boolean; clientRequestId: string };
@@ -132,10 +133,22 @@ function sendToThread(threadId: string, value: unknown): void {
   }
 }
 
-function attachSocketToThread(socket: SocketLike, threadId: string): void {
+function detachSocketFromThread(socket: SocketLike): void {
+  const previousThreadId = socketThreads.get(socket);
+  if (!previousThreadId) return;
+  const attached = threadSockets.get(previousThreadId);
+  attached?.delete(socket);
+  if (attached?.size === 0) threadSockets.delete(previousThreadId);
+  socketThreads.delete(socket);
+}
+
+function setSocketThread(socket: SocketLike, threadId: string): void {
+  if (socketThreads.get(socket) === threadId) return;
+  detachSocketFromThread(socket);
   const attached = threadSockets.get(threadId) ?? new Set<SocketLike>();
   attached.add(socket);
   threadSockets.set(threadId, attached);
+  socketThreads.set(socket, threadId);
 }
 
 bridge.on('message', async (message: Record<string, unknown>) => {
@@ -622,7 +635,7 @@ app.get('/api/ws', { websocket: true }, (socket, request) => {
       app.log.info({ event: message.type }, '收到已认证的 WebSocket 操作');
       if (message.type === 'thread.subscribe') {
         projects.assertThreadProject(message.threadId, message.projectId);
-        attachSocketToThread(socket, message.threadId);
+        setSocketThread(socket, message.threadId);
         return;
       }
       await bridge.ready();
@@ -636,7 +649,7 @@ app.get('/api/ws', { websocket: true }, (socket, request) => {
       const requestKey = `${message.projectId}:${requestId}`;
       const completedRequest = projects.findTaskByClientRequestId(message.projectId, requestId);
       if (completedRequest) {
-        attachSocketToThread(socket, completedRequest.threadId);
+        setSocketThread(socket, completedRequest.threadId);
         socket.send(JSON.stringify({
           type: 'turn.accepted', clientRequestId: requestId, replayed: true,
           threadId: completedRequest.threadId, payload: { turn: { id: completedRequest.turnId } },
@@ -647,7 +660,7 @@ app.get('/api/ws', { websocket: true }, (socket, request) => {
       if (pendingRequest) {
         const accepted = await pendingRequest;
         if (!accepted) throw new Error('原请求执行失败，请检查任务记录后再试');
-        attachSocketToThread(socket, accepted.threadId);
+        setSocketThread(socket, accepted.threadId);
         socket.send(JSON.stringify({ type: 'turn.accepted', ...accepted, replayed: true }));
         return;
       }
@@ -674,7 +687,7 @@ app.get('/api/ws', { websocket: true }, (socket, request) => {
         }
       }
       if (!threadId) throw new Error('无法创建 Codex 对话');
-      attachSocketToThread(socket, threadId);
+      setSocketThread(socket, threadId);
       loadedThreads.add(threadId);
       await projects.rememberThread(threadId, message.projectId, message.text);
       const attachmentPaths = (message.attachments ?? []).map((value) => projects.safeStoredPath(message.projectId, value));
@@ -713,10 +726,7 @@ app.get('/api/ws', { websocket: true }, (socket, request) => {
   });
   socket.on('close', () => {
     sockets.delete(socket);
-    for (const [threadId, attached] of threadSockets) {
-      attached.delete(socket);
-      if (attached.size === 0) threadSockets.delete(threadId);
-    }
+    detachSocketFromThread(socket);
   });
 });
 

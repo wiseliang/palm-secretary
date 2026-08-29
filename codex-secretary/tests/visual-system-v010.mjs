@@ -5,7 +5,7 @@ const css = await readFile(new URL('../app/globals.css', import.meta.url), 'utf8
 const page = await readFile(new URL('../app/page.tsx', import.meta.url), 'utf8');
 const pkg = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'));
 
-assert.equal(pkg.version, '0.10.0');
+assert.ok(/^0\.(?:1[0-9]|[2-9][0-9])\.\d+$/.test(pkg.version), `版本号 ${pkg.version} 低于视觉系统基线 0.10.0`);
 assert.match(css, /--jade:\s*#275fc5/);
 assert.match(css, /--radius-control:\s*10px/);
 assert.match(css, /--radius-card:\s*14px/);
