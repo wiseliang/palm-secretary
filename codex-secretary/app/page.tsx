@@ -5,8 +5,8 @@ import { DragEvent, FormEvent, ReactNode, useCallback, useEffect, useRef, useSta
 type ExecutionStep = { id: string; label: string; detail?: string; status: 'running' | 'completed' | 'failed' };
 type ChatMessage = { id: string; role: 'user' | 'assistant'; text: string; pending?: boolean; attachments?: UploadedFile[]; steps?: ExecutionStep[] };
 type UploadedFile = { name: string; path: string; size?: number; modifiedAt?: string };
-type Project = { id: string; name: string; createdAt: string; updatedAt: string; model?: string; reasoningEffort?: string };
-type ProjectThread = { threadId: string; title: string; updatedAt: string; archivedAt?: string };
+type Project = { id: string; name: string; createdAt: string; updatedAt: string; model?: string; reasoningEffort?: string; archivedAt?: string };
+type ProjectThread = { threadId: string; title: string; updatedAt: string; archivedAt?: string; favorite?: boolean };
 type ProjectTask = { taskId: string; turnId: string; threadId: string; projectId: string; title: string; status: 'running' | 'completed' | 'failed' | 'interrupted'; startedAt: string; updatedAt: string; completedAt?: string; attachments: string[]; outputPaths: string[]; errorMessage?: string };
 type CodexModel = { id: string; model: string; displayName: string; description: string; isDefault: boolean; defaultReasoningEffort: string; supportedReasoningEfforts: Array<{ reasoningEffort: string; description: string }> };
 type ServerStatus = { disk?: { freeBytes: number; usedPercent: number; warning: boolean; tasksPaused: boolean }; sudo?: { available: boolean } };
@@ -17,6 +17,8 @@ type UsageWindow = { id: string; label: string; usedPercent: number; remainingPe
 type NativeSharedFile = { id: string; name: string; mimeType?: string; size?: number };
 type PendingTurn = { clientRequestId: string; projectId: string; threadId?: string; text: string; attachments: UploadedFile[] };
 type DeliveryState = 'idle' | 'sending' | 'accepted';
+type SearchResult = { kind: 'thread' | 'task' | 'file'; projectId: string; threadId?: string; path?: string; title: string; snippet: string; updatedAt?: string };
+type GitStatus = { repository: boolean; branch?: string; changes: Array<{ status: string; path: string }>; diff: string; error?: string };
 
 declare global {
   interface Window {
@@ -24,7 +26,6 @@ declare global {
     PalmNative?: { notifyTask?: (status: 'completed' | 'failed' | 'interrupted', projectId: string, threadId: string) => void };
   }
 }
-
 const starterTasks = ['整理当前项目的文件', '把这份 PDF 提炼成要点', '检查服务器运行状态'];
 const SAFE_UPLOAD_BYTES = 95 * 1024 ** 2;
 
@@ -84,6 +85,29 @@ function uploadOnce(file: File, url: string, uploadId: string, onProgress: (perc
     form.append('file', file);
     request.send(form);
   });
+}
+
+async function uploadChunked(file: File, projectId: string, uploadId: string, onProgress: (percent: number) => void): Promise<UploadResponse> {
+  const base = `?projectId=${encodeURIComponent(projectId)}`;
+  const headers = { 'X-Upload-Id': uploadId, 'X-File-Name': encodeURIComponent(file.name), 'X-File-Size': String(file.size) };
+  const session = await fetch(`/api/files/upload-session${base}`, { headers }).catch(() => null);
+  if (!session) return { status: 0 };
+  if (!session.ok) return { status: session.status, body: await session.json().catch(() => undefined) as UploadResponse['body'] };
+  let offset = Number(((await session.json()) as { uploaded?: number }).uploaded ?? 0);
+  const chunkSize = 8 * 1024 * 1024;
+  while (offset < file.size) {
+    const chunk = file.slice(offset, Math.min(file.size, offset + chunkSize));
+    const response = await fetch(`/api/files/upload-chunk${base}`, { method: 'PUT', headers: { ...headers, 'X-Upload-Offset': String(offset), 'Content-Type': 'application/octet-stream' }, body: chunk }).catch(() => null);
+    if (!response) return { status: 0 };
+    const body = await response.json().catch(() => ({})) as { uploaded?: number; error?: string };
+    if (response.status === 409 && typeof body.uploaded === 'number') { offset = body.uploaded; continue; }
+    if (!response.ok) return { status: response.status, body: { error: body.error } };
+    offset = Number(body.uploaded ?? offset + chunk.size);
+    onProgress(Math.min(99, Math.round(offset / file.size * 100)));
+  }
+  const complete = await fetch(`/api/files/upload-complete${base}`, { method: 'POST', headers }).catch(() => null);
+  if (!complete) return { status: 0 };
+  return { status: complete.status, body: await complete.json().catch(() => undefined) as UploadResponse['body'] };
 }
 
 function uploadErrorMessage(result: UploadResponse): string {
@@ -337,6 +361,12 @@ export default function Home() {
   const [files, setFiles] = useState<UploadedFile[]>([]);
   const [recordSearch, setRecordSearch] = useState('');
   const [showArchived, setShowArchived] = useState(false);
+  const [searchAllProjects, setSearchAllProjects] = useState(false);
+  const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
+  const [searching, setSearching] = useState(false);
+  const [gitOpen, setGitOpen] = useState(false);
+  const [gitStatus, setGitStatus] = useState<GitStatus>();
+  const [gitBusy, setGitBusy] = useState(false);
   const [fileSearch, setFileSearch] = useState('');
   const [fileKind, setFileKind] = useState<'all' | 'inbox' | 'outbox'>('all');
   const [draft, setDraft] = useState('');
@@ -370,14 +400,30 @@ export default function Home() {
   const activeEffort = activeProject?.reasoningEffort ?? activeModel?.defaultReasoningEffort ?? '';
   const recentOutputs = files.filter((file) => file.path.startsWith('outbox/')).slice(0, 3);
   const recordQuery = recordSearch.trim().toLowerCase();
-  const matchingTasks = tasks.filter((task) => task.title.toLowerCase().includes(recordQuery));
-  const matchingThreads = threads.filter((thread) => thread.title.toLowerCase().includes(recordQuery) || tasks.some((task) => task.threadId === thread.threadId && task.title.toLowerCase().includes(recordQuery)));
+  const remoteThreadIds = new Set(searchResults.filter((item) => item.projectId === projectId && item.threadId).map((item) => item.threadId));
+  const matchingTasks = tasks.filter((task) => task.title.toLowerCase().includes(recordQuery) || remoteThreadIds.has(task.threadId));
+  const matchingThreads = threads.filter((thread) => thread.title.toLowerCase().includes(recordQuery) || remoteThreadIds.has(thread.threadId) || tasks.some((task) => task.threadId === thread.threadId && task.title.toLowerCase().includes(recordQuery)));
   const visibleThreads = recordSearch.trim() ? matchingThreads : matchingThreads.slice(0, 3);
   const matchingFiles = files.filter((file) => (fileKind === 'all' || file.path.startsWith(`${fileKind}/`)) && file.name.toLowerCase().includes(fileSearch.trim().toLowerCase()));
 
   useEffect(() => { threadIdRef.current = threadId; }, [threadId]);
   useEffect(() => { projectIdRef.current = projectId; }, [projectId]);
   useEffect(() => { runningRef.current = running; }, [running]);
+  useEffect(() => {
+    const query = recordSearch.trim();
+    if (query.length < 2) return;
+    const controller = new AbortController();
+    const timer = window.setTimeout(async () => {
+      setSearching(true);
+      const params = new URLSearchParams({ q: query, projectId });
+      if (searchAllProjects) params.set('all', '1');
+      try {
+        const response = await fetch(`/api/search?${params}`, { signal: controller.signal });
+        if (response.ok) setSearchResults(((await response.json()) as { results: SearchResult[] }).results);
+      } finally { if (!controller.signal.aborted) setSearching(false); }
+    }, 320);
+    return () => { window.clearTimeout(timer); controller.abort(); };
+  }, [projectId, recordSearch, searchAllProjects]);
   useEffect(() => {
     if (view !== 'chat' || !focusedMessageId) return;
     let clearTimer: number | undefined;
@@ -688,7 +734,60 @@ export default function Home() {
     setNotice('项目名称已更新');
   }
 
-  async function updateThread(item: ProjectThread, update: { title?: string; archived?: boolean }) {
+  async function importGitHubProject() {
+    const url = window.prompt('GitHub HTTPS 仓库地址（公开仓库或服务器已配置凭据的私有仓库）');
+    if (!url?.trim()) return;
+    const fallback = url.trim().split('/').pop()?.replace(/\.git$/i, '') || 'GitHub 项目';
+    const name = window.prompt('项目名称', fallback);
+    if (!name?.trim()) return;
+    setNotice('正在从 GitHub 导入项目…');
+    const response = await fetch('/api/projects/github', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: name.trim(), url: url.trim() }) });
+    const body = await response.json() as { project?: Project; error?: string };
+    if (!response.ok || !body.project) { setNotice(body.error ?? 'GitHub 导入失败'); return; }
+    await loadProjects(); setProjectId(body.project.id); setNotice(body.error ?? 'GitHub 项目已导入');
+  }
+
+  async function duplicateProject() {
+    if (!activeProject) return;
+    const name = window.prompt('项目副本名称', `${activeProject.name} 副本`);
+    if (!name?.trim()) return;
+    const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}/duplicate`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: name.trim() }) });
+    const body = await response.json() as { project?: Project; error?: string };
+    if (!response.ok || !body.project) { setNotice(body.error ?? '项目复制失败'); return; }
+    await loadProjects(); setProjectId(body.project.id); setNotice('项目已复制，Git 历史未复制');
+  }
+
+  async function toggleProjectArchive() {
+    if (!activeProject) return;
+    const archived = !activeProject.archivedAt;
+    if (archived && !window.confirm(`归档项目“${activeProject.name}”？文件不会删除。`)) return;
+    const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ archived }) });
+    const body = await response.json() as { project?: Project; error?: string };
+    if (!response.ok || !body.project) { setNotice(body.error ?? '项目归档失败'); return; }
+    setProjects((items) => items.map((item) => item.id === body.project?.id ? body.project : item)); setNotice(archived ? '项目已归档，文件仍完整保留' : '项目已恢复');
+  }
+
+  async function loadGitStatus(open = true) {
+    if (open) setGitOpen(true);
+    const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}/git`);
+    const body = await response.json() as GitStatus;
+    setGitStatus(response.ok ? body : { repository: false, changes: [], diff: '', error: (body as { error?: string }).error ?? 'Git 状态读取失败' });
+  }
+
+  async function runGitAction(action: 'pull' | 'push' | 'commit') {
+    const message = action === 'commit' ? window.prompt('提交说明') : undefined;
+    if (action === 'commit' && !message?.trim()) return;
+    if ((action === 'push' || action === 'pull') && !window.confirm(`确认执行 git ${action}？`)) return;
+    setGitBusy(true);
+    try {
+      const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}/git`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action, ...(message ? { message: message.trim() } : {}) }) });
+      const body = await response.json() as { error?: string; output?: string };
+      setNotice(response.ok ? body.output || `git ${action} 已完成` : body.error ?? `git ${action} 失败`);
+      await loadGitStatus(false);
+    } finally { setGitBusy(false); }
+  }
+
+  async function updateThread(item: ProjectThread, update: { title?: string; archived?: boolean; favorite?: boolean }) {
     const response = await fetch(`/api/threads/${encodeURIComponent(item.threadId)}?projectId=${encodeURIComponent(projectId)}`, {
       method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(update),
     });
@@ -736,6 +835,19 @@ export default function Home() {
       ?? [...restored].reverse().find((message) => message.role === 'user') ?? restored.at(-1);
     setThreadId(item.threadId); setMessages(restored); setFocusedMessageId(focused?.id); setView('chat');
     if (!restored.length) setNotice('已恢复对话上下文；旧消息格式暂无法完整展示');
+  }
+
+  async function openSearchResult(result: SearchResult) {
+    if (result.kind === 'file') {
+      setProjectId(result.projectId); setFileSearch(result.title); setView('files'); return;
+    }
+    if (!result.threadId) return;
+    const response = await fetch(`/api/threads/${encodeURIComponent(result.threadId)}?projectId=${encodeURIComponent(result.projectId)}`);
+    if (!response.ok) { setNotice('读取搜索结果失败'); return; }
+    const restored = messagesFromThread(await response.json());
+    const hint = recordSearch.trim().toLowerCase();
+    const focused = restored.find((message) => message.text.toLowerCase().includes(hint)) ?? restored.at(-1);
+    setProjectId(result.projectId); setThreadId(result.threadId); setMessages(restored); setFocusedMessageId(focused?.id); setView('chat');
   }
 
   function startTurn(text: string, sentAttachments: UploadedFile[], targetThreadId = threadId) {
@@ -791,7 +903,9 @@ export default function Home() {
       let result: UploadResponse = { status: 0 };
       for (let attempt = 1; attempt <= 3; attempt += 1) {
         updateFeedback((current) => ({ ...current, status: attempt === 1 ? 'uploading' : 'retrying' }));
-        result = await uploadOnce(file, url, uploadId, (progress) => updateFeedback((current) => ({ ...current, progress, status: 'uploading' })));
+        result = file.size > 8 * 1024 * 1024
+          ? await uploadChunked(file, projectId, uploadId, (progress) => updateFeedback((current) => ({ ...current, progress, status: 'uploading' })))
+          : await uploadOnce(file, url, uploadId, (progress) => updateFeedback((current) => ({ ...current, progress, status: 'uploading' })));
         if (result.status >= 200 && result.status < 300 && result.body?.file) {
           const saved = result.body.file;
           setAttachments((items) => items.some((item) => item.path === saved.path) ? items : [...items, saved]);
@@ -911,14 +1025,18 @@ export default function Home() {
     <aside className="desktop-rail" aria-label="主导航"><div className="rail-brand"><div className="brand-mark">掌</div><strong>掌心</strong></div><nav><button className={`rail-button ${view === 'chat' ? 'active' : ''}`} aria-label="新对话" onClick={newConversation}><b>✦</b><span>对话</span></button><button className={`rail-button ${view === 'history' ? 'active' : ''}`} aria-label="任务记录" onClick={() => setView('history')}><b>▤</b><span>记录</span></button><button className={`rail-button ${view === 'files' ? 'active' : ''}`} aria-label="文件中心" onClick={() => setView('files')}><b>▱</b><span>文件</span></button></nav><button className="rail-avatar" aria-label="退出登录" onClick={() => void fetch('/api/auth/logout', { method: 'POST' }).then(() => setAuthenticated(false))}><b>我</b><span>退出</span></button></aside>
     <section className={`conversation ${draggingFiles ? 'drag-active' : ''}`} onDragEnter={dragEnter} onDragOver={(event) => { if (event.dataTransfer.types.includes('Files')) event.preventDefault(); }} onDragLeave={dragLeave} onDrop={dropFiles}>
       {draggingFiles && <div className="drop-overlay" role="status"><div><span>＋</span><strong>拖到这里上传</strong><small>文件会加入当前项目和本轮对话</small></div></div>}
-      <header className="topbar"><div className="identity"><span className="mobile-brand">掌</span><div><h1>掌心助理</h1><p><span className={connection === '已连接' ? 'online-dot' : 'offline-dot'} /> Codex {connection}</p></div></div><div className="header-actions"><select aria-label="当前项目" value={projectId} onChange={(event) => setProjectId(event.target.value)} disabled={uploading}>{projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}</select><button className="project-add" onClick={() => void createProject()} aria-label="创建项目" disabled={uploading}>＋项目</button><div className="usage-control"><button className="usage-pill" aria-label="查看 Codex 余量" aria-expanded={usageOpen} onClick={() => { setUsageOpen((open) => !open); void loadDashboard(); }}>{usageWindows.length ? usageWindows.slice(0, 2).map((window) => <span className="usage-metric" key={window.id}><small>{window.label}</small><strong>{window.remainingPercent}%</strong></span>) : <span className="usage-metric"><small>余量</small><strong>暂无</strong></span>}</button>{usageOpen && <div className="usage-popover"><div className="usage-heading"><strong>Codex 用量</strong><button onClick={() => void loadDashboard()} aria-label="刷新用量">↻</button></div>{usageWindows.length ? usageWindows.map((window) => <div className="usage-window" key={window.id}><div><strong>{window.label}</strong><span>剩余 {window.remainingPercent}%</span></div><i><b style={{ width: `${window.remainingPercent}%` }} /></i><small>{resetLabel(window.resetAt)}</small></div>) : <p>暂时无法读取用量，请稍后刷新。</p>}</div>}</div></div></header>
+      <header className="topbar"><div className="identity"><span className="mobile-brand">掌</span><div><h1>掌心助理</h1><p><span className={connection === '已连接' ? 'online-dot' : 'offline-dot'} /> Codex {connection}</p></div></div><div className="header-actions"><select aria-label="当前项目" value={projectId} onChange={(event) => setProjectId(event.target.value)} disabled={uploading}>{projects.map((project) => <option key={project.id} value={project.id}>{project.name}{project.archivedAt ? '（已归档）' : ''}</option>)}</select><button className="project-add" onClick={() => void createProject()} aria-label="创建项目" disabled={uploading}>＋项目</button><div className="usage-control"><button className="usage-pill" aria-label="查看 Codex 余量" aria-expanded={usageOpen} onClick={() => { setUsageOpen((open) => !open); void loadDashboard(); }}>{usageWindows.length ? usageWindows.slice(0, 2).map((window) => <span className="usage-metric" key={window.id}><small>{window.label}</small><strong>{window.remainingPercent}%</strong></span>) : <span className="usage-metric"><small>余量</small><strong>暂无</strong></span>}</button>{usageOpen && <div className="usage-popover"><div className="usage-heading"><strong>Codex 用量</strong><button onClick={() => void loadDashboard()} aria-label="刷新用量">↻</button></div>{usageWindows.length ? usageWindows.map((window) => <div className="usage-window" key={window.id}><div><strong>{window.label}</strong><span>剩余 {window.remainingPercent}%</span></div><i><b style={{ width: `${window.remainingPercent}%` }} /></i><small>{resetLabel(window.resetAt)}</small></div>) : <p>暂时无法读取用量，请稍后刷新。</p>}</div>}</div></div></header>
       <nav className="mobile-tabs"><button className={view === 'chat' ? 'active' : ''} onClick={() => setView('chat')}>对话</button><button className={view === 'history' ? 'active' : ''} onClick={() => setView('history')}>记录</button><button className={view === 'files' ? 'active' : ''} onClick={() => setView('files')}>文件</button></nav>
       <section className="model-bar" aria-label="Codex 模型设置"><label><span>模型</span><select value={activeModel?.model ?? ''} onChange={(event) => void saveModel(event.target.value)} disabled={!models.length}>{models.map((model) => <option key={model.id} value={model.model}>{model.displayName}</option>)}</select></label><label><span>推理</span><select value={activeEffort} onChange={(event) => activeModel && void saveModel(activeModel.model, event.target.value)} disabled={!activeModel}>{activeModel?.supportedReasoningEfforts.map((effort) => <option key={effort.reasoningEffort} value={effort.reasoningEffort}>{effortLabel(effort.reasoningEffort)}</option>)}</select></label><button className="model-refresh" onClick={() => void loadModels(true)} aria-label="刷新模型列表">↻</button><strong title={status.sudo?.available ? 'Codex 可使用无密码 sudo 执行服务器维护' : 'Codex 完整沙箱访问；sudo 尚不可用'}>{status.sudo?.available ? 'Root 运维' : '完全访问'}</strong></section>
       {(connection !== '已连接' || status.disk?.warning) && <section className={`system-alert ${status.disk?.tasksPaused ? 'critical' : ''}`} role="status"><strong>{connection !== '已连接' ? `Codex ${connection}` : status.disk?.tasksPaused ? '服务器空间不足，已暂停新任务和上传' : '服务器磁盘空间偏低'}</strong><span>{connection !== '已连接' ? '连接恢复后会自动同步当前任务' : `${bytes(status.disk?.freeBytes)} 可用 · 建议尽快清理旧版本`}</span></section>}
-      {view === 'history' && <div className="panel-stage"><div className="panel-title"><div><p className="eyebrow">任务中心</p><h2>{activeProject?.name ?? '当前项目'}</h2></div><div className="panel-title-actions"><button className="secondary" onClick={() => void renameProject()}>重命名项目</button><button onClick={newConversation}>＋ 新对话</button></div></div><div className="panel-search"><input value={recordSearch} onChange={(event) => setRecordSearch(event.target.value)} placeholder="搜索对话标题或任务正文" aria-label="搜索对话标题或任务正文" /><button className={showArchived ? 'active' : ''} onClick={() => setShowArchived((value) => !value)}>{showArchived ? '返回进行中' : '查看归档'}</button><span>{matchingTasks.length} 个任务</span></div>{!showArchived && matchingTasks.length > 0 && <section className="task-section"><div className="section-heading"><strong>最近任务</strong><span>点击后定位到对应消息</span></div><div className="task-list">{matchingTasks.map((task) => <article key={task.taskId} className={`task-card ${task.status}`}><button className="task-main" onClick={() => { const thread = threads.find((item) => item.threadId === task.threadId); if (thread) void openThread(thread, task.title); }}><span className="task-state">{task.status === 'running' ? <i /> : task.status === 'completed' ? '✓' : task.status === 'interrupted' ? '■' : '!'}</span><span className="task-copy"><strong>{task.title}</strong><small>{new Date(task.startedAt).toLocaleString('zh-CN')} · {taskDuration(task)} · 附件 {task.attachments?.length ?? 0} · 成果 {task.outputPaths?.length ?? 0}{task.errorMessage ? ` · ${task.errorMessage}` : ''}</small></span><b>{taskStatusLabel(task.status)}</b></button>{((task.outputPaths?.length ?? 0) > 0 || ['failed', 'interrupted'].includes(task.status)) && <div className="task-actions">{task.outputPaths?.map((outputPath) => { const query = new URLSearchParams({ projectId, path: outputPath }); return <a key={outputPath} href={`/api/files/download?${query}`}>↓ {outputPath.split('/').pop()}</a>; })}{['failed', 'interrupted'].includes(task.status) && <button onClick={() => void retryTask(task)}>重新执行</button>}</div>}</article>)}</div></section>}<section className="thread-section"><div className="section-heading"><strong>{showArchived ? '已归档对话' : '对话记录'}</strong><span>{recordSearch.trim() ? `${matchingThreads.length} 条匹配` : showArchived ? `${visibleThreads.length} 条` : `最近 ${visibleThreads.length} 条`}</span></div>{visibleThreads.length ? <div className="record-list">{visibleThreads.map((thread) => <article key={thread.threadId} className="record-item"><button className="record-main" onClick={() => void openThread(thread)}><strong>{thread.title}</strong><span>{new Date(thread.updatedAt).toLocaleString('zh-CN')}</span></button><div className="record-actions"><button onClick={() => void renameThread(thread)}>重命名</button><button onClick={() => void updateThread(thread, { archived: !showArchived })}>{showArchived ? '恢复' : '归档'}</button><button className="danger" onClick={() => void deleteThread(thread)}>删除</button></div></article>)}</div> : <div className="empty-panel">{showArchived ? '还没有归档的对话。' : '没有匹配的对话。'}</div>}</section></div>}
+      {view === 'history' && <div className="panel-stage"><div className="panel-title"><div><p className="eyebrow">任务中心</p><h2>{activeProject?.name ?? '当前项目'}</h2></div><div className="panel-title-actions"><button className="secondary" onClick={() => void importGitHubProject()}>GitHub 导入</button><button className="secondary" onClick={() => void loadGitStatus()}>代码变更</button><button className="secondary" onClick={() => void duplicateProject()}>复制</button><button className="secondary" onClick={() => void toggleProjectArchive()}>{activeProject?.archivedAt ? '恢复项目' : '归档'}</button><button className="secondary" onClick={() => void renameProject()}>重命名</button><button onClick={newConversation}>＋ 新对话</button></div></div>{gitOpen && <section className="git-review"><div className="git-review-head"><div><strong>{gitStatus?.repository ? `分支 ${gitStatus.branch}` : '代码审核'}</strong><span>{gitStatus?.error ?? (gitStatus?.repository ? `${gitStatus.changes.length} 个变更文件` : '当前项目没有 Git 仓库')}</span></div><div><button disabled={gitBusy || !gitStatus?.repository} onClick={() => void runGitAction('pull')}>拉取</button><button disabled={gitBusy || !gitStatus?.repository || !gitStatus.changes.length} onClick={() => void runGitAction('commit')}>提交</button><button disabled={gitBusy || !gitStatus?.repository} onClick={() => void runGitAction('push')}>推送</button><button onClick={() => setGitOpen(false)}>关闭</button></div></div>{gitStatus?.changes.map((change) => <div className="git-change" key={`${change.status}-${change.path}`}><b>{change.status}</b><span>{change.path}</span></div>)}{gitStatus?.diff && <details><summary>查看 Diff</summary><pre>{gitStatus.diff}</pre></details>}</section>}<div className="panel-search"><input value={recordSearch} onChange={(event) => setRecordSearch(event.target.value)} placeholder="搜索对话、助手回复、任务和文本附件" aria-label="全文搜索" /><button className={searchAllProjects ? 'active' : ''} onClick={() => setSearchAllProjects((value) => !value)}>{searchAllProjects ? '全部项目' : '当前项目'}</button><button className={showArchived ? 'active' : ''} onClick={() => setShowArchived((value) => !value)}>{showArchived ? '返回进行中' : '查看归档'}</button><span>{searching ? '检索中…' : `${searchResults.length} 条结果`}</span></div>{recordSearch.trim().length >= 2 && <section className="global-search-results">{searchResults.length ? searchResults.map((result, index) => <button key={`${result.kind}-${result.projectId}-${result.threadId ?? result.path}-${index}`} onClick={() => void openSearchResult(result)}><span>{result.kind === 'thread' ? '对话' : result.kind === 'task' ? '任务' : '文件'}</span><strong>{result.title}</strong><small>{result.snippet || '匹配到内容'}</small>{searchAllProjects && <em>{projects.find((project) => project.id === result.projectId)?.name ?? result.projectId}</em>}</button>) : !searching && <div className="empty-panel">没有找到匹配内容。</div>}</section>}{!showArchived && matchingTasks.length > 0 && <section className="task-section"><div className="section-heading"><strong>最近任务</strong><span>点击后定位到对应消息</span></div><div className="task-list">{matchingTasks.map((task) => <article key={task.taskId} className={`task-card ${task.status}`}><button className="task-main" onClick={() => { const thread = threads.find((item) => item.threadId === task.threadId); if (thread) void openThread(thread, task.title); }}><span className="task-state">{task.status === 'running' ? <i /> : task.status === 'completed' ? '✓' : task.status === 'interrupted' ? '■' : '!'}</span><span className="task-copy"><strong>{task.title}</strong><small>{new Date(task.startedAt).toLocaleString('zh-CN')} · {taskDuration(task)} · 附件 {task.attachments?.length ?? 0} · 成果 {task.outputPaths?.length ?? 0}{task.errorMessage ? ` · ${task.errorMessage}` : ''}</small></span><b>{taskStatusLabel(task.status)}</b></button>{((task.outputPaths?.length ?? 0) > 0 || ['failed', 'interrupted'].includes(task.status)) && <div className="task-actions">{task.outputPaths?.map((outputPath) => { const query = new URLSearchParams({ projectId, path: outputPath }); return <a key={outputPath} href={`/api/files/download?${query}`}>↓ {outputPath.split('/').pop()}</a>; })}{['failed', 'interrupted'].includes(task.status) && <button onClick={() => void retryTask(task)}>重新执行</button>}</div>}</article>)}</div></section>}<section className="thread-section"><div className="section-heading"><strong>{showArchived ? '已归档对话' : '对话记录'}</strong><span>{recordSearch.trim() ? `${matchingThreads.length} 条匹配` : showArchived ? `${visibleThreads.length} 条` : `最近 ${visibleThreads.length} 条`}</span></div>{visibleThreads.length ? <div className="record-list">{visibleThreads.map((thread) => <article key={thread.threadId} className="record-item"><button className="record-main" onClick={() => void openThread(thread)}><strong>{thread.title}</strong><span>{new Date(thread.updatedAt).toLocaleString('zh-CN')}</span></button><div className="record-actions"><button onClick={() => void updateThread(thread, { favorite: !thread.favorite })}>{thread.favorite ? '取消收藏' : '收藏'}</button><button onClick={() => void renameThread(thread)}>重命名</button><button onClick={() => void updateThread(thread, { archived: !showArchived })}>{showArchived ? '恢复' : '归档'}</button><button className="danger" onClick={() => void deleteThread(thread)}>删除</button></div></article>)}</div> : <div className="empty-panel">{showArchived ? '还没有归档的对话。' : '没有匹配的对话。'}</div>}</section></div>}
       {view === 'files' && <div className="panel-stage"><div className="panel-title"><div><p className="eyebrow">项目文件</p><h2>{activeProject?.name ?? '当前项目'}的文件</h2></div><button onClick={() => fileRef.current?.click()} disabled={uploading}>{uploading ? '上传中…' : '＋ 上传'}</button></div><div className="file-toolbar"><div className="file-filters"><button className={fileKind === 'all' ? 'active' : ''} onClick={() => setFileKind('all')}>全部</button><button className={fileKind === 'inbox' ? 'active' : ''} onClick={() => setFileKind('inbox')}>上传</button><button className={fileKind === 'outbox' ? 'active' : ''} onClick={() => setFileKind('outbox')}>成果</button></div><input value={fileSearch} onChange={(event) => setFileSearch(event.target.value)} placeholder="搜索文件" aria-label="搜索文件" /></div>{notice && <button className="panel-notice" onClick={() => setNotice('')}>✓ {notice}<span>×</span></button>}{uploadFeedbacks.length > 0 && <div className="panel-upload-feedback">{uploadFeedbacks.map((item) => <UploadCard key={item.uploadId} item={item} onRetry={() => void upload(item.file, item.uploadId)} onDismiss={() => setUploadFeedbacks((items) => items.filter((entry) => entry.uploadId !== item.uploadId))} />)}</div>}{matchingFiles.length ? <div className="file-list">{matchingFiles.map((file) => { const query = new URLSearchParams({ projectId, path: file.path }); return <article key={file.path}><div><span className={`file-kind ${file.path.startsWith('outbox/') ? 'output' : ''}`}>{file.path.startsWith('outbox/') ? '成果' : '上传'}</span><strong>{file.name}</strong><span>{bytes(file.size)}{file.modifiedAt ? ` · ${new Date(file.modifiedAt).toLocaleString('zh-CN')}` : ''}</span></div><div>{canPreview(file.name) && <a href={`/api/files/preview?${query}`} target="_blank" rel="noreferrer">预览</a>}<a href={`/api/files/download?${query}`}>下载</a><button onClick={() => void deleteFile(file)}>删除</button></div></article>; })}</div> : <div className="empty-panel">没有匹配的文件。</div>}</div>}
       {view === 'chat' && <div className="message-stage"><div className="date-divider"><span>{activeProject?.name ?? '当前项目'}</span></div>{messages.length === 0 ? <><article className="assistant-message"><div className="assistant-seal">掌</div><div className="message-copy"><p className="eyebrow">独立项目工作台</p><h2>今天想先处理什么？</h2><p className="lede">上传的文件会真实保存到当前项目，并把服务器路径交给 Codex 读取。不同项目拥有独立目录和对话记录。</p><div className="starter-grid">{starterTasks.map((task) => <button key={task} onClick={() => { setDraft(task); window.localStorage.setItem(`palm:draft:${projectId}`, task); }}>{task}<span>↗</span></button>)}</div></div></article><section className={`status-card ${status.disk?.warning ? "warning" : ""}`} aria-label="服务器状态"><div><span className="status-icon">{status.disk?.warning ? "!" : "✓"}</span><div><strong>{status.disk?.tasksPaused ? "空间不足，已暂停新任务" : status.disk?.warning ? "磁盘空间偏低" : "完全访问模式已启用"}</strong><p>{bytes(status.disk?.freeBytes)} 可用 · {status.disk?.warning ? "建议清理旧版本" : "常规操作无需审批"}</p></div></div><button onClick={() => void loadDashboard()}>刷新</button></section></> : <section className="chat-list" aria-live="polite">{messages.map((message) => <article key={message.id} data-message-id={message.id} className={`chat-bubble ${message.role} ${focusedMessageId === message.id ? 'message-focus' : ''}`}><span>{message.role === 'assistant' ? '掌' : '我'}</span><div>{message.steps?.length ? <details className="execution-card"><summary><span>执行过程</span><small>{message.steps.filter((step) => step.status === 'completed').length}/{message.steps.length} 步</small></summary><div>{message.steps.map((step) => <article key={step.id} className={`execution-step ${step.status}`}><b>{step.status === 'running' ? '·' : step.status === 'failed' ? '!' : '✓'}</b><span><strong>{step.label}</strong>{step.detail && <small title={step.detail}>{step.detail}</small>}</span></article>)}</div></details> : null}{message.text ? <MessageContent text={message.text} projectId={projectId} files={files} /> : message.pending && !message.steps?.length ? '正在思考…' : ''}{message.attachments?.length ? <div className="message-files">{message.attachments.map((file) => <SentFileCard key={file.path} file={file} projectId={projectId} />)}</div> : null}{message.pending && <i className="typing-dot" />}{message.role === 'assistant' && message.text && !message.pending && <button type="button" className="copy-message" onClick={() => void copyMessage(message.text)}>复制</button>}</div></article>)}</section>}</div>}
       <footer className={`composer-wrap ${view !== 'chat' ? 'composer-hidden' : ''}`}>{notice && <button className="notice" onClick={() => setNotice('')}>{notice} ×</button>}{recentOutputs.length > 0 && <div className="output-row"><span>最新成果</span>{recentOutputs.map((file) => { const query = new URLSearchParams({ projectId, path: file.path }); return <a key={file.path} href={`/api/files/download?${query}`}>↓ {file.name}</a>; })}</div>}{(uploadFeedbacks.length > 0 || attachments.length > 0) && <div className="attachment-tray">{uploadFeedbacks.map((item) => <UploadCard key={item.uploadId} item={item} onRetry={() => void upload(item.file, item.uploadId)} onDismiss={() => setUploadFeedbacks((items) => items.filter((entry) => entry.uploadId !== item.uploadId))} />)}{attachments.map((file) => <AttachedFileCard key={file.path} file={file} onRemove={() => setAttachments((items) => items.filter((item) => item.path !== file.path))} />)}</div>}<form className="composer" onSubmit={sendTask}><input ref={fileRef} type="file" multiple hidden disabled={uploading} onChange={(event) => { void uploadFiles(event.target.files); event.target.value = ''; }} /><div className="composer-actions"><button type="button" className="round-button" aria-label="添加文件" title="选择文件或直接拖入" onClick={() => fileRef.current?.click()} disabled={uploading}>＋</button><button type="button" className="round-button camera-button" aria-label="选择图片" onClick={() => fileRef.current?.click()} disabled={uploading}>▣</button></div><textarea value={draft} onChange={(event) => { const value = event.target.value; setDraft(value); if (value) window.localStorage.setItem(`palm:draft:${projectId}`, value); else window.localStorage.removeItem(`palm:draft:${projectId}`); }} placeholder={running ? '任务执行中…' : '交代一个任务……'} rows={1} aria-label="任务内容" />{running ? <button type="button" className="stop-button" aria-label="停止任务" onClick={interrupt}>■</button> : <button type="submit" className="send-button" disabled={uploading || (!draft.trim() && !attachments.length) || connection !== '已连接'} aria-label="发送">↑</button>}</form><p className={`composer-note delivery-${deliveryState}`}><span className="desktop-upload-hint">可拖入文件 · </span>{deliveryState === 'sending' ? '正在发送，断线后会安全续传' : deliveryState === 'accepted' ? '服务器已接收，Codex 正在执行' : '草稿按项目保存 · 附件发送时会交给 Codex 读取'}</p></footer>
     </section>
   </main>;
 }
+
+
+
+

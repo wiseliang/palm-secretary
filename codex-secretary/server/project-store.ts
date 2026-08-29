@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { access, mkdir, readFile, readdir, rename, stat, writeFile } from 'node:fs/promises';
+import { access, cp, mkdir, readFile, readdir, rename, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
 export type Project = {
@@ -10,6 +10,7 @@ export type Project = {
   updatedAt: string;
   model?: string;
   reasoningEffort?: string;
+  archivedAt?: string;
 };
 
 export type ProjectThread = {
@@ -19,6 +20,7 @@ export type ProjectThread = {
   createdAt: string;
   updatedAt: string;
   archivedAt?: string;
+  favorite?: boolean;
 };
 
 export type ProjectTask = {
@@ -38,14 +40,14 @@ export type ProjectTask = {
   clientRequestId?: string;
 };
 
-type StoreState = { version: 6; projects: Project[]; threads: ProjectThread[]; tasks: ProjectTask[] };
+type StoreState = { version: 7; projects: Project[]; threads: ProjectThread[]; tasks: ProjectTask[] };
 
 const PROJECT_ID = /^[a-z0-9][a-z0-9-]{0,63}$/;
 
 export class ProjectStore {
   private readonly stateDir: string;
   private readonly stateFile: string;
-  private state: StoreState = { version: 6, projects: [], threads: [], tasks: [] };
+  private state: StoreState = { version: 7, projects: [], threads: [], tasks: [] };
   private writeQueue: Promise<void> = Promise.resolve();
 
   constructor(private readonly workspace: string) {
@@ -56,20 +58,20 @@ export class ProjectStore {
   async initialize(): Promise<void> {
     await mkdir(this.stateDir, { recursive: true, mode: 0o700 });
     try {
-      const parsed = JSON.parse(await readFile(this.stateFile, 'utf8')) as StoreState | (Omit<StoreState, 'version'> & { version: 3 | 4 | 5 }) | (Omit<StoreState, 'version' | 'tasks'> & { version: 2 });
-      if (![2, 3, 4, 5, 6].includes(parsed.version) || !Array.isArray(parsed.projects) || !Array.isArray(parsed.threads)) throw new Error('版本不兼容');
+      const parsed = JSON.parse(await readFile(this.stateFile, 'utf8')) as StoreState | (Omit<StoreState, 'version'> & { version: 3 | 4 | 5 | 6 }) | (Omit<StoreState, 'version' | 'tasks'> & { version: 2 });
+      if (![2, 3, 4, 5, 6, 7].includes(parsed.version) || !Array.isArray(parsed.projects) || !Array.isArray(parsed.threads)) throw new Error('版本不兼容');
       const parsedTasks = parsed.version === 2 ? [] : parsed.tasks;
       const tasks: ProjectTask[] = Array.isArray(parsedTasks)
         ? parsedTasks.map((task: ProjectTask) => ({ ...task, attachments: Array.isArray(task.attachments) ? task.attachments : [], outputPaths: Array.isArray(task.outputPaths) ? task.outputPaths : [] }))
         : [];
-      this.state = { version: 6, projects: parsed.projects, threads: parsed.threads, tasks };
-      if (parsed.version !== 6) await this.persist();
+      this.state = { version: 7, projects: parsed.projects, threads: parsed.threads, tasks };
+      if (parsed.version !== 7) await this.persist();
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
         await writeFile(`${this.stateFile}.invalid-${Date.now()}`, await readFile(this.stateFile), { mode: 0o600 }).catch(() => undefined);
       }
       const now = new Date().toISOString();
-      this.state = { version: 6, projects: [{ id: 'default', name: '默认项目', directory: 'default', createdAt: now, updatedAt: now }], threads: [], tasks: [] };
+      this.state = { version: 7, projects: [{ id: 'default', name: '默认项目', directory: 'default', createdAt: now, updatedAt: now }], threads: [], tasks: [] };
       await this.persist();
     }
     if (!this.state.projects.some((project) => project.id === 'default')) {
@@ -78,6 +80,14 @@ export class ProjectStore {
       await this.persist();
     }
     for (const project of this.state.projects) await this.ensureProjectDirectories(project);
+    const interruptedAt = new Date().toISOString();
+    let recovered = false;
+    for (const task of this.state.tasks) {
+      if (task.status !== 'running') continue;
+      task.status = 'interrupted'; task.updatedAt = interruptedAt; task.completedAt = interruptedAt;
+      task.errorMessage = '服务重启时任务仍在运行，请确认结果后再重新执行'; delete task.outputBaseline; recovered = true;
+    }
+    if (recovered) await this.persist();
     await this.migrateLegacyFiles();
   }
 
@@ -125,6 +135,22 @@ export class ProjectStore {
     return project;
   }
 
+  async archiveProject(id: string, archived: boolean): Promise<Project> {
+    if (id === 'default' && archived) throw new Error('默认项目不能归档');
+    const project = this.getProject(id);
+    project.archivedAt = archived ? new Date().toISOString() : undefined;
+    project.updatedAt = new Date().toISOString();
+    await this.persist(); return project;
+  }
+
+  async duplicateProject(id: string, name: string): Promise<Project> {
+    const source = this.getProject(id);
+    const duplicate = await this.createProject(name);
+    await cp(this.projectRoot(source.id), this.projectRoot(duplicate.id), { recursive: true, force: false, errorOnExist: false, filter: (entry) => !entry.includes(`${path.sep}.git${path.sep}`) && !entry.endsWith(`${path.sep}.git`) });
+    duplicate.model = source.model; duplicate.reasoningEffort = source.reasoningEffort;
+    duplicate.updatedAt = new Date().toISOString(); await this.persist(); return duplicate;
+  }
+
   async setProjectModel(id: string, model: string, reasoningEffort?: string): Promise<Project> {
     const project = this.getProject(id);
     project.model = model;
@@ -136,10 +162,10 @@ export class ProjectStore {
 
   listThreads(projectId: string, archived = false): ProjectThread[] {
     this.getProject(projectId);
-    return this.state.threads.filter((thread) => thread.projectId === projectId && Boolean(thread.archivedAt) === archived).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+    return this.state.threads.filter((thread) => thread.projectId === projectId && Boolean(thread.archivedAt) === archived).sort((a, b) => Number(Boolean(b.favorite)) - Number(Boolean(a.favorite)) || b.updatedAt.localeCompare(a.updatedAt));
   }
 
-  async updateThread(threadId: string, projectId: string, update: { title?: string; archived?: boolean }): Promise<ProjectThread> {
+  async updateThread(threadId: string, projectId: string, update: { title?: string; archived?: boolean; favorite?: boolean }): Promise<ProjectThread> {
     this.assertThreadProject(threadId, projectId);
     const thread = this.state.threads.find((item) => item.threadId === threadId)!;
     if (update.title !== undefined) {
@@ -148,9 +174,15 @@ export class ProjectStore {
       thread.title = title;
     }
     if (update.archived !== undefined) thread.archivedAt = update.archived ? new Date().toISOString() : undefined;
+    if (update.favorite !== undefined) thread.favorite = update.favorite;
     thread.updatedAt = new Date().toISOString();
     await this.persist();
     return thread;
+  }
+
+  allThreads(projectId?: string): ProjectThread[] {
+    if (projectId) this.getProject(projectId);
+    return this.state.threads.filter((thread) => !projectId || thread.projectId === projectId).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
   }
 
   async deleteThread(threadId: string, projectId: string): Promise<void> {

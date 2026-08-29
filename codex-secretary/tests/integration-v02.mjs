@@ -61,6 +61,16 @@ try {
   const largeForm = new FormData(); largeForm.append('file', new Blob([new Uint8Array(64)]), 'too-large.bin');
   const largeResponse = await api(`/api/files/upload?projectId=${encodeURIComponent(project.id)}`, { method: 'POST', body: largeForm });
   if (largeResponse.status !== 413 || (await largeResponse.json()).error !== '文件超过上传上限') throw new Error('超限文件未返回明确的 413 错误');
+  const chunkId = '223e4567-e89b-42d3-a456-426614174000';
+  const chunkHeaders = { 'X-Upload-Id': chunkId, 'X-File-Name': encodeURIComponent('断点文件.txt'), 'X-File-Size': '24' };
+  const firstChunk = await api(`/api/files/upload-chunk?projectId=${encodeURIComponent(project.id)}`, { method: 'PUT', headers: { ...chunkHeaders, 'X-Upload-Offset': '0', 'Content-Type': 'application/octet-stream' }, body: Buffer.from('abcdefghijkl') });
+  if (!firstChunk.ok || (await firstChunk.json()).uploaded !== 12) throw new Error('首个上传分片失败');
+  const resumed = await api(`/api/files/upload-session?projectId=${encodeURIComponent(project.id)}`, { headers: chunkHeaders });
+  if (!resumed.ok || (await resumed.json()).uploaded !== 12) throw new Error('断点位置没有恢复');
+  const secondChunk = await api(`/api/files/upload-chunk?projectId=${encodeURIComponent(project.id)}`, { method: 'PUT', headers: { ...chunkHeaders, 'X-Upload-Offset': '12', 'Content-Type': 'application/octet-stream' }, body: Buffer.from('mnopqrstuvwx') });
+  if (!secondChunk.ok) throw new Error('续传分片失败');
+  const chunkComplete = await api(`/api/files/upload-complete?projectId=${encodeURIComponent(project.id)}`, { method: 'POST', headers: chunkHeaders });
+  if (!chunkComplete.ok || (await chunkComplete.json()).file?.name !== '断点文件.txt') throw new Error('分片上传完成失败');
 
   const events = [];
   const firstRequestId = crypto.randomUUID();
@@ -125,7 +135,7 @@ try {
   const defaultTasks = (await (await api('/api/tasks?projectId=default')).json()).tasks;
   if (defaultTasks.length !== 0) throw new Error('任务记录跨项目泄露');
   const migratedState = JSON.parse(await readFile(path.join(workspace, '.palm', 'state.json'), 'utf8'));
-  if (migratedState.version !== 6 || !Array.isArray(migratedState.tasks)) throw new Error('旧状态未迁移为 v6');
+  if (migratedState.version !== 7 || !Array.isArray(migratedState.tasks)) throw new Error('旧状态未迁移为 v7');
 
   const requests = (await readFile(logFile, 'utf8')).trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
   const threadStart = requests.find((request) => request.method === 'thread/start');
@@ -159,6 +169,13 @@ try {
 
   const renamedThread = await api(`/api/threads/${encodeURIComponent(accepted.threadId)}?projectId=${encodeURIComponent(project.id)}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title: '已重命名对话' }) });
   if (!renamedThread.ok || (await renamedThread.json()).thread?.title !== '已重命名对话') throw new Error('对话重命名失败');
+  const favoriteThread = await api(`/api/threads/${encodeURIComponent(accepted.threadId)}?projectId=${encodeURIComponent(project.id)}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ favorite: true }) });
+  if (!favoriteThread.ok || !(await favoriteThread.json()).thread?.favorite) throw new Error('对话收藏失败');
+  const search = await api(`/api/search?projectId=${encodeURIComponent(project.id)}&q=${encodeURIComponent('MOCK_OK')}`);
+  const searchResults = (await search.json()).results;
+  if (!search.ok || !searchResults.some((item) => item.threadId === accepted.threadId)) throw new Error('助手回复全文搜索失败');
+  const attachmentSearch = await api(`/api/search?projectId=${encodeURIComponent(project.id)}&q=${encodeURIComponent('hello attachment')}`);
+  if (!(await attachmentSearch.json()).results.some((item) => item.kind === 'file' && item.title === 'read-me.txt')) throw new Error('附件全文搜索失败');
   const archivedThread = await api(`/api/threads/${encodeURIComponent(accepted.threadId)}?projectId=${encodeURIComponent(project.id)}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ archived: true }) });
   if (!archivedThread.ok) throw new Error('对话归档失败');
   const activeThreads = (await (await api(`/api/threads?projectId=${encodeURIComponent(project.id)}`)).json()).threads;
@@ -169,7 +186,9 @@ try {
   const deletedRecord = await api(`/api/threads/${encodeURIComponent(accepted.threadId)}?projectId=${encodeURIComponent(project.id)}`, { method: 'DELETE' });
   if (deletedRecord.status !== 204) throw new Error('对话记录删除失败');
   if (((await (await api(`/api/tasks?projectId=${encodeURIComponent(project.id)}`)).json()).tasks).some((task) => task.threadId === accepted.threadId)) throw new Error('删除对话后关联任务仍残留');
-  console.log('PALM_V06_INTEGRATION_OK');
+  const css = await readFile(path.join(root, 'app', 'globals.css'), 'utf8');
+  if (!css.includes('--sticky-context-offset') || !css.includes('--mobile-tabs-height') || !css.includes('top: var(--sticky-context-offset)')) throw new Error('冻结栏未使用统一偏移变量');
+  console.log('PALM_V012_INTEGRATION_OK');
 } finally {
   child.kill('SIGTERM');
   await new Promise((resolve) => child.once('exit', resolve));

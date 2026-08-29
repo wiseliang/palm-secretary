@@ -3,8 +3,9 @@ import cookie from '@fastify/cookie';
 import multipart from '@fastify/multipart';
 import websocket from '@fastify/websocket';
 import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { createReadStream, createWriteStream } from 'node:fs';
-import { mkdir, readdir, rename, rm, stat, statfs } from 'node:fs/promises';
+import { appendFile, mkdir, readFile, readdir, rename, rm, stat, statfs } from 'node:fs/promises';
 import path from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { randomUUID } from 'node:crypto';
@@ -25,6 +26,7 @@ const loginAttempts = new Map<string, { count: number; resetAt: number }>();
 type TurnAcceptance = { threadId: string; payload: { turn?: { id?: string } }; replayed?: boolean; clientRequestId: string };
 const pendingTurnRequests = new Map<string, Promise<TurnAcceptance | undefined>>();
 const projects = new ProjectStore(config.workspace);
+const execFileAsync = promisify(execFile);
 const OUTPUT_INSTRUCTIONS = `你运行在掌心助理的独立项目工作区。用户不需要知道目录约定。只要任务产生可下载成果（文档、表格、演示文稿、PDF、图片、压缩包、代码包或其他文件），你必须主动把最终版本保存到当前工作目录的 outbox/，使用清晰中文文件名，并在最终回复中说明文件名。若成果是需要直接查看或扫码的图片，最终回复中还必须单独写一行 Markdown 图片语法：![图片说明](outbox/实际文件名.png)，路径必须与真实文件完全一致；掌心助理会在聊天中直接显示该图片。不要要求用户说出 outbox，也不要只在聊天中声称已生成而不实际写入。纯问答无需强行创建文件。用户上传的附件位于 inbox/。`;
 type CodexModel = { id: string; model: string; displayName: string; description: string; isDefault: boolean; hidden?: boolean; supportedReasoningEfforts: Array<{ reasoningEffort: string; description: string }>; defaultReasoningEffort: string };
 let modelCache: { expiresAt: number; models: CodexModel[] } | undefined;
@@ -62,6 +64,7 @@ await app.register(multipart, {
   throwFileSizeLimit: false,
 });
 await app.register(websocket);
+app.addContentTypeParser('application/octet-stream', { parseAs: 'buffer', bodyLimit: 9 * 1024 * 1024 }, (_request, body, done) => done(null, body));
 
 function authenticated(request: FastifyRequest): boolean {
   const tailscaleLogin = request.headers['tailscale-user-login'];
@@ -239,7 +242,7 @@ app.get<{ Querystring: { projectId?: string; archived?: string } }>('/api/thread
 
 app.patch<{ Params: { id: string }; Querystring: { projectId?: string } }>('/api/threads/:id', async (request, reply) => {
   if (!requireOwner(request, reply)) return;
-  const parsed = z.object({ title: z.string().min(1).max(80).optional(), archived: z.boolean().optional() }).refine((value) => value.title !== undefined || value.archived !== undefined).safeParse(request.body);
+  const parsed = z.object({ title: z.string().min(1).max(80).optional(), archived: z.boolean().optional(), favorite: z.boolean().optional() }).refine((value) => value.title !== undefined || value.archived !== undefined || value.favorite !== undefined).safeParse(request.body);
   if (!parsed.success) return reply.code(400).send({ error: '对话更新内容无效' });
   try { return { thread: await projects.updateThread(request.params.id, request.query.projectId ?? 'default', parsed.data) }; }
   catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : '对话更新失败' }); }
@@ -254,6 +257,57 @@ app.delete<{ Params: { id: string }; Querystring: { projectId?: string } }>('/ap
 app.get<{ Querystring: { projectId?: string } }>('/api/tasks', async (request, reply) => {
   if (!requireOwner(request, reply)) return;
   return { tasks: projects.listTasks(request.query.projectId ?? 'default') };
+});
+
+function searchableText(value: unknown): string {
+  if (typeof value === 'string') return value;
+  if (Array.isArray(value)) return value.map(searchableText).join('\n');
+  if (!value || typeof value !== 'object') return '';
+  return Object.entries(value as Record<string, unknown>)
+    .map(([key, item]) => item && typeof item === 'object' ? searchableText(item) : ['text', 'content', 'title', 'message', 'output', 'name'].includes(key) ? searchableText(item) : '')
+    .filter(Boolean).join('\n');
+}
+
+app.get<{ Querystring: { q?: string; projectId?: string; all?: string } }>('/api/search', async (request, reply) => {
+  if (!requireOwner(request, reply)) return;
+  const query = request.query.q?.trim().toLocaleLowerCase('zh-CN') ?? '';
+  if (query.length < 2) return { results: [] };
+  if (query.length > 120) return reply.code(400).send({ error: '搜索内容过长' });
+  const projectId = request.query.all === '1' ? undefined : request.query.projectId ?? 'default';
+  const candidates = projects.allThreads(projectId).slice(0, 80);
+  const results: Array<{ kind: 'thread' | 'task' | 'file'; projectId: string; threadId?: string; path?: string; title: string; snippet: string; updatedAt?: string }> = [];
+  await bridge.ready();
+  for (const thread of candidates) {
+    if (results.length >= 60) break;
+    let text = thread.title;
+    try { text += `\n${searchableText(await bridge.call('thread/read', { threadId: thread.threadId, includeTurns: true }))}`; } catch { /* stale thread */ }
+    const folded = text.toLocaleLowerCase('zh-CN');
+    const index = folded.indexOf(query);
+    if (index >= 0) results.push({ kind: 'thread', projectId: thread.projectId, threadId: thread.threadId, title: thread.title, snippet: text.slice(Math.max(0, index - 48), index + query.length + 88).replace(/\s+/g, ' ').trim(), updatedAt: thread.updatedAt });
+  }
+  const projectIds = projectId ? [projectId] : projects.listProjects().map((project) => project.id);
+  const textExtensions = new Set(['.txt', '.md', '.csv', '.json', '.log', '.ts', '.tsx', '.js', '.jsx', '.css', '.html', '.yml', '.yaml']);
+  for (const id of projectIds.slice(0, 30)) {
+    for (const task of projects.listTasks(id)) {
+      if (results.length >= 80) break;
+      const index = task.title.toLocaleLowerCase('zh-CN').indexOf(query);
+      if (index >= 0) results.push({ kind: 'task', projectId: id, threadId: task.threadId, title: task.title, snippet: task.errorMessage ?? task.title, updatedAt: task.updatedAt });
+    }
+    for (const folder of ['inbox', 'outbox'] as const) {
+      const root = folder === 'inbox' ? projects.inbox(id) : projects.outbox(id);
+      for (const entry of (await readdir(root, { withFileTypes: true }).catch(() => [])).slice(0, 200)) {
+        if (!entry.isFile() || results.length >= 100) continue;
+        const fullPath = path.join(root, entry.name);
+        const displayName = displayFileName(entry.name);
+        let text = displayName;
+        const details = await stat(fullPath).catch(() => null);
+        if (details && details.size <= 512 * 1024 && textExtensions.has(path.extname(entry.name).toLowerCase())) text += `\n${await readFile(fullPath, 'utf8').catch(() => '')}`;
+        const index = text.toLocaleLowerCase('zh-CN').indexOf(query);
+        if (index >= 0) results.push({ kind: 'file', projectId: id, path: `${folder}/${entry.name}`, title: displayName, snippet: text.slice(Math.max(0, index - 48), index + query.length + 88).replace(/\s+/g, ' ').trim(), updatedAt: details?.mtime.toISOString() });
+      }
+    }
+  }
+  return { results };
 });
 
 app.get<{ Params: { id: string }; Querystring: { projectId?: string } }>('/api/threads/:id', async (request, reply) => {
@@ -291,9 +345,18 @@ app.post('/api/projects', async (request, reply) => {
 
 app.patch<{ Params: { id: string } }>('/api/projects/:id', async (request, reply) => {
   if (!requireOwner(request, reply)) return;
-  const parsed = z.object({ name: z.string().min(1).max(50) }).safeParse(request.body);
+  const parsed = z.object({ name: z.string().min(1).max(50).optional(), archived: z.boolean().optional() }).refine((value) => value.name !== undefined || value.archived !== undefined).safeParse(request.body);
   if (!parsed.success) return reply.code(400).send({ error: '项目名称无效' });
-  return { project: await projects.renameProject(request.params.id, parsed.data.name) };
+  try { return { project: parsed.data.name !== undefined ? await projects.renameProject(request.params.id, parsed.data.name) : await projects.archiveProject(request.params.id, Boolean(parsed.data.archived)) }; }
+  catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : '项目更新失败' }); }
+});
+
+app.post<{ Params: { id: string } }>('/api/projects/:id/duplicate', async (request, reply) => {
+  if (!requireOwner(request, reply)) return;
+  const parsed = z.object({ name: z.string().min(1).max(50) }).safeParse(request.body);
+  if (!parsed.success) return reply.code(400).send({ error: '副本名称无效' });
+  try { return reply.code(201).send({ project: await projects.duplicateProject(request.params.id, parsed.data.name) }); }
+  catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : '项目复制失败' }); }
 });
 
 app.put<{ Params: { id: string } }>('/api/projects/:id/model', async (request, reply) => {
@@ -307,11 +370,71 @@ app.put<{ Params: { id: string } }>('/api/projects/:id/model', async (request, r
   return { project: await projects.setProjectModel(request.params.id, model.model, effort) };
 });
 
+async function projectGitRoot(projectId: string): Promise<string | undefined> {
+  const root = projects.projectRoot(projectId);
+  for (const candidate of [root, path.join(root, 'repository')]) {
+    if ((await stat(path.join(candidate, '.git')).catch(() => null))?.isDirectory()) return candidate;
+  }
+  return undefined;
+}
+
+async function git(projectId: string, args: string[], timeout = 60_000): Promise<string> {
+  const cwd = await projectGitRoot(projectId);
+  if (!cwd) throw new Error('当前项目还没有 Git 仓库');
+  const { stdout, stderr } = await execFileAsync('/usr/bin/git', ['-C', cwd, ...args], { timeout, maxBuffer: 2 * 1024 * 1024 });
+  return `${stdout}${stderr}`.trim();
+}
+
+app.get<{ Params: { id: string } }>('/api/projects/:id/git', async (request, reply) => {
+  if (!requireOwner(request, reply)) return;
+  try {
+    const root = await projectGitRoot(request.params.id);
+    if (!root) return { repository: false, changes: [], diff: '' };
+    const [branch, statusText, diff] = await Promise.all([
+      git(request.params.id, ['branch', '--show-current']), git(request.params.id, ['status', '--porcelain=v1']), git(request.params.id, ['diff', '--no-ext-diff', '--unified=3']),
+    ]);
+    const changes = statusText.split('\n').filter(Boolean).map((line) => ({ status: line.slice(0, 2).trim() || '?', path: line.slice(3) }));
+    return { repository: true, branch: branch || 'detached', changes, diff: diff.slice(0, 1_000_000) };
+  } catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : 'Git 状态读取失败' }); }
+});
+
+app.post<{ Params: { id: string } }>('/api/projects/:id/git', async (request, reply) => {
+  if (!requireOwner(request, reply)) return;
+  const parsed = z.discriminatedUnion('action', [
+    z.object({ action: z.literal('pull') }), z.object({ action: z.literal('push') }),
+    z.object({ action: z.literal('commit'), message: z.string().min(1).max(160) }),
+    z.object({ action: z.literal('discard'), path: z.string().min(1).max(500) }),
+  ]).safeParse(request.body);
+  if (!parsed.success) return reply.code(400).send({ error: 'Git 操作参数无效' });
+  try {
+    if (parsed.data.action === 'pull') return { ok: true, output: await git(request.params.id, ['pull', '--ff-only'], 120_000) };
+    if (parsed.data.action === 'push') return { ok: true, output: await git(request.params.id, ['push'], 120_000) };
+    if (parsed.data.action === 'commit') {
+      await git(request.params.id, ['add', '--all']);
+      return { ok: true, output: await git(request.params.id, ['commit', '-m', parsed.data.message], 120_000) };
+    }
+    if (path.isAbsolute(parsed.data.path) || parsed.data.path.split(/[\\/]/).includes('..')) throw new Error('文件路径无效');
+    return { ok: true, output: await git(request.params.id, ['restore', '--worktree', '--', parsed.data.path]) };
+  } catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : 'Git 操作失败' }); }
+});
+
+app.post('/api/projects/github', async (request, reply) => {
+  if (!requireOwner(request, reply)) return;
+  const parsed = z.object({ name: z.string().min(1).max(50), url: z.string().url().max(500) }).safeParse(request.body);
+  if (!parsed.success || !/^https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+(?:\.git)?$/.test(parsed.data.url)) return reply.code(400).send({ error: '请输入有效的 GitHub HTTPS 仓库地址' });
+  const project = await projects.createProject(parsed.data.name);
+  try {
+    const destination = path.join(projects.projectRoot(project.id), 'repository');
+    await execFileAsync('/usr/bin/git', ['clone', '--depth=1', '--', parsed.data.url, destination], { timeout: 180_000, maxBuffer: 2 * 1024 * 1024 });
+    return reply.code(201).send({ project });
+  } catch (error) { return reply.code(400).send({ error: error instanceof Error ? `项目已创建，但 Clone 失败：${error.message}` : 'GitHub 导入失败', project }); }
+});
+
 async function listFiles(root: string, prefix: string) {
   const entries = await readdir(root, { withFileTypes: true });
   const files = [];
   for (const entry of entries.slice(0, 500)) {
-    if (!entry.isFile()) continue;
+    if (!entry.isFile() || entry.name.startsWith('.upload-')) continue;
     const fullPath = path.join(root, entry.name);
     const details = await stat(fullPath);
     const displayName = displayFileName(entry.name);
@@ -375,6 +498,56 @@ app.post<{ Querystring: { projectId?: string } }>('/api/files/upload', async (re
   }
   const details = await stat(destination);
   return { file: { name: originalName, storedName, path: `inbox/${storedName}`, size: details.size } };
+});
+
+const uploadSessionHeaders = z.object({
+  uploadId: z.string().uuid(), fileName: z.string().min(1).max(200), totalSize: z.coerce.number().int().positive().max(config.maxUploadBytes),
+});
+
+function chunkSession(request: FastifyRequest, projectId: string) {
+  const parsed = uploadSessionHeaders.safeParse({ uploadId: request.headers['x-upload-id'], fileName: request.headers['x-file-name'], totalSize: request.headers['x-file-size'] });
+  if (!parsed.success) throw new Error('上传会话参数无效');
+  const originalName = path.basename(decodeURIComponent(parsed.data.fileName)).replace(/[\u0000-\u001f<>:"/\\|?*]/g, '_').slice(0, 160) || 'upload.bin';
+  return { ...parsed.data, originalName, part: path.join(projects.inbox(projectId), `.upload-${parsed.data.uploadId}.part`) };
+}
+
+app.get<{ Querystring: { projectId?: string } }>('/api/files/upload-session', async (request, reply) => {
+  if (!requireOwner(request, reply)) return;
+  try {
+    const session = chunkSession(request, request.query.projectId ?? 'default');
+    const details = await stat(session.part).catch(() => null);
+    return { uploaded: details?.size ?? 0, totalSize: session.totalSize };
+  } catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : '上传会话无效' }); }
+});
+
+app.put<{ Querystring: { projectId?: string }; Body: Buffer }>('/api/files/upload-chunk', { bodyLimit: 9 * 1024 * 1024 }, async (request, reply) => {
+  if (!requireOwner(request, reply)) return;
+  try {
+    const projectId = request.query.projectId ?? 'default';
+    const session = chunkSession(request, projectId);
+    const offset = Number(request.headers['x-upload-offset']);
+    const body = request.body;
+    if (!Buffer.isBuffer(body) || !Number.isSafeInteger(offset) || offset < 0 || body.length > 8 * 1024 * 1024) throw new Error('分片参数无效');
+    const current = (await stat(session.part).catch(() => null))?.size ?? 0;
+    if (current !== offset) return reply.code(409).send({ error: '上传位置已变化', uploaded: current });
+    if (current + body.length > session.totalSize) throw new Error('分片超过文件大小');
+    await appendFile(session.part, body, { mode: 0o600 });
+    return { uploaded: current + body.length, totalSize: session.totalSize };
+  } catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : '分片上传失败' }); }
+});
+
+app.post<{ Querystring: { projectId?: string } }>('/api/files/upload-complete', async (request, reply) => {
+  if (!requireOwner(request, reply)) return;
+  try {
+    const projectId = request.query.projectId ?? 'default';
+    const session = chunkSession(request, projectId);
+    const details = await stat(session.part);
+    if (details.size !== session.totalSize) return reply.code(409).send({ error: '文件尚未上传完整', uploaded: details.size });
+    const storedName = `${session.uploadId}-${session.originalName}`;
+    const destination = path.join(projects.inbox(projectId), storedName);
+    await rename(session.part, destination);
+    return { file: { name: session.originalName, storedName, path: `inbox/${storedName}`, size: details.size } };
+  } catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : '完成上传失败' }); }
 });
 
 app.get<{ Querystring: { path?: string; projectId?: string } }>('/api/files/download', async (request, reply) => {
