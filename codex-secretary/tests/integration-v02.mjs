@@ -120,6 +120,8 @@ try {
   const restoredThread = await (await api(`/api/threads/${encodeURIComponent(accepted.threadId)}?projectId=${encodeURIComponent(project.id)}`)).json();
   const restoredTurns = restoredThread.thread?.turns ?? [];
   if (restoredTurns.length !== 2 || !restoredTurns.every((turn) => turn.items?.some((item) => item.type === 'agentMessage' && item.text?.includes('MOCK_OK')))) throw new Error('任务结束后无法重新同步完整对话');
+  const exportedThread = await api(`/api/threads/${encodeURIComponent(accepted.threadId)}/export?projectId=${encodeURIComponent(project.id)}`);
+  if (!exportedThread.ok || !exportedThread.headers.get('content-disposition')?.includes('.md') || !(await exportedThread.text()).includes('## 掌心助理')) throw new Error('Markdown 对话导出失败');
   const defaultTasks = (await (await api('/api/tasks?projectId=default')).json()).tasks;
   if (defaultTasks.length !== 0) throw new Error('任务记录跨项目泄露');
   const migratedState = JSON.parse(await readFile(path.join(workspace, '.palm', 'state.json'), 'utf8'));

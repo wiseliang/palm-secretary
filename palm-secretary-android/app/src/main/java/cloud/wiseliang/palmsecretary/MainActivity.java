@@ -59,11 +59,15 @@ public final class MainActivity extends Activity {
     private static final int FILE_CHOOSER_REQUEST = 1001;
     private static final int NOTIFICATION_PERMISSION_REQUEST = 1002;
     private static final String TASK_CHANNEL_ID = "palm_tasks";
+    private static final String EXTRA_PROJECT_ID = "palm_project_id";
+    private static final String EXTRA_THREAD_ID = "palm_thread_id";
 
     private WebView webView;
     private ProgressBar progress;
     private ValueCallback<Uri[]> fileCallback;
     private boolean resumed;
+    private String pendingProjectId;
+    private String pendingThreadId;
     private final Map<String, SharedFile> sharedFiles = new LinkedHashMap<>();
 
     private static final class SharedFile {
@@ -91,6 +95,7 @@ public final class MainActivity extends Activity {
         configureWebView();
         configureNotifications();
         receiveSharedIntent(getIntent());
+        receiveTaskTarget(getIntent());
 
         if (savedInstanceState == null) {
             loadHome();
@@ -113,7 +118,7 @@ public final class MainActivity extends Activity {
         settings.setAllowContentAccess(true);
         settings.setMixedContentMode(WebSettings.MIXED_CONTENT_NEVER_ALLOW);
         settings.setMediaPlaybackRequiresUserGesture(true);
-        settings.setUserAgentString(settings.getUserAgentString() + " PalmSecretaryAndroid/0.3.2");
+        settings.setUserAgentString(settings.getUserAgentString() + " PalmSecretaryAndroid/0.3.3");
         if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
             settings.setSafeBrowsingEnabled(true);
         }
@@ -138,6 +143,7 @@ public final class MainActivity extends Activity {
                 progress.setVisibility(View.GONE);
                 CookieManager.getInstance().flush();
                 dispatchSharedFiles();
+                dispatchTaskTarget();
             }
 
             @Override
@@ -220,7 +226,7 @@ public final class MainActivity extends Activity {
 
     private final class TaskNotificationBridge {
         @JavascriptInterface
-        public void notifyTask(String status) {
+        public void notifyTask(String status, String projectId, String threadId) {
             if (resumed) return;
             String title = "任务已完成";
             String message = "掌心助理已完成服务器任务";
@@ -232,8 +238,11 @@ public final class MainActivity extends Activity {
                 message = "打开掌心助理查看当前结果";
             }
             Intent intent = new Intent(MainActivity.this, MainActivity.class)
+                .putExtra(EXTRA_PROJECT_ID, projectId)
+                .putExtra(EXTRA_THREAD_ID, threadId)
                 .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
-            PendingIntent pendingIntent = PendingIntent.getActivity(MainActivity.this, 0, intent,
+            int requestCode = (projectId + ":" + threadId).hashCode() & 0x7fffffff;
+            PendingIntent pendingIntent = PendingIntent.getActivity(MainActivity.this, requestCode, intent,
                 PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
             android.app.Notification notification = new android.app.Notification.Builder(MainActivity.this, TASK_CHANNEL_ID)
                 .setSmallIcon(R.drawable.app_icon)
@@ -244,6 +253,32 @@ public final class MainActivity extends Activity {
                 .build();
             NotificationManager manager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
             manager.notify((int) (System.currentTimeMillis() & 0x7fffffff), notification);
+        }
+    }
+
+    private void receiveTaskTarget(Intent intent) {
+        if (intent == null) return;
+        String projectId = intent.getStringExtra(EXTRA_PROJECT_ID);
+        String threadId = intent.getStringExtra(EXTRA_THREAD_ID);
+        if (projectId == null || projectId.isEmpty() || threadId == null || threadId.isEmpty()) return;
+        pendingProjectId = projectId;
+        pendingThreadId = threadId;
+        intent.removeExtra(EXTRA_PROJECT_ID);
+        intent.removeExtra(EXTRA_THREAD_ID);
+    }
+
+    private void dispatchTaskTarget() {
+        if (webView == null || pendingProjectId == null || pendingThreadId == null) return;
+        try {
+            JSONObject detail = new JSONObject();
+            detail.put("projectId", pendingProjectId);
+            detail.put("threadId", pendingThreadId);
+            String script = "window.dispatchEvent(new CustomEvent('palm-open-task',{detail:" + detail.toString() + "}));";
+            pendingProjectId = null;
+            pendingThreadId = null;
+            webView.evaluateJavascript(script, null);
+        } catch (Exception ignored) {
+            // Keep the app usable even if a malformed notification target is received.
         }
     }
 
@@ -439,7 +474,9 @@ public final class MainActivity extends Activity {
         super.onNewIntent(intent);
         setIntent(intent);
         receiveSharedIntent(intent);
+        receiveTaskTarget(intent);
         dispatchSharedFiles();
+        dispatchTaskTarget();
     }
 
     @Override
@@ -451,6 +488,7 @@ public final class MainActivity extends Activity {
             webView.resumeTimers();
             webView.evaluateJavascript("window.dispatchEvent(new Event('palm-resume'));", null);
             dispatchSharedFiles();
+            dispatchTaskTarget();
         }
     }
 

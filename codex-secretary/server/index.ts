@@ -29,6 +29,30 @@ const OUTPUT_INSTRUCTIONS = `你运行在掌心助理的独立项目工作区。
 type CodexModel = { id: string; model: string; displayName: string; description: string; isDefault: boolean; hidden?: boolean; supportedReasoningEfforts: Array<{ reasoningEffort: string; description: string }>; defaultReasoningEffort: string };
 let modelCache: { expiresAt: number; models: CodexModel[] } | undefined;
 
+function threadMarkdown(value: unknown, title: string): string {
+  const root = value && typeof value === 'object' ? value as Record<string, unknown> : {};
+  const thread = root.thread && typeof root.thread === 'object' ? root.thread as Record<string, unknown> : root;
+  const turns = Array.isArray(thread.turns) ? thread.turns : [];
+  const sections = [`# ${title}`, '', `导出时间：${new Date().toISOString()}`, ''];
+  for (const turn of turns) {
+    if (!turn || typeof turn !== 'object') continue;
+    const items = Array.isArray((turn as Record<string, unknown>).items) ? (turn as Record<string, unknown>).items as unknown[] : [];
+    for (const item of items) {
+      if (!item || typeof item !== 'object') continue;
+      const record = item as Record<string, unknown>;
+      const type = String(record.type ?? '');
+      if (!['userMessage', 'agentMessage'].includes(type)) continue;
+      const content = record.content;
+      const text = String(record.text ?? record.message ?? '') || (Array.isArray(content)
+        ? content.map((part) => part && typeof part === 'object' ? String((part as Record<string, unknown>).text ?? '') : '').filter(Boolean).join('\n')
+        : '');
+      if (!text.trim()) continue;
+      sections.push(type === 'userMessage' ? '## 我' : '## 掌心助理', '', text.trim(), '');
+    }
+  }
+  return `${sections.join('\n').trim()}\n`;
+}
+
 await mkdir(config.workspace, { recursive: true });
 await projects.initialize();
 
@@ -238,6 +262,19 @@ app.get<{ Params: { id: string }; Querystring: { projectId?: string } }>('/api/t
   projects.assertThreadProject(request.params.id, projectId);
   await bridge.ready();
   return bridge.call('thread/read', { threadId: request.params.id, includeTurns: true });
+});
+
+app.get<{ Params: { id: string }; Querystring: { projectId?: string } }>('/api/threads/:id/export', async (request, reply) => {
+  if (!requireOwner(request, reply)) return;
+  const projectId = request.query.projectId ?? 'default';
+  projects.assertThreadProject(request.params.id, projectId);
+  const thread = projects.listThreads(projectId).find((item) => item.threadId === request.params.id)
+    ?? projects.listThreads(projectId, true).find((item) => item.threadId === request.params.id);
+  await bridge.ready();
+  const content = threadMarkdown(await bridge.call('thread/read', { threadId: request.params.id, includeTurns: true }), thread?.title ?? '掌心助理对话');
+  const filename = `${(thread?.title ?? '掌心助理对话').replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_').slice(0, 60)}.md`;
+  return reply.header('Content-Type', 'text/markdown; charset=utf-8').header('Cache-Control', 'no-store')
+    .header('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(filename)}`).send(content);
 });
 
 app.get('/api/projects', async (request, reply) => {

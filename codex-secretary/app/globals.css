@@ -75,6 +75,8 @@ button { color: inherit; }
 .model-refresh { width: 30px; height: 30px; border: 1px solid var(--line); border-radius: 9px; background: rgba(255,255,255,.72); color: var(--jade); }
 .message-stage { width: 100%; max-width: 820px; margin: 0 auto; flex: 1; padding: 26px 18px 170px; }
 .date-divider { display: flex; align-items: center; gap: 12px; color: #94978f; font-size: 10px; letter-spacing: .12em; }
+.thread-export-floating { position: fixed; z-index: 24; right: 18px; bottom: calc(112px + env(safe-area-inset-bottom)); padding: 8px 11px; border: 1px solid var(--line); border-radius: 11px; background: var(--surface-strong); box-shadow: var(--shadow-soft); color: var(--muted); font-size: 11px; text-decoration: none; }
+.thread-export-floating:hover { border-color: var(--jade); color: var(--jade); }
 .date-divider::before, .date-divider::after { content: ''; flex: 1; height: 1px; background: var(--line); }
 .assistant-message { display: grid; grid-template-columns: 42px minmax(0, 1fr); gap: 14px; margin-top: 30px; }
 .assistant-seal { width: 42px; height: 42px; border-radius: 15px 15px 15px 5px; box-shadow: 0 8px 20px rgba(25,34,30,.16); }

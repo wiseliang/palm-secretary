@@ -21,7 +21,7 @@ type DeliveryState = 'idle' | 'sending' | 'accepted';
 declare global {
   interface Window {
     __PALM_SHARED_FILES__?: NativeSharedFile[];
-    PalmNative?: { notifyTask?: (status: 'completed' | 'failed' | 'interrupted') => void };
+    PalmNative?: { notifyTask?: (status: 'completed' | 'failed' | 'interrupted', projectId: string, threadId: string) => void };
   }
 }
 
@@ -567,7 +567,7 @@ export default function Home() {
         }
         if (['turn/completed', 'turn/failed', 'turn/interrupted'].includes(String(rpc.method))) {
           const notificationStatus = rpc.method === 'turn/failed' ? 'failed' : rpc.method === 'turn/interrupted' ? 'interrupted' : 'completed';
-          try { window.PalmNative?.notifyTask?.(notificationStatus); } catch { /* 原生桥不可用时保持网页流程 */ }
+          try { if (threadIdRef.current) window.PalmNative?.notifyTask?.(notificationStatus, projectId, threadIdRef.current); } catch { /* 原生桥不可用时保持网页流程 */ }
           setDeliveryState('idle');
           runningRef.current = false; setRunning(false); setTurnId(undefined);
           const terminalText = rpc.method === 'turn/interrupted' ? '任务已停止。' : rpc.method === 'turn/failed' ? '任务执行失败，请在记录中重试。' : '';
@@ -625,6 +625,36 @@ export default function Home() {
       window.clearInterval(timer);
     };
   }, [authenticated, loadDashboard, loadProjectData, projectId, refreshThreadMessages]);
+
+  useEffect(() => {
+    if (!authenticated) return;
+    const rememberTarget = (event: Event) => {
+      const detail = (event as CustomEvent<{ projectId?: string; threadId?: string }>).detail;
+      if (!detail?.projectId || !detail.threadId) return;
+      window.localStorage.setItem('palm:open-task', JSON.stringify(detail));
+      setShowArchived(false); setProjectId(detail.projectId); setView('chat');
+    };
+    window.addEventListener('palm-open-task', rememberTarget);
+    return () => window.removeEventListener('palm-open-task', rememberTarget);
+  }, [authenticated]);
+
+  useEffect(() => {
+    if (!authenticated || showArchived) return;
+    const stored = window.localStorage.getItem('palm:open-task');
+    if (!stored) return;
+    try {
+      const target = JSON.parse(stored) as { projectId?: string; threadId?: string };
+      if (target.projectId !== projectId || !target.threadId) return;
+      const thread = threads.find((item) => item.threadId === target.threadId);
+      if (!thread) return;
+      window.localStorage.removeItem('palm:open-task');
+      void fetch(`/api/threads/${encodeURIComponent(thread.threadId)}?projectId=${encodeURIComponent(projectId)}`).then(async (response) => {
+        if (!response.ok) { setNotice('无法打开通知对应的对话'); return; }
+        const restored = messagesFromThread(await response.json());
+        setThreadId(thread.threadId); setMessages(restored); setFocusedMessageId(restored.at(-1)?.id); setView('chat');
+      });
+    } catch { window.localStorage.removeItem('palm:open-task'); }
+  }, [authenticated, projectId, showArchived, threads]);
 
   async function login(event: FormEvent) {
     event.preventDefault(); setLoginError('');
@@ -877,6 +907,7 @@ export default function Home() {
   if (!authenticated) return <main className="login-shell"><section className="login-card"><div className="login-seal">掌</div><p className="eyebrow">私人空间</p><h1>掌心助理</h1><p className="login-intro">从手机安全访问服务器上的 Codex。</p><form onSubmit={login}><label htmlFor="password">访问密码</label><input id="password" type="password" value={password} onChange={(event) => setPassword(event.target.value)} autoComplete="current-password" autoFocus />{loginError && <p className="form-error" role="alert">{loginError}</p>}<button type="submit" disabled={!password}>进入工作台</button></form><p className="privacy-note">仅允许通过你的受保护域名访问</p></section></main>;
 
   return <main className="app-shell">
+    {view === 'chat' && threadId && <a className="thread-export-floating" href={`/api/threads/${encodeURIComponent(threadId)}/export?projectId=${encodeURIComponent(projectId)}`} aria-label="导出当前对话">导出</a>}
     <aside className="desktop-rail" aria-label="主导航"><div className="rail-brand"><div className="brand-mark">掌</div><strong>掌心</strong></div><nav><button className={`rail-button ${view === 'chat' ? 'active' : ''}`} aria-label="新对话" onClick={newConversation}><b>✦</b><span>对话</span></button><button className={`rail-button ${view === 'history' ? 'active' : ''}`} aria-label="任务记录" onClick={() => setView('history')}><b>▤</b><span>记录</span></button><button className={`rail-button ${view === 'files' ? 'active' : ''}`} aria-label="文件中心" onClick={() => setView('files')}><b>▱</b><span>文件</span></button></nav><button className="rail-avatar" aria-label="退出登录" onClick={() => void fetch('/api/auth/logout', { method: 'POST' }).then(() => setAuthenticated(false))}><b>我</b><span>退出</span></button></aside>
     <section className={`conversation ${draggingFiles ? 'drag-active' : ''}`} onDragEnter={dragEnter} onDragOver={(event) => { if (event.dataTransfer.types.includes('Files')) event.preventDefault(); }} onDragLeave={dragLeave} onDrop={dropFiles}>
       {draggingFiles && <div className="drop-overlay" role="status"><div><span>＋</span><strong>拖到这里上传</strong><small>文件会加入当前项目和本轮对话</small></div></div>}
