@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import {
   mkdtemp,
   mkdir,
@@ -10,7 +11,10 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { promisify } from "node:util";
 import { ProjectStore } from "../dist-server/project-store.js";
+
+const execFileAsync = promisify(execFile);
 
 const workspace = await mkdtemp(path.join(tmpdir(), "palm-v015-"));
 try {
@@ -19,9 +23,9 @@ try {
   const project = await store.createProject("GitHub 项目");
   const root = store.projectRoot(project.id);
   const repository = path.join(root, "repository");
-  await mkdir(path.join(repository, ".git"), { recursive: true });
   await mkdir(path.join(repository, "inbox"), { recursive: true });
   await mkdir(path.join(repository, "outbox"), { recursive: true });
+  await execFileAsync("git", ["init", repository]);
   await store.setProjectWorkdir(project.id, "repository");
 
   const upload = "123e4567-e89b-42d3-a456-426614174000-contract.pdf";
@@ -29,8 +33,12 @@ try {
   await writeFile(path.join(repository, "inbox", upload), "migrated");
   await writeFile(
     path.join(repository, "inbox", "source.ts"),
-    "tracked-looking repository file",
+    "tracked repository file",
   );
+  await writeFile(path.join(repository, "inbox", "draft.json"), "untracked repository asset");
+  await writeFile(path.join(repository, ".gitignore"), "outbox/runtime-cache.db\n");
+  await writeFile(path.join(repository, "outbox", "runtime-cache.db"), "ignored repository asset");
+  await execFileAsync("git", ["-C", repository, "add", ".gitignore", "inbox/source.ts"]);
   await store.rememberThread("thread-1", project.id, "测试");
   await store.rememberTask("turn-1", "thread-1", project.id, "生成报告", [
     `inbox/${upload}`,
@@ -59,13 +67,31 @@ try {
   );
   assert.equal(
     await readFile(path.join(repository, "inbox", "source.ts"), "utf8"),
-    "tracked-looking repository file",
+    "tracked repository file",
+  );
+  assert.equal(
+    await readFile(path.join(repository, "inbox", "draft.json"), "utf8"),
+    "untracked repository asset",
+    "有效 Git 仓库中的 untracked 文件绝不能被迁移",
+  );
+  assert.equal(
+    await readFile(path.join(repository, "outbox", "runtime-cache.db"), "utf8"),
+    "ignored repository asset",
+    "被 .gitignore 忽略的仓库运行时资产绝不能被迁移",
   );
 
   await restarted.rememberTask("turn-2", "thread-1", project.id, "运行中");
   await assert.rejects(
     () => restarted.archiveProject(project.id, true),
     /运行中的任务/,
+  );
+  await assert.rejects(
+    () => restarted.updateThread("thread-1", project.id, { archived: true }),
+    /当前对话仍有任务运行/,
+  );
+  await assert.rejects(
+    () => restarted.deleteThread("thread-1", project.id),
+    /当前对话仍有任务运行/,
   );
 } finally {
   await rm(workspace, { recursive: true, force: true });
@@ -86,10 +112,20 @@ const bridge = await readFile(
 assert.match(server, /loadedThreads\.clear\(\)/);
 assert.match(server, /startingProjects\.has\(message\.projectId\)/);
 assert.match(server, /type: 'task\.finished'/);
+assert.match(server, /completedAt: task\.completedAt/);
 assert.match(server, /upload-complete[\s\S]{0,900}项目已归档/);
 assert.match(server, /--porcelain=v1', '-z'/);
 assert.match(page, /const visibleThreads = showArchived/);
 assert.match(page, /message\.type === "task\.finished"/);
+assert.match(page, /type: "thread\.subscribe", projectId, threadId/);
+assert.match(page, /COMPLETION_CURSOR_KEY/);
+assert.match(page, /rememberTaskNotification/);
+const android = await readFile(
+  new URL("../../palm-secretary-android/app/src/main/java/cloud/wiseliang/palmsecretary/MainActivity.java", import.meta.url),
+  "utf8",
+);
+assert.match(android, /PalmSecretaryAndroid\/" \+ BuildConfig\.VERSION_NAME/);
+assert.doesNotMatch(android, /PalmSecretaryAndroid\/0\.3\.3/);
 const projectSelector =
   page.match(
     /<select[\s\S]{0,500}aria-label="当前项目"[\s\S]{0,500}<\/select>/,

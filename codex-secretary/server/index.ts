@@ -176,7 +176,17 @@ bridge.on('message', async (message: Record<string, unknown>) => {
     const errorMessage = typeof failure?.message === 'string' ? failure.message : undefined;
     try {
       const task = await projects.finishTask(threadId, turnId, status, errorMessage);
-      if (task) broadcast({ type: 'task.finished', payload: { projectId: task.projectId, threadId: task.threadId, turnId: task.turnId, status: task.status } });
+      if (task) broadcast({
+        type: 'task.finished',
+        payload: {
+          taskId: task.taskId,
+          projectId: task.projectId,
+          threadId: task.threadId,
+          turnId: task.turnId,
+          status: task.status,
+          completedAt: task.completedAt,
+        },
+      });
     }
     catch (error) { app.log.warn({ err: error }, '任务状态写入失败'); }
   }
@@ -273,13 +283,19 @@ app.patch<{ Params: { id: string }; Querystring: { projectId?: string } }>('/api
   const parsed = z.object({ title: z.string().min(1).max(80).optional(), archived: z.boolean().optional(), favorite: z.boolean().optional() }).refine((value) => value.title !== undefined || value.archived !== undefined || value.favorite !== undefined).safeParse(request.body);
   if (!parsed.success) return reply.code(400).send({ error: '对话更新内容无效' });
   try { return { thread: await projects.updateThread(request.params.id, request.query.projectId ?? 'default', parsed.data) }; }
-  catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : '对话更新失败' }); }
+  catch (error) {
+    const message = error instanceof Error ? error.message : '对话更新失败';
+    return reply.code(message === '当前对话仍有任务运行，请先停止任务' ? 409 : 400).send({ error: message });
+  }
 });
 
 app.delete<{ Params: { id: string }; Querystring: { projectId?: string } }>('/api/threads/:id', async (request, reply) => {
   if (!requireOwner(request, reply)) return;
   try { await projects.deleteThread(request.params.id, request.query.projectId ?? 'default'); return reply.code(204).send(); }
-  catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : '对话删除失败' }); }
+  catch (error) {
+    const message = error instanceof Error ? error.message : '对话删除失败';
+    return reply.code(message === '当前对话仍有任务运行，请先停止任务' ? 409 : 400).send({ error: message });
+  }
 });
 
 app.get<{ Querystring: { projectId?: string } }>('/api/tasks', async (request, reply) => {

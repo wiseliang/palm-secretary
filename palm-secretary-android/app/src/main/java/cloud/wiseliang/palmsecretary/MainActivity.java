@@ -118,7 +118,7 @@ public final class MainActivity extends Activity {
         settings.setAllowContentAccess(true);
         settings.setMixedContentMode(WebSettings.MIXED_CONTENT_NEVER_ALLOW);
         settings.setMediaPlaybackRequiresUserGesture(true);
-        settings.setUserAgentString(settings.getUserAgentString() + " PalmSecretaryAndroid/0.3.3");
+        settings.setUserAgentString(settings.getUserAgentString() + " PalmSecretaryAndroid/" + BuildConfig.VERSION_NAME);
         if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
             settings.setSafeBrowsingEnabled(true);
         }

@@ -1,8 +1,6 @@
 import { randomUUID } from 'node:crypto';
-import { execFile } from 'node:child_process';
 import { access, cp, mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import { promisify } from 'node:util';
 
 export type Project = {
   id: string;
@@ -47,7 +45,6 @@ type StoreState = { version: 7; projects: Project[]; threads: ProjectThread[]; t
 
 const PROJECT_ID = /^[a-z0-9][a-z0-9-]{0,63}$/;
 const UPLOAD_NAME = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}-/i;
-const execFileAsync = promisify(execFile);
 
 export class ProjectStore {
   private readonly stateDir: string;
@@ -217,6 +214,9 @@ export class ProjectStore {
 
   async updateThread(threadId: string, projectId: string, update: { title?: string; archived?: boolean; favorite?: boolean }): Promise<ProjectThread> {
     this.assertThreadProject(threadId, projectId);
+    if (update.archived === true && this.hasRunningTaskForThread(threadId, projectId)) {
+      throw new Error('当前对话仍有任务运行，请先停止任务');
+    }
     const thread = this.state.threads.find((item) => item.threadId === threadId)!;
     if (update.title !== undefined) {
       const title = update.title.trim().replace(/[\u0000-\u001f]/g, '').slice(0, 80);
@@ -237,6 +237,9 @@ export class ProjectStore {
 
   async deleteThread(threadId: string, projectId: string): Promise<void> {
     this.assertThreadProject(threadId, projectId);
+    if (this.hasRunningTaskForThread(threadId, projectId)) {
+      throw new Error('当前对话仍有任务运行，请先停止任务');
+    }
     this.state.threads = this.state.threads.filter((item) => item.threadId !== threadId);
     this.state.tasks = this.state.tasks.filter((item) => item.threadId !== threadId);
     await this.persist();
@@ -245,6 +248,11 @@ export class ProjectStore {
   listTasks(projectId: string): ProjectTask[] {
     this.getProject(projectId);
     return this.state.tasks.filter((task) => task.projectId === projectId).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)).slice(0, 200);
+  }
+
+  hasRunningTaskForThread(threadId: string, projectId: string): boolean {
+    this.assertThreadProject(threadId, projectId);
+    return this.state.tasks.some((task) => task.projectId === projectId && task.threadId === threadId && task.status === 'running');
   }
 
   findTaskByClientRequestId(projectId: string, clientRequestId: string): ProjectTask | undefined {
@@ -379,9 +387,11 @@ export class ProjectStore {
         for (const entry of entries) {
           if (!entry.isFile()) continue;
           const relativePath = `${folder}/${entry.name}`;
-          const tracked = await this.isGitTracked(workdir, relativePath);
           const knownPalmFile = referenced.has(relativePath) || (folder === 'inbox' && UPLOAD_NAME.test(entry.name));
-          if (tracked === true || (tracked === undefined && !knownPalmFile)) continue;
+          // Never infer Palm ownership from Git state. Untracked and ignored files may
+          // still be real repository assets, so only migrate files with affirmative
+          // Palm provenance (task metadata or the UUID upload naming convention).
+          if (!knownPalmFile) continue;
           const sourcePath = path.join(source, entry.name);
           let destination = path.join(destinationRoot, entry.name);
           if (await stat(destination).catch(() => null)) {
@@ -392,16 +402,6 @@ export class ProjectStore {
         }
         await rm(source, { recursive: false }).catch(() => undefined);
       }
-    }
-  }
-
-  private async isGitTracked(workdir: string, relativePath: string): Promise<boolean | undefined> {
-    try {
-      await execFileAsync('/usr/bin/git', ['-C', workdir, 'ls-files', '--error-unmatch', '--', relativePath], { timeout: 5_000 });
-      return true;
-    } catch (error) {
-      if ((error as { code?: unknown }).code === 1) return false;
-      return undefined;
     }
   }
 

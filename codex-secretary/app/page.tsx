@@ -172,6 +172,11 @@ type PendingNavigation = {
   view: "chat" | "files";
   fileSearch?: string;
 };
+type TaskNotice = {
+  projectId: string;
+  threadId: string;
+  text: string;
+};
 
 declare global {
   interface Window {
@@ -193,6 +198,33 @@ const starterTasks = [
   "检查服务器运行状态",
 ];
 const SAFE_UPLOAD_BYTES = 95 * 1024 ** 2;
+const COMPLETION_CURSOR_KEY = "palm:last-task-completed-at";
+const NOTIFIED_TASKS_KEY = "palm:notified-task-ids";
+
+function rememberTaskNotification(taskId: string, completedAt?: string): boolean {
+  const notified = new Set<string>();
+  try {
+    const stored = JSON.parse(
+      window.localStorage.getItem(NOTIFIED_TASKS_KEY) ?? "[]",
+    ) as unknown;
+    if (Array.isArray(stored))
+      stored.filter((item): item is string => typeof item === "string").forEach((item) => notified.add(item));
+  } catch {
+    /* invalid legacy cache is replaced below */
+  }
+  const isNew = !notified.has(taskId);
+  notified.add(taskId);
+  window.localStorage.setItem(
+    NOTIFIED_TASKS_KEY,
+    JSON.stringify([...notified].slice(-100)),
+  );
+  if (completedAt) {
+    const previous = window.localStorage.getItem(COMPLETION_CURSOR_KEY) ?? "";
+    if (!previous || completedAt > previous)
+      window.localStorage.setItem(COMPLETION_CURSOR_KEY, completedAt);
+  }
+  return isNew;
+}
 
 function usageWindowsFrom(value: unknown): UsageWindow[] {
   const candidates: Array<{ path: string; value: Record<string, unknown> }> =
@@ -955,11 +987,13 @@ export default function Home() {
     "连接中" | "已连接" | "正在重连"
   >("连接中");
   const [notice, setNotice] = useState("");
+  const [taskNotice, setTaskNotice] = useState<TaskNotice>();
   const [uploading, setUploading] = useState(false);
   const [uploadFeedbacks, setUploadFeedbacks] = useState<UploadFeedback[]>([]);
   const socketRef = useRef<WebSocket | null>(null);
   const threadIdRef = useRef<string>();
   const projectIdRef = useRef(projectId);
+  const projectsRef = useRef<Project[]>([]);
   const runningRef = useRef(false);
   const pendingTurnRef = useRef<PendingTurn>();
   const reconnectRef = useRef<number>();
@@ -1034,6 +1068,9 @@ export default function Home() {
   useEffect(() => {
     projectIdRef.current = projectId;
   }, [projectId]);
+  useEffect(() => {
+    projectsRef.current = projects;
+  }, [projects]);
   useEffect(() => {
     runningRef.current = running;
   }, [running]);
@@ -1223,6 +1260,93 @@ export default function Home() {
     [],
   );
 
+  const handleFinishedTask = useCallback(
+    (payload: {
+      taskId?: string;
+      projectId: string;
+      threadId: string;
+      status: "completed" | "failed" | "interrupted";
+      completedAt?: string;
+      projectName?: string;
+    }) => {
+      const taskId = payload.taskId ?? `${payload.projectId}:${payload.threadId}:${payload.completedAt ?? payload.status}`;
+      if (!rememberTaskNotification(taskId, payload.completedAt)) return;
+      try {
+        window.PalmNative?.notifyTask?.(
+          payload.status,
+          payload.projectId,
+          payload.threadId,
+        );
+      } catch {
+        /* 原生桥不可用时仍保留网页内通知 */
+      }
+      if (
+        payload.projectId === projectIdRef.current &&
+        payload.threadId === threadIdRef.current
+      )
+        return;
+      const projectName =
+        payload.projectName ??
+        projectsRef.current.find((project) => project.id === payload.projectId)
+          ?.name ??
+        "其他项目";
+      const result =
+        payload.status === "completed"
+          ? "任务已完成"
+          : payload.status === "failed"
+            ? "任务执行失败"
+            : "任务已停止";
+      setTaskNotice({
+        projectId: payload.projectId,
+        threadId: payload.threadId,
+        text: `${projectName} · ${result}`,
+      });
+    },
+    [],
+  );
+
+  const recoverFinishedTasks = useCallback(async () => {
+    const cursor = window.localStorage.getItem(COMPLETION_CURSOR_KEY);
+    if (!cursor) {
+      window.localStorage.setItem(COMPLETION_CURSOR_KEY, new Date().toISOString());
+      return;
+    }
+    const projectResponse = await fetch("/api/projects").catch(() => null);
+    if (!projectResponse?.ok) return;
+    const listed = ((await projectResponse.json()) as { projects: Project[] })
+      .projects;
+    const recovered: Array<ProjectTask & { projectName: string }> = [];
+    await Promise.all(
+      listed.map(async (project) => {
+        const response = await fetch(
+          `/api/tasks?projectId=${encodeURIComponent(project.id)}`,
+        ).catch(() => null);
+        if (!response?.ok) return;
+        const body = (await response.json()) as { tasks: ProjectTask[] };
+        for (const task of body.tasks) {
+          if (
+            task.status !== "running" &&
+            task.completedAt &&
+            task.completedAt > cursor
+          )
+            recovered.push({ ...task, projectName: project.name });
+        }
+      }),
+    );
+    recovered
+      .sort((a, b) => (a.completedAt ?? "").localeCompare(b.completedAt ?? ""))
+      .forEach((task) =>
+        handleFinishedTask({
+          taskId: task.taskId,
+          projectId: task.projectId,
+          threadId: task.threadId,
+          status: task.status as "completed" | "failed" | "interrupted",
+          completedAt: task.completedAt,
+          projectName: task.projectName,
+        }),
+      );
+  }, [handleFinishedTask]);
+
   useEffect(() => {
     fetch("/api/session")
       .then((response) => response.json())
@@ -1346,6 +1470,7 @@ export default function Home() {
           }
         }
         void loadProjectData(projectId);
+        void recoverFinishedTasks();
       };
       reconnectNowRef.current = () => {
         if (
@@ -1438,21 +1563,21 @@ export default function Home() {
         if (message.type === "task.finished") {
           const payload = message.payload as
             | {
-                projectId?: string;
-                threadId?: string;
-                status?: "completed" | "failed" | "interrupted";
-              }
+              projectId?: string;
+              threadId?: string;
+              taskId?: string;
+              status?: "completed" | "failed" | "interrupted";
+              completedAt?: string;
+            }
             | undefined;
           if (payload?.projectId && payload.threadId && payload.status) {
-            try {
-              window.PalmNative?.notifyTask?.(
-                payload.status,
-                payload.projectId,
-                payload.threadId,
-              );
-            } catch {
-              /* 原生桥不可用时保持网页流程 */
-            }
+            handleFinishedTask({
+              taskId: payload.taskId,
+              projectId: payload.projectId,
+              threadId: payload.threadId,
+              status: payload.status,
+              completedAt: payload.completedAt,
+            });
             if (payload.projectId === projectIdRef.current)
               void loadProjectData(payload.projectId);
             if (payload.threadId === threadIdRef.current) {
@@ -1593,9 +1718,27 @@ export default function Home() {
     authenticated,
     loadDashboard,
     loadProjectData,
+    handleFinishedTask,
     projectId,
+    recoverFinishedTasks,
     refreshThreadMessages,
   ]);
+
+  useEffect(() => {
+    const socket = socketRef.current;
+    if (
+      !authenticated ||
+      !projectId ||
+      !threadId ||
+      connection !== "已连接" ||
+      socket?.readyState !== WebSocket.OPEN
+    )
+      return;
+    socket.send(
+      JSON.stringify({ type: "thread.subscribe", projectId, threadId }),
+    );
+    void refreshThreadMessages(threadId, projectId);
+  }, [authenticated, connection, projectId, refreshThreadMessages, threadId]);
 
   useEffect(() => {
     if (!authenticated || !projectId) return;
@@ -1611,6 +1754,7 @@ export default function Home() {
         reconnectNowRef.current();
       }
       void loadDashboard();
+      void recoverFinishedTasks();
       const activeThreadId = threadIdRef.current;
       try {
         const loadedTasks = await loadProjectData(projectId);
@@ -1652,6 +1796,7 @@ export default function Home() {
     loadDashboard,
     loadProjectData,
     projectId,
+    recoverFinishedTasks,
     refreshThreadMessages,
   ]);
 
@@ -1714,6 +1859,19 @@ export default function Home() {
       window.localStorage.removeItem("palm:open-task");
     }
   }, [authenticated, projectId, showArchived, threads]);
+
+  function openTaskNotice() {
+    if (!taskNotice) return;
+    setPendingNavigation({
+      projectId: taskNotice.projectId,
+      threadId: taskNotice.threadId,
+      view: "chat",
+    });
+    setShowArchived(false);
+    setProjectId(taskNotice.projectId);
+    setView("chat");
+    setTaskNotice(undefined);
+  }
 
   async function login(event: FormEvent) {
     event.preventDefault();
@@ -1962,6 +2120,15 @@ export default function Home() {
     item: ProjectThread,
     update: { title?: string; archived?: boolean; favorite?: boolean },
   ) {
+    if (
+      update.archived === true &&
+      tasks.some(
+        (task) => task.threadId === item.threadId && task.status === "running",
+      )
+    ) {
+      setNotice("当前对话仍有任务运行，请先停止任务");
+      return;
+    }
     const response = await fetch(
       `/api/threads/${encodeURIComponent(item.threadId)}?projectId=${encodeURIComponent(projectId)}`,
       {
@@ -1995,8 +2162,12 @@ export default function Home() {
   }
 
   async function deleteThread(item: ProjectThread) {
-    if (running && item.threadId === threadId) {
-      setNotice("请先停止当前任务再删除对话");
+    if (
+      tasks.some(
+        (task) => task.threadId === item.threadId && task.status === "running",
+      )
+    ) {
+      setNotice("当前对话仍有任务运行，请先停止任务");
       return;
     }
     if (
@@ -2010,7 +2181,10 @@ export default function Home() {
       { method: "DELETE" },
     );
     if (!response.ok) {
-      setNotice("对话删除失败");
+      const body = (await response.json().catch(() => ({}))) as {
+        error?: string;
+      };
+      setNotice(body.error ?? "对话删除失败");
       return;
     }
     if (threadId === item.threadId) newConversation();
@@ -3447,6 +3621,12 @@ export default function Home() {
               </section>
             )}
           </div>
+        )}
+        {taskNotice && (
+          <button className="task-notice" onClick={openTaskNotice}>
+            <span>{taskNotice.text}</span>
+            <strong>查看对话 →</strong>
+          </button>
         )}
         <footer
           ref={composerRef}
