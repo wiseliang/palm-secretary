@@ -10,7 +10,7 @@ assert.match(page, /\^\(inbox\|outbox\)/);
 assert.match(page, /function ServerImage/);
 assert.match(page, /api\/files\/preview/);
 assert.match(page, /data-message-id=\{message\.id\}/);
-assert.match(page, /scrollIntoView\(\{ behavior: 'smooth', block: 'center' \}\)/);
+assert.match(page, /scrollIntoView\(\{\s*behavior:\s*["']smooth["'],\s*block:\s*["']center["'],?\s*\}\)/);
 assert.match(page, /openThread\(thread, task\.title\)/);
 assert.match(css, /\.inline-server-image/);
 assert.match(css, /@keyframes message-focus/);

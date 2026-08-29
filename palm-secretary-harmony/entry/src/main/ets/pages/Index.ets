@@ -3,7 +3,7 @@ import { fileIo } from '@kit.CoreFileKit';
 
 const APP_URL: string = 'https://ai.wiseliang.cloud/';
 const NATIVE_SHARE_PREFIX: string = `${APP_URL}__native_share/`;
-const MAX_SHARED_FILE_SIZE: number = 100 * 1024 * 1024;
+const MAX_SHARED_FILE_SIZE: number = 32 * 1024 * 1024;
 
 interface SharedResource {
   id: string;
@@ -54,7 +54,7 @@ struct Index {
       const size = fileIo.statSync(opened.fd).size;
       fileIo.closeSync(opened);
       if (size > MAX_SHARED_FILE_SIZE) {
-        this.controller.runJavaScript("window.dispatchEvent(new CustomEvent('palm-share-error',{detail:'分享文件超过 100MB 上限'}));").catch(() => {});
+        this.controller.runJavaScript("window.dispatchEvent(new CustomEvent('palm-share-error',{detail:'HarmonyOS 系统分享暂支持最大 32MB，更大文件请在掌心助理内选择上传'}));").catch(() => {});
         return;
       }
       const name = this.fileName(this.sharedUri);

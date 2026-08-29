@@ -513,6 +513,10 @@ button:not(:disabled):active, a[href]:active { transform: translateY(1px) scale(
 .chat-bubble:hover .copy-message, .copy-message:focus-visible { opacity: 1; transform: none; }
 .panel-stage { max-width: 1040px; }
 .panel-title { padding-bottom: 18px; border-bottom: 1px solid rgba(31,42,68,.08); }
+.archived-badge { display: inline-flex; margin-top: 7px; padding: 3px 8px; border-radius: 999px; background: #f2e7d7; color: #8b5b21; font-size: 10px; font-weight: 750; }
+.project-menu { position: relative; }
+.project-menu summary { display: none; }
+.project-menu > div { display: flex; gap: 8px; }
 .panel-search, .file-toolbar { position: sticky; top: var(--sticky-context-offset); z-index: 28; margin: 0 -8px 18px; padding: 12px 8px; background: color-mix(in srgb, var(--paper) 96%, transparent); backdrop-filter: blur(18px); box-shadow: 0 1px 0 var(--line); }
 .task-list, .record-list { grid-template-columns: repeat(2, minmax(0,1fr)); }
 .file-list { grid-template-columns: repeat(2, minmax(0,1fr)); }
@@ -575,6 +579,13 @@ button:not(:disabled):active, a[href]:active { transform: translateY(1px) scale(
   .chat-bubble.assistant > div { padding-right: 0; }
   .panel-stage { padding-top: 22px; }
   .panel-title { align-items: flex-start; }
+  .panel-title-actions { width: 100%; justify-content: space-between; }
+  .project-menu summary { display: inline-flex; min-height: 36px; align-items: center; padding: 0 11px; border: 1px solid var(--line); border-radius: var(--radius-control); background: var(--surface); font-size: 11px; font-weight: 700; cursor: pointer; list-style: none; }
+  .project-menu > div { position: absolute; z-index: 45; top: 42px; left: 0; width: min(230px, calc(100vw - 30px)); padding: 8px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface-strong); box-shadow: var(--shadow-soft); flex-direction: column; }
+  .project-menu:not([open]) > div { display: none; }
+  .panel-search { display: grid; grid-template-columns: 1fr auto auto; gap: 8px; }
+  .panel-search input { grid-column: 1 / -1; width: 100%; min-width: 0; }
+  .panel-search span { align-self: center; white-space: nowrap; }
   .panel-title h2 { font-size: 23px; }
   .panel-title-actions button { min-height: 36px; padding-inline: 10px; }
   .file-toolbar { align-items: stretch; flex-direction: column; }

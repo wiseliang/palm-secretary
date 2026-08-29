@@ -254,6 +254,14 @@ public final class MainActivity extends Activity {
             NotificationManager manager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
             manager.notify((int) (System.currentTimeMillis() & 0x7fffffff), notification);
         }
+
+        @JavascriptInterface
+        public void ackTaskTarget() {
+            runOnUiThread(() -> {
+                pendingProjectId = null;
+                pendingThreadId = null;
+            });
+        }
     }
 
     private void receiveTaskTarget(Intent intent) {
@@ -273,9 +281,7 @@ public final class MainActivity extends Activity {
             JSONObject detail = new JSONObject();
             detail.put("projectId", pendingProjectId);
             detail.put("threadId", pendingThreadId);
-            String script = "window.dispatchEvent(new CustomEvent('palm-open-task',{detail:" + detail.toString() + "}));";
-            pendingProjectId = null;
-            pendingThreadId = null;
+            String script = "window.__PALM_OPEN_TASK__=" + detail.toString() + ";window.dispatchEvent(new CustomEvent('palm-open-task',{detail:window.__PALM_OPEN_TASK__}));";
             webView.evaluateJavascript(script, null);
         } catch (Exception ignored) {
             // Keep the app usable even if a malformed notification target is received.

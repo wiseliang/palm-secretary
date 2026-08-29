@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { access, cp, mkdir, readFile, readdir, rename, stat, writeFile } from 'node:fs/promises';
+import { access, cp, mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
 export type Project = {
@@ -11,6 +11,7 @@ export type Project = {
   model?: string;
   reasoningEffort?: string;
   archivedAt?: string;
+  workdir?: string;
 };
 
 export type ProjectThread = {
@@ -80,6 +81,14 @@ export class ProjectStore {
       await this.persist();
     }
     for (const project of this.state.projects) await this.ensureProjectDirectories(project);
+    let migratedWorkdirs = false;
+    for (const project of this.state.projects) {
+      if (project.workdir) continue;
+      if ((await stat(path.join(this.projectRoot(project.id), 'repository', '.git')).catch(() => null))?.isDirectory()) {
+        project.workdir = 'repository'; await mkdir(this.inbox(project.id), { recursive: true, mode: 0o700 }); await mkdir(this.outbox(project.id), { recursive: true, mode: 0o700 }); migratedWorkdirs = true;
+      }
+    }
+    if (migratedWorkdirs) await this.persist();
     const interruptedAt = new Date().toISOString();
     let recovered = false;
     for (const task of this.state.tasks) {
@@ -110,8 +119,16 @@ export class ProjectStore {
     return resolved;
   }
 
-  inbox(id: string): string { return path.join(this.projectRoot(id), 'inbox'); }
-  outbox(id: string): string { return path.join(this.projectRoot(id), 'outbox'); }
+  projectWorkdir(id: string): string {
+    const project = this.getProject(id);
+    const root = this.projectRoot(id);
+    const resolved = path.resolve(root, project.workdir || '.');
+    if (resolved !== root && !resolved.startsWith(`${root}${path.sep}`)) throw new Error('项目工作目录无效');
+    return resolved;
+  }
+
+  inbox(id: string): string { return path.join(this.projectWorkdir(id), 'inbox'); }
+  outbox(id: string): string { return path.join(this.projectWorkdir(id), 'outbox'); }
 
   async createProject(name: string): Promise<Project> {
     const cleanName = name.trim().replace(/[\u0000-\u001f]/g, '').slice(0, 50);
@@ -123,6 +140,33 @@ export class ProjectStore {
     await this.ensureProjectDirectories(project);
     await this.persist();
     return project;
+  }
+
+  async setProjectWorkdir(id: string, workdir?: string): Promise<Project> {
+    const project = this.getProject(id);
+    const normalized = workdir?.trim().replaceAll('\\', '/');
+    if (normalized && (path.isAbsolute(normalized) || normalized.split('/').includes('..'))) throw new Error('项目工作目录无效');
+    project.workdir = normalized || undefined;
+    project.updatedAt = new Date().toISOString();
+    await mkdir(this.inbox(id), { recursive: true, mode: 0o700 });
+    await mkdir(this.outbox(id), { recursive: true, mode: 0o700 });
+    await this.persist();
+    return project;
+  }
+
+  hasRunningTask(projectId: string): boolean {
+    return this.state.tasks.some((task) => task.projectId === projectId && task.status === 'running');
+  }
+
+  async deleteProject(id: string): Promise<void> {
+    if (id === 'default') throw new Error('默认项目不能删除');
+    if (this.hasRunningTask(id)) throw new Error('项目仍有运行中的任务');
+    const root = this.projectRoot(id);
+    this.state.projects = this.state.projects.filter((project) => project.id !== id);
+    this.state.threads = this.state.threads.filter((thread) => thread.projectId !== id);
+    this.state.tasks = this.state.tasks.filter((task) => task.projectId !== id);
+    await this.persist();
+    await rm(root, { recursive: true, force: true });
   }
 
   async renameProject(id: string, name: string): Promise<Project> {
@@ -147,7 +191,7 @@ export class ProjectStore {
     const source = this.getProject(id);
     const duplicate = await this.createProject(name);
     await cp(this.projectRoot(source.id), this.projectRoot(duplicate.id), { recursive: true, force: false, errorOnExist: false, filter: (entry) => !entry.includes(`${path.sep}.git${path.sep}`) && !entry.endsWith(`${path.sep}.git`) });
-    duplicate.model = source.model; duplicate.reasoningEffort = source.reasoningEffort;
+    duplicate.model = source.model; duplicate.reasoningEffort = source.reasoningEffort; duplicate.workdir = source.workdir;
     duplicate.updatedAt = new Date().toISOString(); await this.persist(); return duplicate;
   }
 
@@ -240,6 +284,18 @@ export class ProjectStore {
     await this.persist();
   }
 
+  async interruptRunningTasks(reason: string): Promise<number> {
+    const now = new Date().toISOString();
+    let count = 0;
+    for (const task of this.state.tasks) {
+      if (task.status !== 'running') continue;
+      task.status = 'interrupted'; task.updatedAt = now; task.completedAt = now;
+      task.errorMessage = reason.trim().slice(0, 500); delete task.outputBaseline; count += 1;
+    }
+    if (count) await this.persist();
+    return count;
+  }
+
   assertThreadProject(threadId: string, projectId: string): void {
     const thread = this.state.threads.find((item) => item.threadId === threadId);
     if (!thread || thread.projectId !== projectId) throw new Error('该对话不属于当前项目');
@@ -263,9 +319,9 @@ export class ProjectStore {
   }
 
   safeStoredPath(projectId: string, relativePath: string): string {
-    const root = this.projectRoot(projectId);
-    const inbox = path.join(root, 'inbox');
-    const outbox = path.join(root, 'outbox');
+    const root = this.projectWorkdir(projectId);
+    const inbox = this.inbox(projectId);
+    const outbox = this.outbox(projectId);
     const resolved = path.resolve(root, relativePath);
     if (resolved !== inbox && !resolved.startsWith(`${inbox}${path.sep}`) && resolved !== outbox && !resolved.startsWith(`${outbox}${path.sep}`)) {
       throw new Error('文件路径不在当前项目的允许范围内');

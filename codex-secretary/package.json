@@ -1,6 +1,6 @@
 {
   "name": "palm-secretary",
-  "version": "0.12.1",
+  "version": "0.13.0",
   "private": true,
   "engines": {
     "node": ">=22.13.0"
@@ -20,6 +20,7 @@
     "test:v09": "node tests/inline-image-focus-v09.mjs",
     "test:v010": "node tests/visual-system-v010.mjs",
     "test:v012": "node tests/stability-v012.mjs",
+    "test:v013": "node tests/audit-complete-v013.mjs",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern dist-server --ignore-pattern .next"
   },
   "dependencies": {
