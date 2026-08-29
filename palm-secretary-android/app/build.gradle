@@ -6,6 +6,10 @@ android {
     namespace 'cloud.wiseliang.palmsecretary'
     compileSdk 35
 
+    buildFeatures {
+        buildConfig true
+    }
+
     defaultConfig {
         applicationId 'cloud.wiseliang.palmsecretary'
         minSdk 26

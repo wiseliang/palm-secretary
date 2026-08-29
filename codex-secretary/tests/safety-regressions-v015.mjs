@@ -126,6 +126,11 @@ const android = await readFile(
 );
 assert.match(android, /PalmSecretaryAndroid\/" \+ BuildConfig\.VERSION_NAME/);
 assert.doesNotMatch(android, /PalmSecretaryAndroid\/0\.3\.3/);
+const androidGradle = await readFile(
+  new URL("../../palm-secretary-android/app/build.gradle", import.meta.url),
+  "utf8",
+);
+assert.match(androidGradle, /buildConfig\s+true/);
 const projectSelector =
   page.match(
     /<select[\s\S]{0,500}aria-label="当前项目"[\s\S]{0,500}<\/select>/,
