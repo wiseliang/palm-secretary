@@ -1,6 +1,8 @@
 import { randomUUID } from 'node:crypto';
+import { execFile } from 'node:child_process';
 import { access, cp, mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { promisify } from 'node:util';
 
 export type Project = {
   id: string;
@@ -44,6 +46,8 @@ export type ProjectTask = {
 type StoreState = { version: 7; projects: Project[]; threads: ProjectThread[]; tasks: ProjectTask[] };
 
 const PROJECT_ID = /^[a-z0-9][a-z0-9-]{0,63}$/;
+const UPLOAD_NAME = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}-/i;
+const execFileAsync = promisify(execFile);
 
 export class ProjectStore {
   private readonly stateDir: string;
@@ -89,6 +93,7 @@ export class ProjectStore {
       }
     }
     if (migratedWorkdirs) await this.persist();
+    await this.migrateWorkdirPrivateFiles();
     const interruptedAt = new Date().toISOString();
     let recovered = false;
     for (const task of this.state.tasks) {
@@ -127,8 +132,8 @@ export class ProjectStore {
     return resolved;
   }
 
-  inbox(id: string): string { return path.join(this.projectWorkdir(id), 'inbox'); }
-  outbox(id: string): string { return path.join(this.projectWorkdir(id), 'outbox'); }
+  inbox(id: string): string { return path.join(this.projectRoot(id), 'inbox'); }
+  outbox(id: string): string { return path.join(this.projectRoot(id), 'outbox'); }
 
   async createProject(name: string): Promise<Project> {
     const cleanName = name.trim().replace(/[\u0000-\u001f]/g, '').slice(0, 50);
@@ -181,6 +186,7 @@ export class ProjectStore {
 
   async archiveProject(id: string, archived: boolean): Promise<Project> {
     if (id === 'default' && archived) throw new Error('默认项目不能归档');
+    if (archived && this.hasRunningTask(id)) throw new Error('项目仍有运行中的任务，任务结束后才能归档');
     const project = this.getProject(id);
     project.archivedAt = archived ? new Date().toISOString() : undefined;
     project.updatedAt = new Date().toISOString();
@@ -266,11 +272,11 @@ export class ProjectStore {
     return task;
   }
 
-  async finishTask(threadId: string, turnId: string | undefined, status: ProjectTask['status'], errorMessage?: string): Promise<void> {
+  async finishTask(threadId: string, turnId: string | undefined, status: ProjectTask['status'], errorMessage?: string): Promise<ProjectTask | undefined> {
     const task = turnId
       ? this.state.tasks.find((item) => item.threadId === threadId && item.turnId === turnId)
       : [...this.state.tasks].reverse().find((item) => item.threadId === threadId && item.status === 'running');
-    if (!task) return;
+    if (!task) return undefined;
     const now = new Date().toISOString();
     task.status = status;
     task.updatedAt = now;
@@ -282,6 +288,7 @@ export class ProjectStore {
       .map(([name]) => `outbox/${name}`);
     delete task.outputBaseline;
     await this.persist();
+    return { ...task, attachments: [...task.attachments], outputPaths: [...task.outputPaths] };
   }
 
   async interruptRunningTasks(reason: string): Promise<number> {
@@ -319,7 +326,7 @@ export class ProjectStore {
   }
 
   safeStoredPath(projectId: string, relativePath: string): string {
-    const root = this.projectWorkdir(projectId);
+    const root = this.projectRoot(projectId);
     const inbox = this.inbox(projectId);
     const outbox = this.outbox(projectId);
     const resolved = path.resolve(root, relativePath);
@@ -354,6 +361,47 @@ export class ProjectStore {
         catch { /* destination is free */ }
         await rename(source, destination);
       }
+    }
+  }
+
+  private async migrateWorkdirPrivateFiles(): Promise<void> {
+    for (const project of this.state.projects) {
+      const workdir = this.projectWorkdir(project.id);
+      const root = this.projectRoot(project.id);
+      if (workdir === root) continue;
+      const referenced = new Set(this.state.tasks
+        .filter((task) => task.projectId === project.id)
+        .flatMap((task) => [...task.attachments, ...task.outputPaths]));
+      for (const folder of ['inbox', 'outbox'] as const) {
+        const source = path.join(workdir, folder);
+        const destinationRoot = path.join(root, folder);
+        const entries = await readdir(source, { withFileTypes: true }).catch(() => []);
+        for (const entry of entries) {
+          if (!entry.isFile()) continue;
+          const relativePath = `${folder}/${entry.name}`;
+          const tracked = await this.isGitTracked(workdir, relativePath);
+          const knownPalmFile = referenced.has(relativePath) || (folder === 'inbox' && UPLOAD_NAME.test(entry.name));
+          if (tracked === true || (tracked === undefined && !knownPalmFile)) continue;
+          const sourcePath = path.join(source, entry.name);
+          let destination = path.join(destinationRoot, entry.name);
+          if (await stat(destination).catch(() => null)) {
+            const parsed = path.parse(entry.name);
+            destination = path.join(destinationRoot, `${parsed.name}-migrated-${Date.now()}-${randomUUID().slice(0, 8)}${parsed.ext}`);
+          }
+          await rename(sourcePath, destination);
+        }
+        await rm(source, { recursive: false }).catch(() => undefined);
+      }
+    }
+  }
+
+  private async isGitTracked(workdir: string, relativePath: string): Promise<boolean | undefined> {
+    try {
+      await execFileAsync('/usr/bin/git', ['-C', workdir, 'ls-files', '--error-unmatch', '--', relativePath], { timeout: 5_000 });
+      return true;
+    } catch (error) {
+      if ((error as { code?: unknown }).code === 1) return false;
+      return undefined;
     }
   }
 

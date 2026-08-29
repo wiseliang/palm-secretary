@@ -23,12 +23,17 @@ const sockets = new Set<SocketLike>();
 const threadSockets = new Map<string, Set<SocketLike>>();
 const socketThreads = new Map<SocketLike, string>();
 const loadedThreads = new Set<string>();
+const startingProjects = new Set<string>();
 const loginAttempts = new Map<string, { count: number; resetAt: number }>();
 type TurnAcceptance = { threadId: string; payload: { turn?: { id?: string } }; replayed?: boolean; clientRequestId: string };
 const pendingTurnRequests = new Map<string, Promise<TurnAcceptance | undefined>>();
 const projects = new ProjectStore(config.workspace);
 const execFileAsync = promisify(execFile);
-const OUTPUT_INSTRUCTIONS = `你运行在掌心助理的独立项目工作区。用户不需要知道目录约定。只要任务产生可下载成果（文档、表格、演示文稿、PDF、图片、压缩包、代码包或其他文件），你必须主动把最终版本保存到当前工作目录的 outbox/，使用清晰中文文件名，并在最终回复中说明文件名。若成果是需要直接查看或扫码的图片，最终回复中还必须单独写一行 Markdown 图片语法：![图片说明](outbox/实际文件名.png)，路径必须与真实文件完全一致；掌心助理会在聊天中直接显示该图片。不要要求用户说出 outbox，也不要只在聊天中声称已生成而不实际写入。纯问答无需强行创建文件。用户上传的附件位于 inbox/。`;
+function outputInstructions(projectId: string): string {
+  const inbox = projects.inbox(projectId);
+  const outbox = projects.outbox(projectId);
+  return `你运行在掌心助理的独立项目工作区。用户不需要知道目录约定。代码与 Git 操作以当前工作目录为准，但 Palm 私有文件不在 Git 仓库内。用户上传的附件位于绝对目录 ${inbox}。只要任务产生可下载成果（文档、表格、演示文稿、PDF、图片、压缩包、代码包或其他文件），你必须主动把最终版本保存到绝对目录 ${outbox}，使用清晰中文文件名，并在最终回复中说明文件名。若成果是需要直接查看或扫码的图片，最终回复中还必须单独写一行 Markdown 图片语法：![图片说明](outbox/实际文件名.png)，路径必须与真实文件完全一致；掌心助理会在聊天中直接显示该图片。不要把 inbox 或 outbox 复制进当前 Git 仓库，不要要求用户说出 outbox，也不要只在聊天中声称已生成而不实际写入。纯问答无需强行创建文件。`;
+}
 type CodexModel = { id: string; model: string; displayName: string; description: string; isDefault: boolean; hidden?: boolean; supportedReasoningEfforts: Array<{ reasoningEffort: string; description: string }>; defaultReasoningEffort: string };
 let modelCache: { expiresAt: number; models: CodexModel[] } | undefined;
 
@@ -169,7 +174,10 @@ bridge.on('message', async (message: Record<string, unknown>) => {
     const failure = params && typeof (params as Record<string, unknown>).error === 'object'
       ? (params as Record<string, unknown>).error as Record<string, unknown> : undefined;
     const errorMessage = typeof failure?.message === 'string' ? failure.message : undefined;
-    try { await projects.finishTask(threadId, turnId, status, errorMessage); }
+    try {
+      const task = await projects.finishTask(threadId, turnId, status, errorMessage);
+      if (task) broadcast({ type: 'task.finished', payload: { projectId: task.projectId, threadId: task.threadId, turnId: task.turnId, status: task.status } });
+    }
     catch (error) { app.log.warn({ err: error }, '任务状态写入失败'); }
   }
   if (threadId) sendToThread(threadId, { type: 'codex.event', payload: message });
@@ -177,6 +185,8 @@ bridge.on('message', async (message: Record<string, unknown>) => {
 });
 bridge.on('offline', async (details) => {
   const interrupted = await projects.interruptRunningTasks('Codex App Server 意外退出，请确认结果后重新执行').catch(() => 0);
+  loadedThreads.clear();
+  modelCache = undefined;
   pendingTurnRequests.clear();
   broadcast({ type: 'codex.offline', payload: { ...details, interrupted } });
   broadcast({ type: 'tasks.changed', payload: { interrupted } });
@@ -412,10 +422,20 @@ app.get<{ Params: { id: string } }>('/api/projects/:id/git', async (request, rep
     const root = await projectGitRoot(request.params.id);
     if (!root) return { repository: false, changes: [], diff: '' };
     const [branch, statusText, unstagedDiff, stagedDiff] = await Promise.all([
-      git(request.params.id, ['branch', '--show-current']), git(request.params.id, ['status', '--porcelain=v1']),
+      git(request.params.id, ['branch', '--show-current']), git(request.params.id, ['status', '--porcelain=v1', '-z']),
       git(request.params.id, ['diff', '--no-ext-diff', '--unified=3']), git(request.params.id, ['diff', '--cached', '--no-ext-diff', '--unified=3']),
     ]);
-    const changes = statusText.split('\n').filter(Boolean).map((line) => ({ status: line.slice(0, 2).trim() || '?', path: line.slice(3) }));
+    const entries = statusText.split('\0').filter(Boolean);
+    const changes: Array<{ status: string; indexStatus: string; worktreeStatus: string; path: string; originalPath?: string }> = [];
+    for (let index = 0; index < entries.length; index += 1) {
+      const entry = entries[index];
+      const indexStatus = entry[0] ?? ' ';
+      const worktreeStatus = entry[1] ?? ' ';
+      const filePath = entry.slice(3);
+      const renamed = indexStatus === 'R' || indexStatus === 'C' || worktreeStatus === 'R' || worktreeStatus === 'C';
+      const originalPath = renamed ? entries[++index] : undefined;
+      changes.push({ status: `${indexStatus}${worktreeStatus}`, indexStatus, worktreeStatus, path: filePath, ...(originalPath ? { originalPath } : {}) });
+    }
     const untracked = changes.filter((change) => change.status === '??').map((change) => change.path);
     return { projectId: request.params.id, repository: true, branch: branch || 'detached', changes, untracked, unstagedDiff: unstagedDiff.slice(0, 1_000_000), stagedDiff: stagedDiff.slice(0, 1_000_000) };
   } catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : 'Git 状态读取失败' }); }
@@ -440,6 +460,8 @@ app.post<{ Params: { id: string } }>('/api/projects/:id/git', async (request, re
       return { ok: true, output: await git(request.params.id, ['commit', '-m', parsed.data.message], 120_000) };
     }
     if (path.isAbsolute(parsed.data.path) || parsed.data.path.split(/[\\/]/).includes('..')) throw new Error('文件路径无效');
+    const status = (await git(request.params.id, ['status', '--porcelain=v1', '-z', '--', parsed.data.path])).split('\0').find(Boolean);
+    if (!status || status.slice(0, 2) === '??' || status[1] === ' ') throw new Error('该文件没有可撤销的未暂存修改');
     return { ok: true, output: await git(request.params.id, ['restore', '--worktree', '--', parsed.data.path]) };
   } catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : 'Git 操作失败' }); }
 });
@@ -600,6 +622,7 @@ app.post<{ Querystring: { projectId?: string } }>('/api/files/upload-complete', 
   try {
     if (!await uploadAllowed(reply)) return;
     const projectId = request.query.projectId ?? 'default';
+    if (projects.getProject(projectId).archivedAt) return reply.code(409).send({ error: '项目已归档，请先恢复后再完成上传' });
     const session = chunkSession(request, projectId);
     const details = await stat(session.part);
     if (details.size !== session.totalSize) return reply.code(409).send({ error: '文件尚未上传完整', uploaded: details.size });
@@ -723,17 +746,22 @@ app.get('/api/ws', { websocket: true }, (socket, request) => {
       }
       let settlePending!: (value: TurnAcceptance | undefined) => void;
       pendingTurnRequests.set(requestKey, new Promise<TurnAcceptance | undefined>((resolve) => { settlePending = resolve; }));
+      let projectReserved = false;
       try {
       const disk = await diskInfo();
       if (disk.tasksPaused) throw new Error('磁盘可用空间低于安全线，已暂停新任务');
+      if (startingProjects.has(message.projectId) || projects.hasRunningTask(message.projectId)) throw new Error('当前项目已有任务正在运行，请等待完成后再开始新任务');
+      startingProjects.add(message.projectId);
+      projectReserved = true;
       let threadId = message.threadId;
       const projectRoot = projects.projectWorkdir(message.projectId);
       const project = projects.getProject(message.projectId);
+      const developerInstructions = outputInstructions(message.projectId);
       if (project.archivedAt) throw new Error('项目已归档，请先恢复后再执行任务');
       if (!threadId) {
         const started = await bridge.call('thread/start', {
           cwd: projectRoot, model: project.model, config: project.reasoningEffort ? { model_reasoning_effort: project.reasoningEffort } : undefined,
-          developerInstructions: OUTPUT_INSTRUCTIONS,
+          developerInstructions,
           approvalPolicy: 'never', sandbox: 'danger-full-access', serviceName: 'palm_secretary',
         }) as { thread?: { id?: string } };
         threadId = started.thread?.id;
@@ -741,7 +769,7 @@ app.get('/api/ws', { websocket: true }, (socket, request) => {
       } else {
         projects.assertThreadProject(threadId, message.projectId);
         if (!loadedThreads.has(threadId)) {
-          await bridge.call('thread/resume', { threadId, cwd: projectRoot, developerInstructions: OUTPUT_INSTRUCTIONS, approvalPolicy: 'never', sandbox: 'danger-full-access' });
+          await bridge.call('thread/resume', { threadId, cwd: projectRoot, developerInstructions, approvalPolicy: 'never', sandbox: 'danger-full-access' });
         }
       }
       if (!threadId) throw new Error('无法创建 Codex 对话');
@@ -776,6 +804,7 @@ app.get('/api/ws', { websocket: true }, (socket, request) => {
         settlePending(undefined);
         throw error;
       } finally {
+        if (projectReserved) startingProjects.delete(message.projectId);
         pendingTurnRequests.delete(requestKey);
       }
     } catch (error) {

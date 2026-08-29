@@ -1,7 +1,10 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { EventEmitter } from 'node:events';
+import { createRequire } from 'node:module';
 import { config } from './config.js';
+
+const packageVersion = (createRequire(import.meta.url)('../package.json') as { version: string }).version;
 
 type JsonRecord = Record<string, unknown>;
 type Pending = { resolve: (value: unknown) => void; reject: (error: Error) => void; timer: NodeJS.Timeout };
@@ -58,7 +61,7 @@ export class CodexBridge extends EventEmitter {
     });
 
     await this.call('initialize', {
-      clientInfo: { name: 'palm_secretary', title: '掌心助理', version: '0.12.0' },
+      clientInfo: { name: 'palm_secretary', title: '掌心助理', version: packageVersion },
       capabilities: {},
     });
     this.notify('initialized', {});

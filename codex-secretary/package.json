@@ -21,12 +21,15 @@
     "test:v010": "node tests/visual-system-v010.mjs",
     "test:v012": "node tests/stability-v012.mjs",
     "test:v013": "node tests/audit-complete-v013.mjs",
+    "test:v014": "node tests/design-system-v014.mjs",
+    "test:v015": "node tests/safety-regressions-v015.mjs",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern dist-server --ignore-pattern .next"
   },
   "dependencies": {
     "@fastify/cookie": "^11.0.2",
     "@fastify/multipart": "^9.2.1",
     "@fastify/websocket": "^11.2.0",
+    "@phosphor-icons/react": "^2.1.10",
     "fastify": "^5.12.1",
     "next": "^16.3.2",
     "react": "^19.2.8",
