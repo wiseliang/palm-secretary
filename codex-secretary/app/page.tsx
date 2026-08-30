@@ -1018,6 +1018,7 @@ export default function Home() {
   const [attachments, setAttachments] = useState<UploadedFile[]>([]);
   const [status, setStatus] = useState<ServerStatus>({});
   const [usageWindows, setUsageWindows] = useState<UsageWindow[]>([]);
+  const [usageUpdatedAt, setUsageUpdatedAt] = useState<number>();
   const [runtimeOpen, setRuntimeOpen] = useState(false);
   const [openMenu, setOpenMenu] = useState<OpenMenu>();
   const [projectDialog, setProjectDialog] = useState<ProjectDialog>();
@@ -1237,6 +1238,7 @@ export default function Home() {
         usage?: unknown;
       };
       setUsageWindows(usageWindowsFrom(value.rateLimits ?? value.usage));
+      setUsageUpdatedAt(Date.now());
     }
   }, []);
 
@@ -3411,7 +3413,17 @@ export default function Home() {
           >
             <div className="usage-overview-title">
               <Gauge size={17} weight="bold" />
-              <span>Codex 用量</span>
+              <div>
+                <span>Codex 用量</span>
+                <small>
+                  {usageUpdatedAt
+                    ? `更新于 ${new Date(usageUpdatedAt).toLocaleTimeString(
+                        "zh-CN",
+                        { hour: "2-digit", minute: "2-digit" },
+                      )}`
+                    : "尚未刷新"}
+                </small>
+              </div>
             </div>
             <div className="usage-overview-windows">
               {usageWindows.length ? (

@@ -1,4 +1,4 @@
-/* v0.13.8 - resilient dialogs and direct usage visibility. */
+/* v0.13.9 - resilient dialogs and timestamped usage visibility. */
 .mobile-identity { display: none; }
 .mobile-menu-only { display: none !important; }
 .topbar .project-add::before { content: none !important; }
@@ -165,7 +165,10 @@
   background: color-mix(in srgb, var(--accent-soft) 52%, var(--surface));
   color: var(--ink);
 }
-.usage-overview-title { display: flex; align-items: center; gap: 7px; color: var(--accent); font-size: 11px; font-weight: 750; white-space: nowrap; }
+.usage-overview-title { display: flex; align-items: center; gap: 7px; color: var(--accent); white-space: nowrap; }
+.usage-overview-title > div { display: grid; gap: 1px; }
+.usage-overview-title span { font-size: 11px; font-weight: 750; }
+.usage-overview-title small { color: var(--muted); font-size: 9px; font-weight: 600; }
 .usage-overview-windows { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: center; min-width: 0; }
 .usage-overview-windows > p { grid-column: 1 / -1; margin: 0; color: var(--muted); font-size: 11px; }
 .usage-overview-window { display: grid; grid-template-columns: auto auto; align-items: baseline; justify-content: start; column-gap: 6px; min-width: 0; padding: 1px 12px; }
@@ -255,7 +258,9 @@
   }
   .project-dialog footer { position: sticky; bottom: 0; padding-top: 8px; background: var(--surface-strong); }
   .usage-overview { width: calc(100% - 24px); min-height: 46px; margin-top: 7px; gap: 7px; padding: 6px 6px 6px 10px; }
-  .usage-overview-title { gap: 5px; font-size: 10px; }
+  .usage-overview-title { gap: 5px; }
+  .usage-overview-title span { font-size: 10px; }
+  .usage-overview-title small { font-size: 8px; }
   .usage-overview-window { column-gap: 4px; padding-inline: 7px; }
   .usage-overview-window strong { font-size: 13px; }
   .usage-overview-window small { display: none; }

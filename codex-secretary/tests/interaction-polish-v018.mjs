@@ -54,5 +54,7 @@ assert.match(page, /className="usage-overview"/);
 assert.match(page, /className="usage-overview-window"/);
 assert.doesNotMatch(page, /className="usage-popover"/);
 assert.match(css, /grid-template-columns: auto minmax\(0, 1fr\) 38px/);
+assert.match(page, /setUsageUpdatedAt\(Date\.now\(\)\)/);
+assert.match(page, /更新于 \$\{new Date\(usageUpdatedAt\)\.toLocaleTimeString/);
 
 console.log("interaction polish v018 passed");
