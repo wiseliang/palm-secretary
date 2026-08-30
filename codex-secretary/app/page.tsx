@@ -997,6 +997,8 @@ export default function Home() {
   const threadIdRef = useRef<string>();
   const projectIdRef = useRef(projectId);
   const projectLoadGenerationRef = useRef(0);
+  const threadLoadGenerationRef = useRef(0);
+  const showArchivedRef = useRef(showArchived);
   const [filesProjectId, setFilesProjectId] = useState(projectId);
   const projectsRef = useRef<Project[]>([]);
   const runningRef = useRef(false);
@@ -1162,20 +1164,36 @@ export default function Home() {
     setModels(((await response.json()) as { models: CodexModel[] }).models);
   }, []);
 
-  const loadProjectData = useCallback(
+  const loadThreads = useCallback(
+    async (id: string, archived = showArchivedRef.current) => {
+      const generation = ++threadLoadGenerationRef.current;
+      const encoded = encodeURIComponent(id);
+      const response = await fetch(
+        `/api/threads?projectId=${encoded}&archived=${archived ? "1" : "0"}`,
+      );
+      const loadedThreads = response.ok
+        ? ((await response.json()) as { threads: ProjectThread[] }).threads
+        : undefined;
+      if (
+        generation !== threadLoadGenerationRef.current ||
+        id !== projectIdRef.current ||
+        archived !== showArchivedRef.current
+      )
+        return [];
+      if (loadedThreads) setThreads(loadedThreads);
+      return loadedThreads ?? [];
+    },
+    [],
+  );
+
+  const loadProjectCore = useCallback(
     async (id: string): Promise<ProjectTask[]> => {
       const generation = ++projectLoadGenerationRef.current;
       const encoded = encodeURIComponent(id);
-      const [threadResponse, taskResponse, fileResponse] = await Promise.all([
-        fetch(
-          `/api/threads?projectId=${encoded}&archived=${showArchived ? "1" : "0"}`,
-        ),
+      const [taskResponse, fileResponse] = await Promise.all([
         fetch(`/api/tasks?projectId=${encoded}`),
         fetch(`/api/files?projectId=${encoded}`),
       ]);
-      const loadedThreads = threadResponse.ok
-        ? ((await threadResponse.json()) as { threads: ProjectThread[] }).threads
-        : undefined;
       let loadedTasks: ProjectTask[] = [];
       if (taskResponse.ok) {
         loadedTasks = ((await taskResponse.json()) as { tasks: ProjectTask[] })
@@ -1189,7 +1207,6 @@ export default function Home() {
         id !== projectIdRef.current
       )
         return [];
-      if (loadedThreads) setThreads(loadedThreads);
       if (taskResponse.ok) {
         setTasks(loadedTasks);
         const activeTask = loadedTasks.find(
@@ -1212,7 +1229,18 @@ export default function Home() {
       }
       return loadedTasks;
     },
-    [showArchived],
+    [],
+  );
+
+  const loadProjectData = useCallback(
+    async (id: string): Promise<ProjectTask[]> => {
+      const [loadedTasks] = await Promise.all([
+        loadProjectCore(id),
+        loadThreads(id),
+      ]);
+      return loadedTasks;
+    },
+    [loadProjectCore, loadThreads],
   );
 
   const refreshThreadMessages = useCallback(
@@ -1378,6 +1406,7 @@ export default function Home() {
   useEffect(() => {
     if (!authenticated || !projectId) return;
     projectLoadGenerationRef.current += 1;
+    threadLoadGenerationRef.current += 1;
     threadIdRef.current = undefined;
     const timer = window.setTimeout(() => {
       setThreads([]);
@@ -1394,10 +1423,17 @@ export default function Home() {
       setAttachments([]);
       setUploadFeedbacks([]);
       setRunning(false);
-      void loadProjectData(projectId);
+      void loadProjectCore(projectId);
+      void loadThreads(projectId, showArchivedRef.current);
     }, 0);
     return () => window.clearTimeout(timer);
-  }, [authenticated, projectId, loadProjectData]);
+  }, [authenticated, projectId, loadProjectCore, loadThreads]);
+
+  useEffect(() => {
+    showArchivedRef.current = showArchived;
+    if (!authenticated || !projectId) return;
+    void loadThreads(projectId, showArchived);
+  }, [authenticated, loadThreads, projectId, showArchived]);
 
   useEffect(() => {
     if (!pendingNavigation || pendingNavigation.projectId !== projectId) return;

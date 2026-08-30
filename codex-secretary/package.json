@@ -1,6 +1,6 @@
 {
   "name": "palm-secretary",
-  "version": "0.13.3",
+  "version": "0.13.4",
   "private": true,
   "engines": {
     "node": ">=22.13.0"
@@ -23,6 +23,7 @@
     "test:v013": "node tests/audit-complete-v013.mjs",
     "test:v014": "node tests/design-system-v014.mjs",
     "test:v015": "node tests/safety-regressions-v015.mjs",
+    "test:v016": "node tests/archive-filter-v016.mjs",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern dist-server --ignore-pattern .next"
   },
   "dependencies": {
