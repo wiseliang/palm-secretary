@@ -21,6 +21,7 @@ import {
   DownloadSimple,
   Export,
   FolderOpen,
+  Gauge,
   GithubLogo,
   GitDiff,
   ImageSquare,
@@ -183,6 +184,7 @@ type TaskNotice = {
 type OpenMenu =
   | "project-picker"
   | "project-actions"
+  | "usage"
   | "attachments"
   | `task-actions:${string}`;
 type ProjectDialog = {
@@ -210,6 +212,32 @@ const starterTasks = [
   "把这份 PDF 提炼成要点",
   "检查服务器运行状态",
 ];
+
+function pendingAttachmentKey(projectId: string) {
+  return `palm:pending-attachments:${projectId}`;
+}
+
+function readPendingAttachments(projectId: string): UploadedFile[] {
+  try {
+    const stored = window.localStorage.getItem(pendingAttachmentKey(projectId));
+    if (!stored) return [];
+    const parsed = JSON.parse(stored) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(
+      (item): item is UploadedFile =>
+        Boolean(
+          item &&
+            typeof item === "object" &&
+            "path" in item &&
+            "name" in item &&
+            typeof item.path === "string" &&
+            typeof item.name === "string",
+        ),
+    );
+  } catch {
+    return [];
+  }
+}
 const SAFE_UPLOAD_BYTES = 95 * 1024 ** 2;
 const COMPLETION_CURSOR_KEY = "palm:last-task-completed-at";
 const NOTIFIED_TASKS_KEY = "palm:notified-task-ids";
@@ -991,7 +1019,6 @@ export default function Home() {
   const [attachments, setAttachments] = useState<UploadedFile[]>([]);
   const [status, setStatus] = useState<ServerStatus>({});
   const [usageWindows, setUsageWindows] = useState<UsageWindow[]>([]);
-  const [usageOpen, setUsageOpen] = useState(false);
   const [runtimeOpen, setRuntimeOpen] = useState(false);
   const [openMenu, setOpenMenu] = useState<OpenMenu>();
   const [projectDialog, setProjectDialog] = useState<ProjectDialog>();
@@ -1011,6 +1038,7 @@ export default function Home() {
   const socketRef = useRef<WebSocket | null>(null);
   const threadIdRef = useRef<string>();
   const projectIdRef = useRef(projectId);
+  const attachmentsProjectRef = useRef(projectId);
   const projectLoadGenerationRef = useRef(0);
   const threadLoadGenerationRef = useRef(0);
   const showArchivedRef = useRef(showArchived);
@@ -1104,7 +1132,6 @@ export default function Home() {
         !target.closest("[data-popover-root]")
       ) {
         setOpenMenu(undefined);
-        setUsageOpen(false);
       }
     };
     const closeOnEscape = (event: KeyboardEvent) => {
@@ -1124,7 +1151,6 @@ export default function Home() {
   useEffect(() => {
     const timer = window.setTimeout(() => {
       setOpenMenu(undefined);
-      setUsageOpen(false);
     }, 0);
     return () => window.clearTimeout(timer);
   }, [projectId]);
@@ -1133,6 +1159,15 @@ export default function Home() {
     const timer = window.setTimeout(() => setNotice(""), 4200);
     return () => window.clearTimeout(timer);
   }, [notice]);
+  useEffect(() => {
+    if (!authenticated || attachmentsProjectRef.current !== projectId) return;
+    const key = pendingAttachmentKey(projectId);
+    if (attachments.length) {
+      window.localStorage.setItem(key, JSON.stringify(attachments));
+    } else {
+      window.localStorage.removeItem(key);
+    }
+  }, [attachments, authenticated, projectId]);
   useEffect(() => {
     runningRef.current = running;
   }, [running]);
@@ -1463,6 +1498,8 @@ export default function Home() {
     projectLoadGenerationRef.current += 1;
     threadLoadGenerationRef.current += 1;
     threadIdRef.current = undefined;
+    attachmentsProjectRef.current = projectId;
+    const restoredAttachments = readPendingAttachments(projectId);
     const timer = window.setTimeout(() => {
       setThreads([]);
       setTasks([]);
@@ -1475,11 +1512,14 @@ export default function Home() {
       setGitBusy(false);
       setThreadId(undefined);
       setMessages([]);
-      setAttachments([]);
+      setAttachments(restoredAttachments);
       setUploadFeedbacks([]);
       setRunning(false);
       void loadProjectCore(projectId);
       void loadThreads(projectId, showArchivedRef.current);
+      if (restoredAttachments.length) {
+        setNotice(`已恢复 ${restoredAttachments.length} 个待发送附件`);
+      }
     }, 0);
     return () => window.clearTimeout(timer);
   }, [authenticated, projectId, loadProjectCore, loadThreads]);
@@ -2575,12 +2615,8 @@ export default function Home() {
       setNotice("请等待连接恢复或先停止当前任务");
       return;
     }
-    const thread = threads.find((item) => item.threadId === task.threadId);
-    if (!thread) {
-      setNotice("原任务不存在，无法重试");
-      return;
-    }
-    await openThread(thread);
+    await openThreadById(task.projectId, task.threadId, task.title);
+    if (task.projectId !== projectId) return;
     const retryAttachments = (task.attachments ?? []).map(
       (attachmentPath) =>
         files.find((file) => file.path === attachmentPath) ?? {
@@ -2593,6 +2629,13 @@ export default function Home() {
     );
     startTurn(task.title, retryAttachments, task.threadId);
   }
+
+  const mobileConnection =
+    connection === "已连接"
+      ? "在线"
+      : connection === "正在重连"
+        ? "重连"
+        : "连接";
 
   const upload = useCallback(
     async (
@@ -2877,9 +2920,12 @@ export default function Home() {
     const requestProjectId = filesProjectId;
     const query = new URLSearchParams({ projectId: requestProjectId, path: file.path });
     const response = await fetch(`/api/files?${query}`, { method: "DELETE" });
-    if (response.ok)
+    if (response.ok) {
       setFiles((items) => items.filter((item) => item.path !== file.path));
-    else setNotice("文件删除失败");
+      setAttachments((items) =>
+        items.filter((item) => item.path !== file.path),
+      );
+    } else setNotice("文件删除失败");
   }
 
   function interrupt() {
@@ -3024,7 +3070,7 @@ export default function Home() {
             <span className="mobile-identity" aria-label={`Codex ${connection}`}>
               <b>掌</b>
               <small className={connection === "已连接" ? "online" : "offline"}>
-                <i /> {connection === "已连接" ? "在线" : connection}
+                <i /> {mobileConnection}
               </small>
             </span>
             <div>
@@ -3048,11 +3094,12 @@ export default function Home() {
                 aria-haspopup="listbox"
                 aria-expanded={openMenu === "project-picker"}
                 disabled={uploading}
-                onClick={() =>
+                onClick={() => {
+                  setRuntimeOpen(false);
                   setOpenMenu((current) =>
                     current === "project-picker" ? undefined : "project-picker",
-                  )
-                }
+                  );
+                }}
               >
                 <span>{activeProject?.name ?? "选择项目"}</span>
                 <CaretDown size={14} weight="bold" />
@@ -3066,8 +3113,14 @@ export default function Home() {
                       aria-selected={project.id === projectId}
                       key={project.id}
                       onClick={() => {
+                        const pendingCount = attachments.length;
                         setProjectId(project.id);
                         setOpenMenu(undefined);
+                        if (pendingCount && project.id !== projectId) {
+                          setNotice(
+                            `已为 ${activeProject?.name ?? "当前项目"} 保留 ${pendingCount} 个待发送附件`,
+                          );
+                        }
                       }}
                     >
                       <span>{project.name}</span>
@@ -3093,11 +3146,12 @@ export default function Home() {
                 aria-label="项目操作"
                 aria-haspopup="menu"
                 aria-expanded={openMenu === "project-actions"}
-                onClick={() =>
+                onClick={() => {
+                  setRuntimeOpen(false);
                   setOpenMenu((current) =>
                     current === "project-actions" ? undefined : "project-actions",
-                  )
-                }
+                  );
+                }}
               >
                 <DotsThree size={22} weight="bold" />
               </button>
@@ -3141,13 +3195,37 @@ export default function Home() {
                   <PencilSimple size={17} />
                   重命名
                 </button>
+                <button
+                  className="mobile-menu-only"
+                  onClick={() => {
+                    setOpenMenu(undefined);
+                    setRuntimeOpen((open) => !open);
+                  }}
+                >
+                  <SlidersHorizontal size={17} />
+                  运行设置
+                </button>
+                <button
+                  className="mobile-menu-only"
+                  onClick={() => {
+                    setRuntimeOpen(false);
+                    setOpenMenu("usage");
+                    void loadDashboard();
+                  }}
+                >
+                  <Gauge size={17} />
+                  Codex 用量
+                </button>
               </div>}
             </div>
             <button
               className={`runtime-toggle ${runtimeOpen ? "active" : ""}`}
               aria-label="运行设置"
               aria-expanded={runtimeOpen}
-              onClick={() => setRuntimeOpen((open) => !open)}
+              onClick={() => {
+                setOpenMenu(undefined);
+                setRuntimeOpen((open) => !open);
+              }}
             >
               <SlidersHorizontal size={19} />
             </button>
@@ -3155,10 +3233,12 @@ export default function Home() {
               <button
                 className="usage-pill"
                 aria-label="查看 Codex 余量"
-                aria-expanded={usageOpen}
+                aria-expanded={openMenu === "usage"}
                 onClick={() => {
-                  setOpenMenu(undefined);
-                  setUsageOpen((open) => !open);
+                  setRuntimeOpen(false);
+                  setOpenMenu((current) =>
+                    current === "usage" ? undefined : "usage",
+                  );
                   void loadDashboard();
                 }}
               >
@@ -3176,7 +3256,7 @@ export default function Home() {
                   </span>
                 )}
               </button>
-              {usageOpen && (
+              {openMenu === "usage" && (
                 <div className="usage-popover">
                   <div className="usage-heading">
                     <strong>Codex 用量</strong>

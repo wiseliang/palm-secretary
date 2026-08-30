@@ -34,4 +34,17 @@ assert.match(page, /最近执行/);
 assert.match(page, /任务记录/);
 assert.doesNotMatch(page, /className="readonly-banner"/);
 
+assert.match(page, /palm:pending-attachments:/);
+assert.match(page, /readPendingAttachments\(projectId\)/);
+assert.match(page, /已恢复 \$\{restoredAttachments\.length\} 个待发送附件/);
+assert.match(page, /\| "usage"/);
+assert.doesNotMatch(page, /const \[usageOpen, setUsageOpen\]/);
+assert.match(page, /className="mobile-menu-only"/);
+assert.match(css, /\.runtime-toggle,\s*\.usage-pill \{ display: none; \}/);
+assert.match(css, /max-height: calc\(100dvh - 32px\)/);
+assert.match(css, /border-radius: 22px 22px 0 0/);
+assert.match(page, /await openThreadById\(task\.projectId, task\.threadId, task\.title\)/);
+assert.doesNotMatch(page, /threads\.find\(\(item\) => item\.threadId === task\.threadId\)/);
+assert.match(page, /connection === "正在重连"\s*\? "重连"/);
+
 console.log("interaction polish v018 passed");
