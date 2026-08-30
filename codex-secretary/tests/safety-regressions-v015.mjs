@@ -44,7 +44,12 @@ try {
     `inbox/${upload}`,
   ]);
   await writeFile(path.join(root, "outbox", "报告.xlsx"), "report");
-  await store.finishTask("thread-1", "turn-1", "completed");
+  const firstFinish = await store.finishTask("thread-1", "turn-1", "completed");
+  await writeFile(path.join(root, "outbox", "later.txt"), "later output");
+  const repeatedFinish = await store.finishTask("thread-1", "turn-1", "failed", "late duplicate event");
+  assert.equal(repeatedFinish.status, "completed", "重复终态事件不得覆盖首次终态");
+  assert.equal(repeatedFinish.completedAt, firstFinish.completedAt);
+  assert.deepEqual(repeatedFinish.outputPaths, firstFinish.outputPaths);
   await rename(
     path.join(root, "outbox", "报告.xlsx"),
     path.join(repository, "outbox", "报告.xlsx"),
@@ -93,6 +98,11 @@ try {
     () => restarted.deleteThread("thread-1", project.id),
     /当前对话仍有任务运行/,
   );
+  await writeFile(path.join(root, "outbox", "中断前成果.txt"), "partial result");
+  assert.equal(await restarted.interruptRunningTasks("连接中断"), 1);
+  const interrupted = restarted.listTasks(project.id).find((task) => task.turnId === "turn-2");
+  assert.equal(interrupted.status, "interrupted");
+  assert.ok(interrupted.outputPaths.includes("outbox/中断前成果.txt"));
 } finally {
   await rm(workspace, { recursive: true, force: true });
 }
@@ -113,6 +123,8 @@ assert.match(server, /loadedThreads\.clear\(\)/);
 assert.match(server, /startingProjects\.has\(message\.projectId\)/);
 assert.match(server, /type: 'task\.finished'/);
 assert.match(server, /completedAt: task\.completedAt/);
+assert.match(server, /\/api\/tasks\/completed/);
+assert.match(server, /operation, clientRequestId/);
 assert.match(server, /upload-complete[\s\S]{0,900}项目已归档/);
 assert.match(server, /--porcelain=v1', '-z'/);
 assert.match(page, /const visibleThreads = showArchived/);
@@ -120,6 +132,10 @@ assert.match(page, /message\.type === "task\.finished"/);
 assert.match(page, /type: "thread\.subscribe", projectId, threadId/);
 assert.match(page, /COMPLETION_CURSOR_KEY/);
 assert.match(page, /rememberTaskNotification/);
+assert.match(page, /projectLoadGenerationRef/);
+assert.match(page, /task-notice-stack/);
+assert.match(page, /message\.type === "codex\.online"/);
+assert.match(bridge, /emit\('online'\)/);
 const android = await readFile(
   new URL("../../palm-secretary-android/app/src/main/java/cloud/wiseliang/palmsecretary/MainActivity.java", import.meta.url),
   "utf8",

@@ -173,6 +173,7 @@ type PendingNavigation = {
   fileSearch?: string;
 };
 type TaskNotice = {
+  key: string;
   projectId: string;
   threadId: string;
   text: string;
@@ -201,7 +202,7 @@ const SAFE_UPLOAD_BYTES = 95 * 1024 ** 2;
 const COMPLETION_CURSOR_KEY = "palm:last-task-completed-at";
 const NOTIFIED_TASKS_KEY = "palm:notified-task-ids";
 
-function rememberTaskNotification(taskId: string, completedAt?: string): boolean {
+function rememberTaskNotification(taskId: string): boolean {
   const notified = new Set<string>();
   try {
     const stored = JSON.parse(
@@ -218,12 +219,14 @@ function rememberTaskNotification(taskId: string, completedAt?: string): boolean
     NOTIFIED_TASKS_KEY,
     JSON.stringify([...notified].slice(-100)),
   );
-  if (completedAt) {
-    const previous = window.localStorage.getItem(COMPLETION_CURSOR_KEY) ?? "";
-    if (!previous || completedAt > previous)
-      window.localStorage.setItem(COMPLETION_CURSOR_KEY, completedAt);
-  }
   return isNew;
+}
+
+function advanceCompletionCursor(completedAt?: string): void {
+  if (!completedAt) return;
+  const previous = window.localStorage.getItem(COMPLETION_CURSOR_KEY) ?? "";
+  if (!previous || completedAt > previous)
+    window.localStorage.setItem(COMPLETION_CURSOR_KEY, completedAt);
 }
 
 function usageWindowsFrom(value: unknown): UsageWindow[] {
@@ -987,12 +990,14 @@ export default function Home() {
     "连接中" | "已连接" | "正在重连"
   >("连接中");
   const [notice, setNotice] = useState("");
-  const [taskNotice, setTaskNotice] = useState<TaskNotice>();
+  const [taskNotices, setTaskNotices] = useState<TaskNotice[]>([]);
   const [uploading, setUploading] = useState(false);
   const [uploadFeedbacks, setUploadFeedbacks] = useState<UploadFeedback[]>([]);
   const socketRef = useRef<WebSocket | null>(null);
   const threadIdRef = useRef<string>();
   const projectIdRef = useRef(projectId);
+  const projectLoadGenerationRef = useRef(0);
+  const [filesProjectId, setFilesProjectId] = useState(projectId);
   const projectsRef = useRef<Project[]>([]);
   const runningRef = useRef(false);
   const pendingTurnRef = useRef<PendingTurn>();
@@ -1159,6 +1164,7 @@ export default function Home() {
 
   const loadProjectData = useCallback(
     async (id: string): Promise<ProjectTask[]> => {
+      const generation = ++projectLoadGenerationRef.current;
       const encoded = encodeURIComponent(id);
       const [threadResponse, taskResponse, fileResponse] = await Promise.all([
         fetch(
@@ -1167,15 +1173,24 @@ export default function Home() {
         fetch(`/api/tasks?projectId=${encoded}`),
         fetch(`/api/files?projectId=${encoded}`),
       ]);
-      if (threadResponse.ok)
-        setThreads(
-          ((await threadResponse.json()) as { threads: ProjectThread[] })
-            .threads,
-        );
+      const loadedThreads = threadResponse.ok
+        ? ((await threadResponse.json()) as { threads: ProjectThread[] }).threads
+        : undefined;
       let loadedTasks: ProjectTask[] = [];
       if (taskResponse.ok) {
         loadedTasks = ((await taskResponse.json()) as { tasks: ProjectTask[] })
           .tasks;
+      }
+      const loadedFiles = fileResponse.ok
+        ? ((await fileResponse.json()) as { files: UploadedFile[] }).files
+        : undefined;
+      if (
+        generation !== projectLoadGenerationRef.current ||
+        id !== projectIdRef.current
+      )
+        return [];
+      if (loadedThreads) setThreads(loadedThreads);
+      if (taskResponse.ok) {
         setTasks(loadedTasks);
         const activeTask = loadedTasks.find(
           (task) =>
@@ -1191,10 +1206,10 @@ export default function Home() {
           setTurnId(undefined);
         }
       }
-      if (fileResponse.ok)
-        setFiles(
-          ((await fileResponse.json()) as { files: UploadedFile[] }).files,
-        );
+      if (loadedFiles) {
+        setFiles(loadedFiles);
+        setFilesProjectId(id);
+      }
       return loadedTasks;
     },
     [showArchived],
@@ -1270,7 +1285,7 @@ export default function Home() {
       projectName?: string;
     }) => {
       const taskId = payload.taskId ?? `${payload.projectId}:${payload.threadId}:${payload.completedAt ?? payload.status}`;
-      if (!rememberTaskNotification(taskId, payload.completedAt)) return;
+      if (!rememberTaskNotification(taskId)) return;
       try {
         window.PalmNative?.notifyTask?.(
           payload.status,
@@ -1296,11 +1311,15 @@ export default function Home() {
           : payload.status === "failed"
             ? "任务执行失败"
             : "任务已停止";
-      setTaskNotice({
-        projectId: payload.projectId,
-        threadId: payload.threadId,
-        text: `${projectName} · ${result}`,
-      });
+      setTaskNotices((items) => [
+        ...items.filter((item) => item.key !== taskId),
+        {
+          key: taskId,
+          projectId: payload.projectId,
+          threadId: payload.threadId,
+          text: `${projectName} · ${result}`,
+        },
+      ]);
     },
     [],
   );
@@ -1311,28 +1330,13 @@ export default function Home() {
       window.localStorage.setItem(COMPLETION_CURSOR_KEY, new Date().toISOString());
       return;
     }
-    const projectResponse = await fetch("/api/projects").catch(() => null);
-    if (!projectResponse?.ok) return;
-    const listed = ((await projectResponse.json()) as { projects: Project[] })
-      .projects;
-    const recovered: Array<ProjectTask & { projectName: string }> = [];
-    await Promise.all(
-      listed.map(async (project) => {
-        const response = await fetch(
-          `/api/tasks?projectId=${encodeURIComponent(project.id)}`,
-        ).catch(() => null);
-        if (!response?.ok) return;
-        const body = (await response.json()) as { tasks: ProjectTask[] };
-        for (const task of body.tasks) {
-          if (
-            task.status !== "running" &&
-            task.completedAt &&
-            task.completedAt > cursor
-          )
-            recovered.push({ ...task, projectName: project.name });
-        }
-      }),
-    );
+    const response = await fetch(
+      `/api/tasks/completed?since=${encodeURIComponent(cursor)}`,
+    ).catch(() => null);
+    if (!response?.ok) return;
+    const recovered = ((await response.json()) as {
+      tasks: Array<ProjectTask & { projectName: string }>;
+    }).tasks;
     recovered
       .sort((a, b) => (a.completedAt ?? "").localeCompare(b.completedAt ?? ""))
       .forEach((task) =>
@@ -1345,6 +1349,8 @@ export default function Home() {
           projectName: task.projectName,
         }),
       );
+    const latest = recovered.at(-1)?.completedAt;
+    advanceCompletionCursor(latest);
   }, [handleFinishedTask]);
 
   useEffect(() => {
@@ -1371,8 +1377,13 @@ export default function Home() {
 
   useEffect(() => {
     if (!authenticated || !projectId) return;
+    projectLoadGenerationRef.current += 1;
+    threadIdRef.current = undefined;
     const timer = window.setTimeout(() => {
-      void loadProjectData(projectId);
+      setThreads([]);
+      setTasks([]);
+      setFiles([]);
+      setFilesProjectId(projectId);
       setDraft(window.localStorage.getItem(`palm:draft:${projectId}`) ?? "");
       runningRef.current = false;
       setGitOpen(false);
@@ -1383,6 +1394,7 @@ export default function Home() {
       setAttachments([]);
       setUploadFeedbacks([]);
       setRunning(false);
+      void loadProjectData(projectId);
     }, 0);
     return () => window.clearTimeout(timer);
   }, [authenticated, projectId, loadProjectData]);
@@ -1493,6 +1505,7 @@ export default function Home() {
           type: string;
           threadId?: string;
           message?: string;
+          operation?: "turn.start" | "turn.interrupt" | "thread.subscribe" | "unknown";
           clientRequestId?: string;
           replayed?: boolean;
           payload?: Record<string, unknown>;
@@ -1524,6 +1537,10 @@ export default function Home() {
           return;
         }
         if (message.type === "error") {
+          if (message.operation && message.operation !== "turn.start") {
+            setNotice(message.message ?? "操作未能完成");
+            return;
+          }
           const pending = pendingTurnRef.current;
           if (
             pending &&
@@ -1560,6 +1577,25 @@ export default function Home() {
           void loadProjectData(projectIdRef.current);
           return;
         }
+        if (message.type === "codex.online") {
+          setConnection("已连接");
+          setNotice("Codex 服务已恢复");
+          void loadProjectData(projectIdRef.current);
+          const activeThreadId = threadIdRef.current;
+          if (activeThreadId) {
+            socket.send(JSON.stringify({
+              type: "thread.subscribe",
+              projectId: projectIdRef.current,
+              threadId: activeThreadId,
+            }));
+            void refreshThreadMessages(
+              activeThreadId,
+              projectIdRef.current,
+              true,
+            );
+          }
+          return;
+        }
         if (message.type === "task.finished") {
           const payload = message.payload as
             | {
@@ -1571,6 +1607,7 @@ export default function Home() {
             }
             | undefined;
           if (payload?.projectId && payload.threadId && payload.status) {
+            advanceCompletionCursor(payload.completedAt);
             handleFinishedTask({
               taskId: payload.taskId,
               projectId: payload.projectId,
@@ -1730,6 +1767,8 @@ export default function Home() {
       !authenticated ||
       !projectId ||
       !threadId ||
+      projectIdRef.current !== projectId ||
+      threadIdRef.current !== threadId ||
       connection !== "已连接" ||
       socket?.readyState !== WebSocket.OPEN
     )
@@ -1754,7 +1793,6 @@ export default function Home() {
         reconnectNowRef.current();
       }
       void loadDashboard();
-      void recoverFinishedTasks();
       const activeThreadId = threadIdRef.current;
       try {
         const loadedTasks = await loadProjectData(projectId);
@@ -1774,22 +1812,28 @@ export default function Home() {
         syncing = false;
       }
     };
+    const resumeVisibleView = () => {
+      void recoverFinishedTasks();
+      void syncVisibleView();
+    };
     const onVisibilityChange = () => {
-      if (document.visibilityState === "visible") syncVisibleView();
+      if (document.visibilityState === "visible") resumeVisibleView();
     };
     document.addEventListener("visibilitychange", onVisibilityChange);
-    window.addEventListener("focus", syncVisibleView);
-    window.addEventListener("online", syncVisibleView);
-    window.addEventListener("pageshow", syncVisibleView);
-    window.addEventListener("palm-resume", syncVisibleView);
+    window.addEventListener("focus", resumeVisibleView);
+    window.addEventListener("online", resumeVisibleView);
+    window.addEventListener("pageshow", resumeVisibleView);
+    window.addEventListener("palm-resume", resumeVisibleView);
     const timer = window.setInterval(syncVisibleView, 4_000);
+    const recoveryTimer = window.setInterval(recoverFinishedTasks, 60_000);
     return () => {
       document.removeEventListener("visibilitychange", onVisibilityChange);
-      window.removeEventListener("focus", syncVisibleView);
-      window.removeEventListener("online", syncVisibleView);
-      window.removeEventListener("pageshow", syncVisibleView);
-      window.removeEventListener("palm-resume", syncVisibleView);
+      window.removeEventListener("focus", resumeVisibleView);
+      window.removeEventListener("online", resumeVisibleView);
+      window.removeEventListener("pageshow", resumeVisibleView);
+      window.removeEventListener("palm-resume", resumeVisibleView);
       window.clearInterval(timer);
+      window.clearInterval(recoveryTimer);
     };
   }, [
     authenticated,
@@ -1860,8 +1904,7 @@ export default function Home() {
     }
   }, [authenticated, projectId, showArchived, threads]);
 
-  function openTaskNotice() {
-    if (!taskNotice) return;
+  function openTaskNotice(taskNotice: TaskNotice) {
     setPendingNavigation({
       projectId: taskNotice.projectId,
       threadId: taskNotice.threadId,
@@ -1870,7 +1913,7 @@ export default function Home() {
     setShowArchived(false);
     setProjectId(taskNotice.projectId);
     setView("chat");
-    setTaskNotice(undefined);
+    setTaskNotices((items) => items.filter((item) => item !== taskNotice));
   }
 
   async function login(event: FormEvent) {
@@ -2469,11 +2512,14 @@ export default function Home() {
                 ? items
                 : [...items, saved],
             );
-            setFiles((items) =>
-              items.some((item) => item.path === saved.path)
-                ? items
-                : [saved, ...items],
-            );
+            if (projectIdRef.current === projectId) {
+              setFilesProjectId(projectId);
+              setFiles((items) =>
+                items.some((item) => item.path === saved.path)
+                  ? items
+                  : [saved, ...items],
+              );
+            }
             updateFeedback((current) => ({
               ...current,
               progress: 100,
@@ -2653,8 +2699,13 @@ export default function Home() {
   }
 
   async function deleteFile(file: UploadedFile) {
+    if (filesProjectId !== projectId) {
+      setNotice("项目刚刚切换，请等待文件列表刷新后再删除");
+      return;
+    }
     if (!window.confirm(`删除 ${file.name}？`)) return;
-    const query = new URLSearchParams({ projectId, path: file.path });
+    const requestProjectId = filesProjectId;
+    const query = new URLSearchParams({ projectId: requestProjectId, path: file.path });
     const response = await fetch(`/api/files?${query}`, { method: "DELETE" });
     if (response.ok)
       setFiles((items) => items.filter((item) => item.path !== file.path));
@@ -3622,11 +3673,19 @@ export default function Home() {
             )}
           </div>
         )}
-        {taskNotice && (
-          <button className="task-notice" onClick={openTaskNotice}>
-            <span>{taskNotice.text}</span>
-            <strong>查看对话 →</strong>
-          </button>
+        {taskNotices.length > 0 && (
+          <div className="task-notice-stack" aria-label="任务完成通知">
+            {taskNotices.map((taskNotice) => (
+              <button
+                key={taskNotice.key}
+                className="task-notice"
+                onClick={() => openTaskNotice(taskNotice)}
+              >
+                <span>{taskNotice.text}</span>
+                <strong>查看对话 →</strong>
+              </button>
+            ))}
+          </div>
         )}
         <footer
           ref={composerRef}

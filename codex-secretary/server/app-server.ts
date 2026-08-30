@@ -65,6 +65,7 @@ export class CodexBridge extends EventEmitter {
       capabilities: {},
     });
     this.notify('initialized', {});
+    this.emit('online');
   }
 
   private receive(message: JsonRecord): void {

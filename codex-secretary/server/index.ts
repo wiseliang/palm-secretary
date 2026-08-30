@@ -193,13 +193,20 @@ bridge.on('message', async (message: Record<string, unknown>) => {
   if (threadId) sendToThread(threadId, { type: 'codex.event', payload: message });
   else if (typeof message.id !== 'number') broadcast({ type: 'codex.event', payload: message });
 });
+let bridgeWasOffline = false;
 bridge.on('offline', async (details) => {
+  bridgeWasOffline = true;
   const interrupted = await projects.interruptRunningTasks('Codex App Server 意外退出，请确认结果后重新执行').catch(() => 0);
   loadedThreads.clear();
   modelCache = undefined;
   pendingTurnRequests.clear();
   broadcast({ type: 'codex.offline', payload: { ...details, interrupted } });
   broadcast({ type: 'tasks.changed', payload: { interrupted } });
+});
+bridge.on('online', () => {
+  if (!bridgeWasOffline) return;
+  bridgeWasOffline = false;
+  broadcast({ type: 'codex.online' });
 });
 bridge.on('diagnostic', (details) => app.log.info(details));
 
@@ -296,6 +303,19 @@ app.delete<{ Params: { id: string }; Querystring: { projectId?: string } }>('/ap
     const message = error instanceof Error ? error.message : '对话删除失败';
     return reply.code(message === '当前对话仍有任务运行，请先停止任务' ? 409 : 400).send({ error: message });
   }
+});
+
+app.get<{ Querystring: { since?: string } }>('/api/tasks/completed', async (request, reply) => {
+  if (!requireOwner(request, reply)) return;
+  const parsed = z.string().datetime().safeParse(request.query.since);
+  if (!parsed.success) return reply.code(400).send({ error: '完成时间游标无效' });
+  const projectNames = new Map(projects.listProjects().map((project) => [project.id, project.name]));
+  return {
+    tasks: projects.listCompletedTasksSince(parsed.data).map((task) => ({
+      ...task,
+      projectName: projectNames.get(task.projectId) ?? '未知项目',
+    })),
+  };
 });
 
 app.get<{ Querystring: { projectId?: string } }>('/api/tasks', async (request, reply) => {
@@ -723,10 +743,12 @@ app.get('/api/ws', { websocket: true }, (socket, request) => {
 
   socket.on('message', async (raw) => {
     let clientRequestId: string | undefined;
+    let operation: 'turn.start' | 'turn.interrupt' | 'thread.subscribe' | 'unknown' = 'unknown';
     try {
       const parsed = clientMessage.safeParse(JSON.parse(raw.toString()));
       if (!parsed.success) throw new Error('消息格式无效');
       const message = parsed.data;
+      operation = message.type;
       clientRequestId = message.type === 'turn.start' ? message.clientRequestId : undefined;
       app.log.info({ event: message.type }, '收到已认证的 WebSocket 操作');
       if (message.type === 'thread.subscribe') {
@@ -824,7 +846,7 @@ app.get('/api/ws', { websocket: true }, (socket, request) => {
         pendingTurnRequests.delete(requestKey);
       }
     } catch (error) {
-      socket.send(JSON.stringify({ type: 'error', clientRequestId, message: error instanceof Error ? error.message : '任务执行失败' }));
+      socket.send(JSON.stringify({ type: 'error', operation, clientRequestId, message: error instanceof Error ? error.message : '任务执行失败' }));
     }
   });
   socket.on('close', () => {

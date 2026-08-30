@@ -95,6 +95,10 @@ export class ProjectStore {
     let recovered = false;
     for (const task of this.state.tasks) {
       if (task.status !== 'running') continue;
+      const currentOutputs = await this.snapshotOutbox(task.projectId);
+      task.outputPaths = Object.entries(currentOutputs)
+        .filter(([name, signature]) => task.outputBaseline?.[name] !== signature)
+        .map(([name]) => `outbox/${name}`);
       task.status = 'interrupted'; task.updatedAt = interruptedAt; task.completedAt = interruptedAt;
       task.errorMessage = '服务重启时任务仍在运行，请确认结果后再重新执行'; delete task.outputBaseline; recovered = true;
     }
@@ -250,6 +254,16 @@ export class ProjectStore {
     return this.state.tasks.filter((task) => task.projectId === projectId).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)).slice(0, 200);
   }
 
+  listCompletedTasksSince(since: string): ProjectTask[] {
+    const sinceTime = Date.parse(since);
+    if (!Number.isFinite(sinceTime)) throw new Error('完成时间游标无效');
+    return this.state.tasks
+      .filter((task) => task.status !== 'running' && task.completedAt && Date.parse(task.completedAt) > sinceTime)
+      .sort((a, b) => (a.completedAt ?? '').localeCompare(b.completedAt ?? ''))
+      .slice(0, 500)
+      .map((task) => ({ ...task, attachments: [...task.attachments], outputPaths: [...task.outputPaths] }));
+  }
+
   hasRunningTaskForThread(threadId: string, projectId: string): boolean {
     this.assertThreadProject(threadId, projectId);
     return this.state.tasks.some((task) => task.projectId === projectId && task.threadId === threadId && task.status === 'running');
@@ -285,6 +299,9 @@ export class ProjectStore {
       ? this.state.tasks.find((item) => item.threadId === threadId && item.turnId === turnId)
       : [...this.state.tasks].reverse().find((item) => item.threadId === threadId && item.status === 'running');
     if (!task) return undefined;
+    if (task.status !== 'running') {
+      return { ...task, attachments: [...task.attachments], outputPaths: [...task.outputPaths] };
+    }
     const now = new Date().toISOString();
     task.status = status;
     task.updatedAt = now;
@@ -304,6 +321,10 @@ export class ProjectStore {
     let count = 0;
     for (const task of this.state.tasks) {
       if (task.status !== 'running') continue;
+      const currentOutputs = await this.snapshotOutbox(task.projectId);
+      task.outputPaths = Object.entries(currentOutputs)
+        .filter(([name, signature]) => task.outputBaseline?.[name] !== signature)
+        .map(([name]) => `outbox/${name}`);
       task.status = 'interrupted'; task.updatedAt = now; task.completedAt = now;
       task.errorMessage = reason.trim().slice(0, 500); delete task.outputBaseline; count += 1;
     }
