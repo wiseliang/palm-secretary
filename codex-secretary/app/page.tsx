@@ -1607,7 +1607,6 @@ export default function Home() {
             }
             | undefined;
           if (payload?.projectId && payload.threadId && payload.status) {
-            advanceCompletionCursor(payload.completedAt);
             handleFinishedTask({
               taskId: payload.taskId,
               projectId: payload.projectId,

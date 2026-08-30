@@ -99,10 +99,14 @@ try {
     /当前对话仍有任务运行/,
   );
   await writeFile(path.join(root, "outbox", "中断前成果.txt"), "partial result");
-  assert.equal(await restarted.interruptRunningTasks("连接中断"), 1);
+  const crashedTaskIds = restarted.runningTaskIds();
+  await restarted.rememberTask("turn-3", "thread-1", project.id, "恢复期间的新任务");
+  assert.equal(await restarted.interruptRunningTasks("连接中断", crashedTaskIds), 1);
   const interrupted = restarted.listTasks(project.id).find((task) => task.turnId === "turn-2");
   assert.equal(interrupted.status, "interrupted");
   assert.ok(interrupted.outputPaths.includes("outbox/中断前成果.txt"));
+  const newerTask = restarted.listTasks(project.id).find((task) => task.turnId === "turn-3");
+  assert.equal(newerTask.status, "running", "恢复过程不得中断捕获集合之后创建的任务");
 } finally {
   await rm(workspace, { recursive: true, force: true });
 }
@@ -125,6 +129,12 @@ assert.match(server, /type: 'task\.finished'/);
 assert.match(server, /completedAt: task\.completedAt/);
 assert.match(server, /\/api\/tasks\/completed/);
 assert.match(server, /operation, clientRequestId/);
+assert.ok(
+  server.indexOf("broadcast({ type: 'codex.offline'") < server.indexOf("void projects.interruptRunningTasks"),
+  "offline 必须在异步成果核对前广播",
+);
+assert.match(server, /bridgeRecoveryPending/);
+assert.match(server, /interruptedTaskIds = projects\.runningTaskIds\(\)/);
 assert.match(server, /upload-complete[\s\S]{0,900}项目已归档/);
 assert.match(server, /--porcelain=v1', '-z'/);
 assert.match(page, /const visibleThreads = showArchived/);
@@ -135,6 +145,11 @@ assert.match(page, /rememberTaskNotification/);
 assert.match(page, /projectLoadGenerationRef/);
 assert.match(page, /task-notice-stack/);
 assert.match(page, /message\.type === "codex\.online"/);
+assert.equal(
+  page.match(/advanceCompletionCursor\(/g)?.length,
+  2,
+  "恢复游标只能由函数定义和完整补偿请求推进，实时事件不得推进",
+);
 assert.match(bridge, /emit\('online'\)/);
 const android = await readFile(
   new URL("../../palm-secretary-android/app/src/main/java/cloud/wiseliang/palmsecretary/MainActivity.java", import.meta.url),

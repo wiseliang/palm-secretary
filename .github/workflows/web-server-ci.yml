@@ -1,0 +1,52 @@
+name: Web and Server CI
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "codex-secretary/**"
+      - "palm-secretary-android/**"
+      - "palm-secretary-harmony/**"
+      - ".github/workflows/web-server-ci.yml"
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "codex-secretary/**"
+      - "palm-secretary-android/**"
+      - "palm-secretary-harmony/**"
+      - ".github/workflows/web-server-ci.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: codex-secretary
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: codex-secretary/package-lock.json
+      - name: Prepare non-secret hosting defaults
+        run: |
+          mkdir -p .openai
+          printf '{"d1":null,"r2":null}\n' > .openai/hosting.json
+      - run: npm ci --no-audit --no-fund
+      - run: npm run check
+      - run: npm run build
+      - run: npm run test:integration
+      - run: npm run test:v08
+      - run: npm run test:v09
+      - run: npm run test:v010
+      - run: npm run test:v012
+      - run: npm run test:v013
+      - run: npm run test:v014
+      - run: npm run test:v015

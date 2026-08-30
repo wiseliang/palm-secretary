@@ -164,6 +164,12 @@ export class ProjectStore {
     return this.state.tasks.some((task) => task.projectId === projectId && task.status === 'running');
   }
 
+  runningTaskIds(): string[] {
+    return this.state.tasks
+      .filter((task) => task.status === 'running')
+      .map((task) => task.taskId);
+  }
+
   async deleteProject(id: string): Promise<void> {
     if (id === 'default') throw new Error('默认项目不能删除');
     if (this.hasRunningTask(id)) throw new Error('项目仍有运行中的任务');
@@ -316,20 +322,23 @@ export class ProjectStore {
     return { ...task, attachments: [...task.attachments], outputPaths: [...task.outputPaths] };
   }
 
-  async interruptRunningTasks(reason: string): Promise<number> {
+  async interruptRunningTasks(reason: string, taskIds = this.runningTaskIds()): Promise<number> {
     const now = new Date().toISOString();
-    let count = 0;
-    for (const task of this.state.tasks) {
-      if (task.status !== 'running') continue;
+    const selected = new Set(taskIds);
+    const tasks = this.state.tasks.filter((task) => selected.has(task.taskId) && task.status === 'running');
+    for (const task of tasks) {
+      task.status = 'interrupted'; task.updatedAt = now; task.completedAt = now;
+      task.errorMessage = reason.trim().slice(0, 500);
+    }
+    for (const task of tasks) {
       const currentOutputs = await this.snapshotOutbox(task.projectId);
       task.outputPaths = Object.entries(currentOutputs)
         .filter(([name, signature]) => task.outputBaseline?.[name] !== signature)
         .map(([name]) => `outbox/${name}`);
-      task.status = 'interrupted'; task.updatedAt = now; task.completedAt = now;
-      task.errorMessage = reason.trim().slice(0, 500); delete task.outputBaseline; count += 1;
+      delete task.outputBaseline;
     }
-    if (count) await this.persist();
-    return count;
+    if (tasks.length) await this.persist();
+    return tasks.length;
   }
 
   assertThreadProject(threadId: string, projectId: string): void {

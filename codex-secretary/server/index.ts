@@ -194,19 +194,45 @@ bridge.on('message', async (message: Record<string, unknown>) => {
   else if (typeof message.id !== 'number') broadcast({ type: 'codex.event', payload: message });
 });
 let bridgeWasOffline = false;
-bridge.on('offline', async (details) => {
+let bridgeRecoveryPending = false;
+let bridgeOnlinePending = false;
+let bridgeRecoveryGeneration = 0;
+const publishBridgeOnline = () => {
+  if (!bridgeWasOffline || bridgeRecoveryPending) return;
+  bridgeWasOffline = false;
+  bridgeOnlinePending = false;
+  broadcast({ type: 'codex.online' });
+};
+bridge.on('offline', (details) => {
+  const generation = ++bridgeRecoveryGeneration;
   bridgeWasOffline = true;
-  const interrupted = await projects.interruptRunningTasks('Codex App Server 意外退出，请确认结果后重新执行').catch(() => 0);
+  bridgeRecoveryPending = true;
+  bridgeOnlinePending = false;
+  const interruptedTaskIds = projects.runningTaskIds();
   loadedThreads.clear();
   modelCache = undefined;
   pendingTurnRequests.clear();
-  broadcast({ type: 'codex.offline', payload: { ...details, interrupted } });
-  broadcast({ type: 'tasks.changed', payload: { interrupted } });
+  broadcast({ type: 'codex.offline', payload: { ...details, interrupted: interruptedTaskIds.length, reconciling: true } });
+  void projects.interruptRunningTasks(
+    'Codex App Server 意外退出，请确认结果后重新执行',
+    interruptedTaskIds,
+  ).then((interrupted) => {
+    broadcast({ type: 'tasks.changed', payload: { interrupted } });
+  }).catch((error) => {
+    app.log.warn({ err: error }, '中断任务成果核对失败');
+  }).finally(() => {
+    if (generation !== bridgeRecoveryGeneration) return;
+    bridgeRecoveryPending = false;
+    if (bridgeOnlinePending) publishBridgeOnline();
+  });
 });
 bridge.on('online', () => {
   if (!bridgeWasOffline) return;
-  bridgeWasOffline = false;
-  broadcast({ type: 'codex.online' });
+  if (bridgeRecoveryPending) {
+    bridgeOnlinePending = true;
+    return;
+  }
+  publishBridgeOnline();
 });
 bridge.on('diagnostic', (details) => app.log.info(details));
 
@@ -755,6 +781,9 @@ app.get('/api/ws', { websocket: true }, (socket, request) => {
         projects.assertThreadProject(message.threadId, message.projectId);
         setSocketThread(socket, message.threadId);
         return;
+      }
+      if (message.type === 'turn.start' && bridgeRecoveryPending) {
+        throw new Error('Codex 服务正在核对中断任务，请稍后重试');
       }
       await bridge.ready();
       app.log.info({ event: message.type }, 'Codex App Server 已就绪');

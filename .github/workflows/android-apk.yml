@@ -2,19 +2,33 @@ name: Android APK
 
 on:
   workflow_dispatch:
+    inputs:
+      publish:
+        description: "发布不可变的 Android 内测版本"
+        required: false
+        type: boolean
+        default: false
   push:
     branches:
-      - fix/audit-complete-20260829
+      - main
+    paths:
+      - "palm-secretary-android/**"
+      - ".github/workflows/android-apk.yml"
+  pull_request:
+    branches:
+      - main
     paths:
       - "palm-secretary-android/**"
       - ".github/workflows/android-apk.yml"
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     defaults:
       run:
         working-directory: palm-secretary-android
@@ -28,7 +42,7 @@ jobs:
       - name: Build debug APK
         run: |
           chmod +x gradlew
-          ./gradlew --no-daemon clean assembleDebug
+          ./gradlew --no-daemon clean assembleDebug lintDebug
       - name: Verify APK signature
         run: |
           BUILD_TOOLS_VERSION=$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)
@@ -36,15 +50,22 @@ jobs:
       - name: Publish APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: palm-secretary-v0.13.2-android
+          name: palm-secretary-android-${{ github.sha }}
           path: palm-secretary-android/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
           retention-days: 30
       - name: Publish downloadable prerelease
+        if: github.event_name == 'workflow_dispatch' && inputs.publish
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          cp app/build/outputs/apk/debug/app-debug.apk "掌心助理-v0.13.2-安卓内测版.apk"
-          gh release view android-v0.13.2 >/dev/null 2>&1 || \
-            gh release create android-v0.13.2 --target "$GITHUB_SHA" --prerelease --title "掌心助理 v0.13.2 Android 内测版" --notes "自动构建并通过 APK 签名校验的 Android 内测安装包。"
-          gh release upload android-v0.13.2 "掌心助理-v0.13.2-安卓内测版.apk" --clobber
+          VERSION=$(sed -n "s/.*versionName ['\"]\([^'\"]*\).*/\1/p" app/build.gradle | head -1)
+          test -n "$VERSION"
+          TAG="android-v$VERSION"
+          ASSET="palm-secretary-v$VERSION-android-beta.apk"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG 已存在；同版本安装包禁止覆盖，请先提升 versionName。" >&2
+            exit 1
+          fi
+          cp app/build/outputs/apk/debug/app-debug.apk "$ASSET"
+          gh release create "$TAG" --target "$GITHUB_SHA" --prerelease --title "掌心助理 v$VERSION Android 内测版" --notes "自动构建并通过 Android lint 与 APK 签名校验的内测安装包。" "$ASSET"

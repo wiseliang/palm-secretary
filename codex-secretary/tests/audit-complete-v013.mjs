@@ -37,8 +37,8 @@ for (const route of ["upload-session", "upload-chunk", "upload-complete"])
 assert.match(server, /UPLOAD_PART_TTL_MS = 24 \* 60 \* 60 \* 1000/);
 assert.match(server, /app\.delete[^\n]*\/api\/files\/upload-session/);
 assert.match(server, /reply\.code\(507\)/);
-assert.match(store, /interruptRunningTasks\(reason: string\)/);
-assert.match(server, /bridge\.on\('offline', async/);
+assert.match(store, /interruptRunningTasks\(reason: string, taskIds = this\.runningTaskIds\(\)\)/);
+assert.match(server, /bridge\.on\('offline', \(details\) =>/);
 assert.match(store, /projectWorkdir\(id: string\)/);
 assert.match(server, /setProjectWorkdir\(project\.id, 'repository'\)/);
 assert.match(server, /await projects\.deleteProject\(project\.id\)/);
