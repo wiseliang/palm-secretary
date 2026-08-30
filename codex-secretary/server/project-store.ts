@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { access, cp, mkdir, readFile, readdir, rename, stat, writeFile } from 'node:fs/promises';
+import { access, cp, mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
 export type Project = {
@@ -11,6 +11,7 @@ export type Project = {
   model?: string;
   reasoningEffort?: string;
   archivedAt?: string;
+  workdir?: string;
 };
 
 export type ProjectThread = {
@@ -43,6 +44,7 @@ export type ProjectTask = {
 type StoreState = { version: 7; projects: Project[]; threads: ProjectThread[]; tasks: ProjectTask[] };
 
 const PROJECT_ID = /^[a-z0-9][a-z0-9-]{0,63}$/;
+const UPLOAD_NAME = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}-/i;
 
 export class ProjectStore {
   private readonly stateDir: string;
@@ -80,10 +82,23 @@ export class ProjectStore {
       await this.persist();
     }
     for (const project of this.state.projects) await this.ensureProjectDirectories(project);
+    let migratedWorkdirs = false;
+    for (const project of this.state.projects) {
+      if (project.workdir) continue;
+      if ((await stat(path.join(this.projectRoot(project.id), 'repository', '.git')).catch(() => null))?.isDirectory()) {
+        project.workdir = 'repository'; await mkdir(this.inbox(project.id), { recursive: true, mode: 0o700 }); await mkdir(this.outbox(project.id), { recursive: true, mode: 0o700 }); migratedWorkdirs = true;
+      }
+    }
+    if (migratedWorkdirs) await this.persist();
+    await this.migrateWorkdirPrivateFiles();
     const interruptedAt = new Date().toISOString();
     let recovered = false;
     for (const task of this.state.tasks) {
       if (task.status !== 'running') continue;
+      const currentOutputs = await this.snapshotOutbox(task.projectId);
+      task.outputPaths = Object.entries(currentOutputs)
+        .filter(([name, signature]) => task.outputBaseline?.[name] !== signature)
+        .map(([name]) => `outbox/${name}`);
       task.status = 'interrupted'; task.updatedAt = interruptedAt; task.completedAt = interruptedAt;
       task.errorMessage = '服务重启时任务仍在运行，请确认结果后再重新执行'; delete task.outputBaseline; recovered = true;
     }
@@ -110,6 +125,14 @@ export class ProjectStore {
     return resolved;
   }
 
+  projectWorkdir(id: string): string {
+    const project = this.getProject(id);
+    const root = this.projectRoot(id);
+    const resolved = path.resolve(root, project.workdir || '.');
+    if (resolved !== root && !resolved.startsWith(`${root}${path.sep}`)) throw new Error('项目工作目录无效');
+    return resolved;
+  }
+
   inbox(id: string): string { return path.join(this.projectRoot(id), 'inbox'); }
   outbox(id: string): string { return path.join(this.projectRoot(id), 'outbox'); }
 
@@ -125,6 +148,39 @@ export class ProjectStore {
     return project;
   }
 
+  async setProjectWorkdir(id: string, workdir?: string): Promise<Project> {
+    const project = this.getProject(id);
+    const normalized = workdir?.trim().replaceAll('\\', '/');
+    if (normalized && (path.isAbsolute(normalized) || normalized.split('/').includes('..'))) throw new Error('项目工作目录无效');
+    project.workdir = normalized || undefined;
+    project.updatedAt = new Date().toISOString();
+    await mkdir(this.inbox(id), { recursive: true, mode: 0o700 });
+    await mkdir(this.outbox(id), { recursive: true, mode: 0o700 });
+    await this.persist();
+    return project;
+  }
+
+  hasRunningTask(projectId: string): boolean {
+    return this.state.tasks.some((task) => task.projectId === projectId && task.status === 'running');
+  }
+
+  runningTaskIds(): string[] {
+    return this.state.tasks
+      .filter((task) => task.status === 'running')
+      .map((task) => task.taskId);
+  }
+
+  async deleteProject(id: string): Promise<void> {
+    if (id === 'default') throw new Error('默认项目不能删除');
+    if (this.hasRunningTask(id)) throw new Error('项目仍有运行中的任务');
+    const root = this.projectRoot(id);
+    this.state.projects = this.state.projects.filter((project) => project.id !== id);
+    this.state.threads = this.state.threads.filter((thread) => thread.projectId !== id);
+    this.state.tasks = this.state.tasks.filter((task) => task.projectId !== id);
+    await this.persist();
+    await rm(root, { recursive: true, force: true });
+  }
+
   async renameProject(id: string, name: string): Promise<Project> {
     const project = this.getProject(id);
     const cleanName = name.trim().replace(/[\u0000-\u001f]/g, '').slice(0, 50);
@@ -137,6 +193,7 @@ export class ProjectStore {
 
   async archiveProject(id: string, archived: boolean): Promise<Project> {
     if (id === 'default' && archived) throw new Error('默认项目不能归档');
+    if (archived && this.hasRunningTask(id)) throw new Error('项目仍有运行中的任务，任务结束后才能归档');
     const project = this.getProject(id);
     project.archivedAt = archived ? new Date().toISOString() : undefined;
     project.updatedAt = new Date().toISOString();
@@ -147,7 +204,7 @@ export class ProjectStore {
     const source = this.getProject(id);
     const duplicate = await this.createProject(name);
     await cp(this.projectRoot(source.id), this.projectRoot(duplicate.id), { recursive: true, force: false, errorOnExist: false, filter: (entry) => !entry.includes(`${path.sep}.git${path.sep}`) && !entry.endsWith(`${path.sep}.git`) });
-    duplicate.model = source.model; duplicate.reasoningEffort = source.reasoningEffort;
+    duplicate.model = source.model; duplicate.reasoningEffort = source.reasoningEffort; duplicate.workdir = source.workdir;
     duplicate.updatedAt = new Date().toISOString(); await this.persist(); return duplicate;
   }
 
@@ -167,6 +224,9 @@ export class ProjectStore {
 
   async updateThread(threadId: string, projectId: string, update: { title?: string; archived?: boolean; favorite?: boolean }): Promise<ProjectThread> {
     this.assertThreadProject(threadId, projectId);
+    if (update.archived === true && this.hasRunningTaskForThread(threadId, projectId)) {
+      throw new Error('当前对话仍有任务运行，请先停止任务');
+    }
     const thread = this.state.threads.find((item) => item.threadId === threadId)!;
     if (update.title !== undefined) {
       const title = update.title.trim().replace(/[\u0000-\u001f]/g, '').slice(0, 80);
@@ -187,6 +247,9 @@ export class ProjectStore {
 
   async deleteThread(threadId: string, projectId: string): Promise<void> {
     this.assertThreadProject(threadId, projectId);
+    if (this.hasRunningTaskForThread(threadId, projectId)) {
+      throw new Error('当前对话仍有任务运行，请先停止任务');
+    }
     this.state.threads = this.state.threads.filter((item) => item.threadId !== threadId);
     this.state.tasks = this.state.tasks.filter((item) => item.threadId !== threadId);
     await this.persist();
@@ -195,6 +258,21 @@ export class ProjectStore {
   listTasks(projectId: string): ProjectTask[] {
     this.getProject(projectId);
     return this.state.tasks.filter((task) => task.projectId === projectId).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)).slice(0, 200);
+  }
+
+  listCompletedTasksSince(since: string): ProjectTask[] {
+    const sinceTime = Date.parse(since);
+    if (!Number.isFinite(sinceTime)) throw new Error('完成时间游标无效');
+    return this.state.tasks
+      .filter((task) => task.status !== 'running' && task.completedAt && Date.parse(task.completedAt) > sinceTime)
+      .sort((a, b) => (a.completedAt ?? '').localeCompare(b.completedAt ?? ''))
+      .slice(0, 500)
+      .map((task) => ({ ...task, attachments: [...task.attachments], outputPaths: [...task.outputPaths] }));
+  }
+
+  hasRunningTaskForThread(threadId: string, projectId: string): boolean {
+    this.assertThreadProject(threadId, projectId);
+    return this.state.tasks.some((task) => task.projectId === projectId && task.threadId === threadId && task.status === 'running');
   }
 
   findTaskByClientRequestId(projectId: string, clientRequestId: string): ProjectTask | undefined {
@@ -222,11 +300,14 @@ export class ProjectStore {
     return task;
   }
 
-  async finishTask(threadId: string, turnId: string | undefined, status: ProjectTask['status'], errorMessage?: string): Promise<void> {
+  async finishTask(threadId: string, turnId: string | undefined, status: ProjectTask['status'], errorMessage?: string): Promise<ProjectTask | undefined> {
     const task = turnId
       ? this.state.tasks.find((item) => item.threadId === threadId && item.turnId === turnId)
       : [...this.state.tasks].reverse().find((item) => item.threadId === threadId && item.status === 'running');
-    if (!task) return;
+    if (!task) return undefined;
+    if (task.status !== 'running') {
+      return { ...task, attachments: [...task.attachments], outputPaths: [...task.outputPaths] };
+    }
     const now = new Date().toISOString();
     task.status = status;
     task.updatedAt = now;
@@ -238,6 +319,26 @@ export class ProjectStore {
       .map(([name]) => `outbox/${name}`);
     delete task.outputBaseline;
     await this.persist();
+    return { ...task, attachments: [...task.attachments], outputPaths: [...task.outputPaths] };
+  }
+
+  async interruptRunningTasks(reason: string, taskIds = this.runningTaskIds()): Promise<number> {
+    const now = new Date().toISOString();
+    const selected = new Set(taskIds);
+    const tasks = this.state.tasks.filter((task) => selected.has(task.taskId) && task.status === 'running');
+    for (const task of tasks) {
+      task.status = 'interrupted'; task.updatedAt = now; task.completedAt = now;
+      task.errorMessage = reason.trim().slice(0, 500);
+    }
+    for (const task of tasks) {
+      const currentOutputs = await this.snapshotOutbox(task.projectId);
+      task.outputPaths = Object.entries(currentOutputs)
+        .filter(([name, signature]) => task.outputBaseline?.[name] !== signature)
+        .map(([name]) => `outbox/${name}`);
+      delete task.outputBaseline;
+    }
+    if (tasks.length) await this.persist();
+    return tasks.length;
   }
 
   assertThreadProject(threadId: string, projectId: string): void {
@@ -264,8 +365,8 @@ export class ProjectStore {
 
   safeStoredPath(projectId: string, relativePath: string): string {
     const root = this.projectRoot(projectId);
-    const inbox = path.join(root, 'inbox');
-    const outbox = path.join(root, 'outbox');
+    const inbox = this.inbox(projectId);
+    const outbox = this.outbox(projectId);
     const resolved = path.resolve(root, relativePath);
     if (resolved !== inbox && !resolved.startsWith(`${inbox}${path.sep}`) && resolved !== outbox && !resolved.startsWith(`${outbox}${path.sep}`)) {
       throw new Error('文件路径不在当前项目的允许范围内');
@@ -297,6 +398,39 @@ export class ProjectStore {
         try { await access(destination); destination = path.join(this.projectRoot('default'), folder, `${Date.now()}-${entry.name}`); }
         catch { /* destination is free */ }
         await rename(source, destination);
+      }
+    }
+  }
+
+  private async migrateWorkdirPrivateFiles(): Promise<void> {
+    for (const project of this.state.projects) {
+      const workdir = this.projectWorkdir(project.id);
+      const root = this.projectRoot(project.id);
+      if (workdir === root) continue;
+      const referenced = new Set(this.state.tasks
+        .filter((task) => task.projectId === project.id)
+        .flatMap((task) => [...task.attachments, ...task.outputPaths]));
+      for (const folder of ['inbox', 'outbox'] as const) {
+        const source = path.join(workdir, folder);
+        const destinationRoot = path.join(root, folder);
+        const entries = await readdir(source, { withFileTypes: true }).catch(() => []);
+        for (const entry of entries) {
+          if (!entry.isFile()) continue;
+          const relativePath = `${folder}/${entry.name}`;
+          const knownPalmFile = referenced.has(relativePath) || (folder === 'inbox' && UPLOAD_NAME.test(entry.name));
+          // Never infer Palm ownership from Git state. Untracked and ignored files may
+          // still be real repository assets, so only migrate files with affirmative
+          // Palm provenance (task metadata or the UUID upload naming convention).
+          if (!knownPalmFile) continue;
+          const sourcePath = path.join(source, entry.name);
+          let destination = path.join(destinationRoot, entry.name);
+          if (await stat(destination).catch(() => null)) {
+            const parsed = path.parse(entry.name);
+            destination = path.join(destinationRoot, `${parsed.name}-migrated-${Date.now()}-${randomUUID().slice(0, 8)}${parsed.ext}`);
+          }
+          await rename(sourcePath, destination);
+        }
+        await rm(source, { recursive: false }).catch(() => undefined);
       }
     }
   }

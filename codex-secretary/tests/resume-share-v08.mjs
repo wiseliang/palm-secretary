@@ -12,7 +12,7 @@ for (const event of ['visibilitychange', 'focus', 'online', 'pageshow', 'palm-re
   assert.match(page, new RegExp(event), `缺少前台同步事件 ${event}`);
 }
 assert.match(page, /window\.setInterval\(syncVisibleView, 4_000\)/, '运行期间需要主动对账');
-assert.match(page, /updated \? next : \[\.\.\.items/, '漏掉回复首帧时应补建消息');
+assert.match(page, /return updated[\s\S]{0,180}\[\s*\.\.\.items/, '漏掉回复首帧时应补建消息');
 assert.match(page, /__PALM_SHARED_FILES__/, '网页必须消费原生分享文件');
 assert.match(page, /\/__native_share\//, '网页必须读取原生分享流');
 assert.match(manifest, /android\.intent\.action\.SEND/, 'Android 必须注册单文件分享');

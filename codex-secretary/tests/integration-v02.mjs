@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rm, stat, utimes, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import WebSocket from 'ws';
 
@@ -12,6 +12,12 @@ await writeFile(logFile, '');
 await mkdir(path.join(workspace, '.palm'), { recursive: true });
 const seededAt = new Date().toISOString();
 await writeFile(path.join(workspace, '.palm', 'state.json'), `${JSON.stringify({ version: 2, projects: [{ id: 'default', name: '默认项目', directory: 'default', createdAt: seededAt, updatedAt: seededAt }], threads: [] }, null, 2)}\n`);
+const seededInbox = path.join(workspace, 'projects', 'default', 'inbox');
+await mkdir(seededInbox, { recursive: true });
+const stalePart = path.join(seededInbox, '.upload-323e4567-e89b-42d3-a456-426614174000.part');
+const freshPart = path.join(seededInbox, '.upload-423e4567-e89b-42d3-a456-426614174000.part');
+await writeFile(stalePart, 'stale'); await writeFile(freshPart, 'fresh');
+const old = new Date(Date.now() - 25 * 60 * 60 * 1000); await utimes(stalePart, old, old);
 
 const port = 4591;
 const commonHeaders = { Origin: `http://127.0.0.1:${port}`, 'Tailscale-User-Login': 'test@example.com' };
@@ -40,6 +46,8 @@ try {
     if ((await fetch(`http://127.0.0.1:${port}/api/health`).catch(() => null))?.ok) break;
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
+  if (await stat(stalePart).catch(() => null)) throw new Error('过期上传分片未在启动时清理');
+  if (!(await stat(freshPart).catch(() => null))) throw new Error('未过期上传分片被错误清理');
   const createdResponse = await api('/api/projects', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: '附件测试项目' }) });
   if (createdResponse.status !== 201) throw new Error(`创建项目失败: ${createdResponse.status}`);
   const project = (await createdResponse.json()).project;
@@ -71,6 +79,13 @@ try {
   if (!secondChunk.ok) throw new Error('续传分片失败');
   const chunkComplete = await api(`/api/files/upload-complete?projectId=${encodeURIComponent(project.id)}`, { method: 'POST', headers: chunkHeaders });
   if (!chunkComplete.ok || (await chunkComplete.json()).file?.name !== '断点文件.txt') throw new Error('分片上传完成失败');
+  const abortId = '523e4567-e89b-42d3-a456-426614174000';
+  const abortHeaders = { 'X-Upload-Id': abortId, 'X-File-Name': encodeURIComponent('取消上传.txt'), 'X-File-Size': '24' };
+  await api(`/api/files/upload-chunk?projectId=${encodeURIComponent(project.id)}`, { method: 'PUT', headers: { ...abortHeaders, 'X-Upload-Offset': '0', 'Content-Type': 'application/octet-stream' }, body: Buffer.from('abcdefghijkl') });
+  const aborted = await api(`/api/files/upload-session?projectId=${encodeURIComponent(project.id)}`, { method: 'DELETE', headers: abortHeaders });
+  if (!aborted.ok) throw new Error('上传会话取消失败');
+  const abortedSession = await api(`/api/files/upload-session?projectId=${encodeURIComponent(project.id)}`, { headers: abortHeaders });
+  if (!abortedSession.ok || (await abortedSession.json()).uploaded !== 0) throw new Error('取消后分片仍然存在');
 
   const events = [];
   const firstRequestId = crypto.randomUUID();

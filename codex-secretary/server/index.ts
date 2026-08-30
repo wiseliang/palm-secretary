@@ -21,13 +21,19 @@ const bridge = new CodexBridge();
 type SocketLike = { send: (value: string) => void; close: (code?: number, reason?: string) => void; readyState: number };
 const sockets = new Set<SocketLike>();
 const threadSockets = new Map<string, Set<SocketLike>>();
+const socketThreads = new Map<SocketLike, string>();
 const loadedThreads = new Set<string>();
+const startingProjects = new Set<string>();
 const loginAttempts = new Map<string, { count: number; resetAt: number }>();
 type TurnAcceptance = { threadId: string; payload: { turn?: { id?: string } }; replayed?: boolean; clientRequestId: string };
 const pendingTurnRequests = new Map<string, Promise<TurnAcceptance | undefined>>();
 const projects = new ProjectStore(config.workspace);
 const execFileAsync = promisify(execFile);
-const OUTPUT_INSTRUCTIONS = `你运行在掌心助理的独立项目工作区。用户不需要知道目录约定。只要任务产生可下载成果（文档、表格、演示文稿、PDF、图片、压缩包、代码包或其他文件），你必须主动把最终版本保存到当前工作目录的 outbox/，使用清晰中文文件名，并在最终回复中说明文件名。若成果是需要直接查看或扫码的图片，最终回复中还必须单独写一行 Markdown 图片语法：![图片说明](outbox/实际文件名.png)，路径必须与真实文件完全一致；掌心助理会在聊天中直接显示该图片。不要要求用户说出 outbox，也不要只在聊天中声称已生成而不实际写入。纯问答无需强行创建文件。用户上传的附件位于 inbox/。`;
+function outputInstructions(projectId: string): string {
+  const inbox = projects.inbox(projectId);
+  const outbox = projects.outbox(projectId);
+  return `你运行在掌心助理的独立项目工作区。用户不需要知道目录约定。代码与 Git 操作以当前工作目录为准，但 Palm 私有文件不在 Git 仓库内。用户上传的附件位于绝对目录 ${inbox}。只要任务产生可下载成果（文档、表格、演示文稿、PDF、图片、压缩包、代码包或其他文件），你必须主动把最终版本保存到绝对目录 ${outbox}，使用清晰中文文件名，并在最终回复中说明文件名。若成果是需要直接查看或扫码的图片，最终回复中还必须单独写一行 Markdown 图片语法：![图片说明](outbox/实际文件名.png)，路径必须与真实文件完全一致；掌心助理会在聊天中直接显示该图片。不要把 inbox 或 outbox 复制进当前 Git 仓库，不要要求用户说出 outbox，也不要只在聊天中声称已生成而不实际写入。纯问答无需强行创建文件。`;
+}
 type CodexModel = { id: string; model: string; displayName: string; description: string; isDefault: boolean; hidden?: boolean; supportedReasoningEfforts: Array<{ reasoningEffort: string; description: string }>; defaultReasoningEffort: string };
 let modelCache: { expiresAt: number; models: CodexModel[] } | undefined;
 
@@ -132,10 +138,22 @@ function sendToThread(threadId: string, value: unknown): void {
   }
 }
 
-function attachSocketToThread(socket: SocketLike, threadId: string): void {
+function detachSocketFromThread(socket: SocketLike): void {
+  const previousThreadId = socketThreads.get(socket);
+  if (!previousThreadId) return;
+  const attached = threadSockets.get(previousThreadId);
+  attached?.delete(socket);
+  if (attached?.size === 0) threadSockets.delete(previousThreadId);
+  socketThreads.delete(socket);
+}
+
+function setSocketThread(socket: SocketLike, threadId: string): void {
+  if (socketThreads.get(socket) === threadId) return;
+  detachSocketFromThread(socket);
   const attached = threadSockets.get(threadId) ?? new Set<SocketLike>();
   attached.add(socket);
   threadSockets.set(threadId, attached);
+  socketThreads.set(socket, threadId);
 }
 
 bridge.on('message', async (message: Record<string, unknown>) => {
@@ -156,13 +174,66 @@ bridge.on('message', async (message: Record<string, unknown>) => {
     const failure = params && typeof (params as Record<string, unknown>).error === 'object'
       ? (params as Record<string, unknown>).error as Record<string, unknown> : undefined;
     const errorMessage = typeof failure?.message === 'string' ? failure.message : undefined;
-    try { await projects.finishTask(threadId, turnId, status, errorMessage); }
+    try {
+      const task = await projects.finishTask(threadId, turnId, status, errorMessage);
+      if (task) broadcast({
+        type: 'task.finished',
+        payload: {
+          taskId: task.taskId,
+          projectId: task.projectId,
+          threadId: task.threadId,
+          turnId: task.turnId,
+          status: task.status,
+          completedAt: task.completedAt,
+        },
+      });
+    }
     catch (error) { app.log.warn({ err: error }, '任务状态写入失败'); }
   }
   if (threadId) sendToThread(threadId, { type: 'codex.event', payload: message });
   else if (typeof message.id !== 'number') broadcast({ type: 'codex.event', payload: message });
 });
-bridge.on('offline', (details) => broadcast({ type: 'codex.offline', payload: details }));
+let bridgeWasOffline = false;
+let bridgeRecoveryPending = false;
+let bridgeOnlinePending = false;
+let bridgeRecoveryGeneration = 0;
+const publishBridgeOnline = () => {
+  if (!bridgeWasOffline || bridgeRecoveryPending) return;
+  bridgeWasOffline = false;
+  bridgeOnlinePending = false;
+  broadcast({ type: 'codex.online' });
+};
+bridge.on('offline', (details) => {
+  const generation = ++bridgeRecoveryGeneration;
+  bridgeWasOffline = true;
+  bridgeRecoveryPending = true;
+  bridgeOnlinePending = false;
+  const interruptedTaskIds = projects.runningTaskIds();
+  loadedThreads.clear();
+  modelCache = undefined;
+  pendingTurnRequests.clear();
+  broadcast({ type: 'codex.offline', payload: { ...details, interrupted: interruptedTaskIds.length, reconciling: true } });
+  void projects.interruptRunningTasks(
+    'Codex App Server 意外退出，请确认结果后重新执行',
+    interruptedTaskIds,
+  ).then((interrupted) => {
+    broadcast({ type: 'tasks.changed', payload: { interrupted } });
+  }).catch((error) => {
+    app.log.warn({ err: error }, '中断任务成果核对失败');
+  }).finally(() => {
+    if (generation !== bridgeRecoveryGeneration) return;
+    bridgeRecoveryPending = false;
+    if (bridgeOnlinePending) publishBridgeOnline();
+  });
+});
+bridge.on('online', () => {
+  if (!bridgeWasOffline) return;
+  if (bridgeRecoveryPending) {
+    bridgeOnlinePending = true;
+    return;
+  }
+  publishBridgeOnline();
+});
 bridge.on('diagnostic', (details) => app.log.info(details));
 
 app.get('/api/health', async () => ({ ok: true }));
@@ -245,13 +316,32 @@ app.patch<{ Params: { id: string }; Querystring: { projectId?: string } }>('/api
   const parsed = z.object({ title: z.string().min(1).max(80).optional(), archived: z.boolean().optional(), favorite: z.boolean().optional() }).refine((value) => value.title !== undefined || value.archived !== undefined || value.favorite !== undefined).safeParse(request.body);
   if (!parsed.success) return reply.code(400).send({ error: '对话更新内容无效' });
   try { return { thread: await projects.updateThread(request.params.id, request.query.projectId ?? 'default', parsed.data) }; }
-  catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : '对话更新失败' }); }
+  catch (error) {
+    const message = error instanceof Error ? error.message : '对话更新失败';
+    return reply.code(message === '当前对话仍有任务运行，请先停止任务' ? 409 : 400).send({ error: message });
+  }
 });
 
 app.delete<{ Params: { id: string }; Querystring: { projectId?: string } }>('/api/threads/:id', async (request, reply) => {
   if (!requireOwner(request, reply)) return;
   try { await projects.deleteThread(request.params.id, request.query.projectId ?? 'default'); return reply.code(204).send(); }
-  catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : '对话删除失败' }); }
+  catch (error) {
+    const message = error instanceof Error ? error.message : '对话删除失败';
+    return reply.code(message === '当前对话仍有任务运行，请先停止任务' ? 409 : 400).send({ error: message });
+  }
+});
+
+app.get<{ Querystring: { since?: string } }>('/api/tasks/completed', async (request, reply) => {
+  if (!requireOwner(request, reply)) return;
+  const parsed = z.string().datetime().safeParse(request.query.since);
+  if (!parsed.success) return reply.code(400).send({ error: '完成时间游标无效' });
+  const projectNames = new Map(projects.listProjects().map((project) => [project.id, project.name]));
+  return {
+    tasks: projects.listCompletedTasksSince(parsed.data).map((task) => ({
+      ...task,
+      projectName: projectNames.get(task.projectId) ?? '未知项目',
+    })),
+  };
 });
 
 app.get<{ Querystring: { projectId?: string } }>('/api/tasks', async (request, reply) => {
@@ -355,7 +445,10 @@ app.post<{ Params: { id: string } }>('/api/projects/:id/duplicate', async (reque
   if (!requireOwner(request, reply)) return;
   const parsed = z.object({ name: z.string().min(1).max(50) }).safeParse(request.body);
   if (!parsed.success) return reply.code(400).send({ error: '副本名称无效' });
-  try { return reply.code(201).send({ project: await projects.duplicateProject(request.params.id, parsed.data.name) }); }
+  try {
+    if (projects.hasRunningTask(request.params.id)) throw new Error('Codex 正在处理该项目，暂时禁止复制');
+    return reply.code(201).send({ project: await projects.duplicateProject(request.params.id, parsed.data.name) });
+  }
   catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : '项目复制失败' }); }
 });
 
@@ -371,8 +464,8 @@ app.put<{ Params: { id: string } }>('/api/projects/:id/model', async (request, r
 });
 
 async function projectGitRoot(projectId: string): Promise<string | undefined> {
-  const root = projects.projectRoot(projectId);
-  for (const candidate of [root, path.join(root, 'repository')]) {
+  const root = projects.projectWorkdir(projectId);
+  for (const candidate of [root]) {
     if ((await stat(path.join(candidate, '.git')).catch(() => null))?.isDirectory()) return candidate;
   }
   return undefined;
@@ -390,11 +483,23 @@ app.get<{ Params: { id: string } }>('/api/projects/:id/git', async (request, rep
   try {
     const root = await projectGitRoot(request.params.id);
     if (!root) return { repository: false, changes: [], diff: '' };
-    const [branch, statusText, diff] = await Promise.all([
-      git(request.params.id, ['branch', '--show-current']), git(request.params.id, ['status', '--porcelain=v1']), git(request.params.id, ['diff', '--no-ext-diff', '--unified=3']),
+    const [branch, statusText, unstagedDiff, stagedDiff] = await Promise.all([
+      git(request.params.id, ['branch', '--show-current']), git(request.params.id, ['status', '--porcelain=v1', '-z']),
+      git(request.params.id, ['diff', '--no-ext-diff', '--unified=3']), git(request.params.id, ['diff', '--cached', '--no-ext-diff', '--unified=3']),
     ]);
-    const changes = statusText.split('\n').filter(Boolean).map((line) => ({ status: line.slice(0, 2).trim() || '?', path: line.slice(3) }));
-    return { repository: true, branch: branch || 'detached', changes, diff: diff.slice(0, 1_000_000) };
+    const entries = statusText.split('\0').filter(Boolean);
+    const changes: Array<{ status: string; indexStatus: string; worktreeStatus: string; path: string; originalPath?: string }> = [];
+    for (let index = 0; index < entries.length; index += 1) {
+      const entry = entries[index];
+      const indexStatus = entry[0] ?? ' ';
+      const worktreeStatus = entry[1] ?? ' ';
+      const filePath = entry.slice(3);
+      const renamed = indexStatus === 'R' || indexStatus === 'C' || worktreeStatus === 'R' || worktreeStatus === 'C';
+      const originalPath = renamed ? entries[++index] : undefined;
+      changes.push({ status: `${indexStatus}${worktreeStatus}`, indexStatus, worktreeStatus, path: filePath, ...(originalPath ? { originalPath } : {}) });
+    }
+    const untracked = changes.filter((change) => change.status === '??').map((change) => change.path);
+    return { projectId: request.params.id, repository: true, branch: branch || 'detached', changes, untracked, unstagedDiff: unstagedDiff.slice(0, 1_000_000), stagedDiff: stagedDiff.slice(0, 1_000_000) };
   } catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : 'Git 状态读取失败' }); }
 });
 
@@ -407,6 +512,9 @@ app.post<{ Params: { id: string } }>('/api/projects/:id/git', async (request, re
   ]).safeParse(request.body);
   if (!parsed.success) return reply.code(400).send({ error: 'Git 操作参数无效' });
   try {
+    const project = projects.getProject(request.params.id);
+    if (project.archivedAt) throw new Error('项目已归档，请先恢复后再执行 Git 写操作');
+    if (projects.hasRunningTask(request.params.id)) throw new Error('Codex 正在处理该项目，暂时禁止 Git 写操作');
     if (parsed.data.action === 'pull') return { ok: true, output: await git(request.params.id, ['pull', '--ff-only'], 120_000) };
     if (parsed.data.action === 'push') return { ok: true, output: await git(request.params.id, ['push'], 120_000) };
     if (parsed.data.action === 'commit') {
@@ -414,6 +522,8 @@ app.post<{ Params: { id: string } }>('/api/projects/:id/git', async (request, re
       return { ok: true, output: await git(request.params.id, ['commit', '-m', parsed.data.message], 120_000) };
     }
     if (path.isAbsolute(parsed.data.path) || parsed.data.path.split(/[\\/]/).includes('..')) throw new Error('文件路径无效');
+    const status = (await git(request.params.id, ['status', '--porcelain=v1', '-z', '--', parsed.data.path])).split('\0').find(Boolean);
+    if (!status || status.slice(0, 2) === '??' || status[1] === ' ') throw new Error('该文件没有可撤销的未暂存修改');
     return { ok: true, output: await git(request.params.id, ['restore', '--worktree', '--', parsed.data.path]) };
   } catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : 'Git 操作失败' }); }
 });
@@ -426,8 +536,11 @@ app.post('/api/projects/github', async (request, reply) => {
   try {
     const destination = path.join(projects.projectRoot(project.id), 'repository');
     await execFileAsync('/usr/bin/git', ['clone', '--depth=1', '--', parsed.data.url, destination], { timeout: 180_000, maxBuffer: 2 * 1024 * 1024 });
-    return reply.code(201).send({ project });
-  } catch (error) { return reply.code(400).send({ error: error instanceof Error ? `项目已创建，但 Clone 失败：${error.message}` : 'GitHub 导入失败', project }); }
+    return reply.code(201).send({ project: await projects.setProjectWorkdir(project.id, 'repository') });
+  } catch (error) {
+    await projects.deleteProject(project.id).catch(() => undefined);
+    return reply.code(400).send({ error: error instanceof Error ? `Clone 失败，未保留空项目：${error.message}` : 'GitHub 导入失败' });
+  }
 });
 
 async function listFiles(root: string, prefix: string) {
@@ -467,6 +580,7 @@ app.get<{ Querystring: { projectId?: string } }>('/api/files', async (request, r
 app.post<{ Querystring: { projectId?: string } }>('/api/files/upload', async (request, reply) => {
   if (!requireOwner(request, reply)) return;
   const projectId = request.query.projectId ?? 'default';
+  if (projects.getProject(projectId).archivedAt) return reply.code(409).send({ error: '项目已归档，请先恢复后再上传' });
   const inbox = projects.inbox(projectId);
   const disk = await diskInfo();
   if (disk.tasksPaused) return reply.code(507).send({ error: '磁盘可用空间低于安全线，已暂停上传' });
@@ -511,10 +625,37 @@ function chunkSession(request: FastifyRequest, projectId: string) {
   return { ...parsed.data, originalName, part: path.join(projects.inbox(projectId), `.upload-${parsed.data.uploadId}.part`) };
 }
 
+const UPLOAD_PART_TTL_MS = 24 * 60 * 60 * 1000;
+async function cleanupExpiredUploadParts(): Promise<number> {
+  let removed = 0;
+  const cutoff = Date.now() - UPLOAD_PART_TTL_MS;
+  for (const project of projects.listProjects()) {
+    const entries = await readdir(projects.inbox(project.id), { withFileTypes: true }).catch(() => []);
+    for (const entry of entries) {
+      if (!entry.isFile() || !/^\.upload-[0-9a-f-]{36}\.part$/i.test(entry.name)) continue;
+      const target = path.join(projects.inbox(project.id), entry.name);
+      const details = await stat(target).catch(() => null);
+      if (details && details.mtimeMs < cutoff) { await rm(target, { force: true }); removed += 1; }
+    }
+  }
+  return removed;
+}
+await cleanupExpiredUploadParts();
+
+async function uploadAllowed(reply: FastifyReply): Promise<boolean> {
+  if (!(await diskInfo()).tasksPaused) return true;
+  await reply.code(507).send({ error: '磁盘可用空间低于安全线，已暂停上传' });
+  return false;
+}
+
 app.get<{ Querystring: { projectId?: string } }>('/api/files/upload-session', async (request, reply) => {
   if (!requireOwner(request, reply)) return;
   try {
-    const session = chunkSession(request, request.query.projectId ?? 'default');
+    if (!await uploadAllowed(reply)) return;
+    await cleanupExpiredUploadParts();
+    const projectId = request.query.projectId ?? 'default';
+    if (projects.getProject(projectId).archivedAt) return reply.code(409).send({ error: '项目已归档，请先恢复后再上传' });
+    const session = chunkSession(request, projectId);
     const details = await stat(session.part).catch(() => null);
     return { uploaded: details?.size ?? 0, totalSize: session.totalSize };
   } catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : '上传会话无效' }); }
@@ -523,7 +664,9 @@ app.get<{ Querystring: { projectId?: string } }>('/api/files/upload-session', as
 app.put<{ Querystring: { projectId?: string }; Body: Buffer }>('/api/files/upload-chunk', { bodyLimit: 9 * 1024 * 1024 }, async (request, reply) => {
   if (!requireOwner(request, reply)) return;
   try {
+    if (!await uploadAllowed(reply)) return;
     const projectId = request.query.projectId ?? 'default';
+    if (projects.getProject(projectId).archivedAt) return reply.code(409).send({ error: '项目已归档，请先恢复后再上传' });
     const session = chunkSession(request, projectId);
     const offset = Number(request.headers['x-upload-offset']);
     const body = request.body;
@@ -539,7 +682,9 @@ app.put<{ Querystring: { projectId?: string }; Body: Buffer }>('/api/files/uploa
 app.post<{ Querystring: { projectId?: string } }>('/api/files/upload-complete', async (request, reply) => {
   if (!requireOwner(request, reply)) return;
   try {
+    if (!await uploadAllowed(reply)) return;
     const projectId = request.query.projectId ?? 'default';
+    if (projects.getProject(projectId).archivedAt) return reply.code(409).send({ error: '项目已归档，请先恢复后再完成上传' });
     const session = chunkSession(request, projectId);
     const details = await stat(session.part);
     if (details.size !== session.totalSize) return reply.code(409).send({ error: '文件尚未上传完整', uploaded: details.size });
@@ -548,6 +693,15 @@ app.post<{ Querystring: { projectId?: string } }>('/api/files/upload-complete', 
     await rename(session.part, destination);
     return { file: { name: session.originalName, storedName, path: `inbox/${storedName}`, size: details.size } };
   } catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : '完成上传失败' }); }
+});
+
+app.delete<{ Querystring: { projectId?: string } }>('/api/files/upload-session', async (request, reply) => {
+  if (!requireOwner(request, reply)) return;
+  try {
+    const session = chunkSession(request, request.query.projectId ?? 'default');
+    await rm(session.part, { force: true });
+    return { ok: true };
+  } catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : '上传会话无效' }); }
 });
 
 app.get<{ Querystring: { path?: string; projectId?: string } }>('/api/files/download', async (request, reply) => {
@@ -588,6 +742,7 @@ app.delete<{ Querystring: { path?: string; projectId?: string } }>('/api/files',
   if (!requireOwner(request, reply)) return;
   if (!request.query.path) return reply.code(400).send({ error: '缺少文件路径' });
   try {
+    if (projects.getProject(request.query.projectId ?? 'default').archivedAt) return reply.code(409).send({ error: '项目已归档，请先恢复后再删除文件' });
     const filePath = projects.safeStoredPath(request.query.projectId ?? 'default', request.query.path);
     const details = await stat(filePath);
     if (!details.isFile()) throw new Error('不是文件');
@@ -614,16 +769,21 @@ app.get('/api/ws', { websocket: true }, (socket, request) => {
 
   socket.on('message', async (raw) => {
     let clientRequestId: string | undefined;
+    let operation: 'turn.start' | 'turn.interrupt' | 'thread.subscribe' | 'unknown' = 'unknown';
     try {
       const parsed = clientMessage.safeParse(JSON.parse(raw.toString()));
       if (!parsed.success) throw new Error('消息格式无效');
       const message = parsed.data;
+      operation = message.type;
       clientRequestId = message.type === 'turn.start' ? message.clientRequestId : undefined;
       app.log.info({ event: message.type }, '收到已认证的 WebSocket 操作');
       if (message.type === 'thread.subscribe') {
         projects.assertThreadProject(message.threadId, message.projectId);
-        attachSocketToThread(socket, message.threadId);
+        setSocketThread(socket, message.threadId);
         return;
+      }
+      if (message.type === 'turn.start' && bridgeRecoveryPending) {
+        throw new Error('Codex 服务正在核对中断任务，请稍后重试');
       }
       await bridge.ready();
       app.log.info({ event: message.type }, 'Codex App Server 已就绪');
@@ -636,7 +796,7 @@ app.get('/api/ws', { websocket: true }, (socket, request) => {
       const requestKey = `${message.projectId}:${requestId}`;
       const completedRequest = projects.findTaskByClientRequestId(message.projectId, requestId);
       if (completedRequest) {
-        attachSocketToThread(socket, completedRequest.threadId);
+        setSocketThread(socket, completedRequest.threadId);
         socket.send(JSON.stringify({
           type: 'turn.accepted', clientRequestId: requestId, replayed: true,
           threadId: completedRequest.threadId, payload: { turn: { id: completedRequest.turnId } },
@@ -647,22 +807,28 @@ app.get('/api/ws', { websocket: true }, (socket, request) => {
       if (pendingRequest) {
         const accepted = await pendingRequest;
         if (!accepted) throw new Error('原请求执行失败，请检查任务记录后再试');
-        attachSocketToThread(socket, accepted.threadId);
+        setSocketThread(socket, accepted.threadId);
         socket.send(JSON.stringify({ type: 'turn.accepted', ...accepted, replayed: true }));
         return;
       }
       let settlePending!: (value: TurnAcceptance | undefined) => void;
       pendingTurnRequests.set(requestKey, new Promise<TurnAcceptance | undefined>((resolve) => { settlePending = resolve; }));
+      let projectReserved = false;
       try {
       const disk = await diskInfo();
       if (disk.tasksPaused) throw new Error('磁盘可用空间低于安全线，已暂停新任务');
+      if (startingProjects.has(message.projectId) || projects.hasRunningTask(message.projectId)) throw new Error('当前项目已有任务正在运行，请等待完成后再开始新任务');
+      startingProjects.add(message.projectId);
+      projectReserved = true;
       let threadId = message.threadId;
-      const projectRoot = projects.projectRoot(message.projectId);
+      const projectRoot = projects.projectWorkdir(message.projectId);
       const project = projects.getProject(message.projectId);
+      const developerInstructions = outputInstructions(message.projectId);
+      if (project.archivedAt) throw new Error('项目已归档，请先恢复后再执行任务');
       if (!threadId) {
         const started = await bridge.call('thread/start', {
           cwd: projectRoot, model: project.model, config: project.reasoningEffort ? { model_reasoning_effort: project.reasoningEffort } : undefined,
-          developerInstructions: OUTPUT_INSTRUCTIONS,
+          developerInstructions,
           approvalPolicy: 'never', sandbox: 'danger-full-access', serviceName: 'palm_secretary',
         }) as { thread?: { id?: string } };
         threadId = started.thread?.id;
@@ -670,11 +836,11 @@ app.get('/api/ws', { websocket: true }, (socket, request) => {
       } else {
         projects.assertThreadProject(threadId, message.projectId);
         if (!loadedThreads.has(threadId)) {
-          await bridge.call('thread/resume', { threadId, cwd: projectRoot, developerInstructions: OUTPUT_INSTRUCTIONS, approvalPolicy: 'never', sandbox: 'danger-full-access' });
+          await bridge.call('thread/resume', { threadId, cwd: projectRoot, developerInstructions, approvalPolicy: 'never', sandbox: 'danger-full-access' });
         }
       }
       if (!threadId) throw new Error('无法创建 Codex 对话');
-      attachSocketToThread(socket, threadId);
+      setSocketThread(socket, threadId);
       loadedThreads.add(threadId);
       await projects.rememberThread(threadId, message.projectId, message.text);
       const attachmentPaths = (message.attachments ?? []).map((value) => projects.safeStoredPath(message.projectId, value));
@@ -705,18 +871,16 @@ app.get('/api/ws', { websocket: true }, (socket, request) => {
         settlePending(undefined);
         throw error;
       } finally {
+        if (projectReserved) startingProjects.delete(message.projectId);
         pendingTurnRequests.delete(requestKey);
       }
     } catch (error) {
-      socket.send(JSON.stringify({ type: 'error', clientRequestId, message: error instanceof Error ? error.message : '任务执行失败' }));
+      socket.send(JSON.stringify({ type: 'error', operation, clientRequestId, message: error instanceof Error ? error.message : '任务执行失败' }));
     }
   });
   socket.on('close', () => {
     sockets.delete(socket);
-    for (const [threadId, attached] of threadSockets) {
-      attached.delete(socket);
-      if (attached.size === 0) threadSockets.delete(threadId);
-    }
+    detachSocketFromThread(socket);
   });
 });
 

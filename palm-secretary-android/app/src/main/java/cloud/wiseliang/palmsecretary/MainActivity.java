@@ -118,7 +118,7 @@ public final class MainActivity extends Activity {
         settings.setAllowContentAccess(true);
         settings.setMixedContentMode(WebSettings.MIXED_CONTENT_NEVER_ALLOW);
         settings.setMediaPlaybackRequiresUserGesture(true);
-        settings.setUserAgentString(settings.getUserAgentString() + " PalmSecretaryAndroid/0.3.3");
+        settings.setUserAgentString(settings.getUserAgentString() + " PalmSecretaryAndroid/" + BuildConfig.VERSION_NAME);
         if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
             settings.setSafeBrowsingEnabled(true);
         }
@@ -192,13 +192,17 @@ public final class MainActivity extends Activity {
             public boolean onShowFileChooser(WebView view, ValueCallback<Uri[]> callback, FileChooserParams params) {
                 if (fileCallback != null) fileCallback.onReceiveValue(null);
                 fileCallback = callback;
-                Intent picker = new Intent(Intent.ACTION_OPEN_DOCUMENT);
-                picker.addCategory(Intent.CATEGORY_OPENABLE);
                 String[] accepted = params.getAcceptTypes();
                 ArrayList<String> mimeTypes = new ArrayList<>();
                 if (accepted != null) {
                     for (String type : accepted) if (type != null && type.contains("/")) mimeTypes.add(type);
                 }
+                boolean imagesOnly = !mimeTypes.isEmpty();
+                for (String type : mimeTypes) {
+                    if (!type.startsWith("image/")) imagesOnly = false;
+                }
+                Intent picker = new Intent(imagesOnly ? Intent.ACTION_GET_CONTENT : Intent.ACTION_OPEN_DOCUMENT);
+                picker.addCategory(Intent.CATEGORY_OPENABLE);
                 picker.setType(mimeTypes.size() == 1 ? mimeTypes.get(0) : "*/*");
                 if (mimeTypes.size() > 1) picker.putExtra(Intent.EXTRA_MIME_TYPES, mimeTypes.toArray(new String[0]));
                 picker.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, params.getMode() == FileChooserParams.MODE_OPEN_MULTIPLE);
@@ -254,6 +258,14 @@ public final class MainActivity extends Activity {
             NotificationManager manager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
             manager.notify((int) (System.currentTimeMillis() & 0x7fffffff), notification);
         }
+
+        @JavascriptInterface
+        public void ackTaskTarget() {
+            runOnUiThread(() -> {
+                pendingProjectId = null;
+                pendingThreadId = null;
+            });
+        }
     }
 
     private void receiveTaskTarget(Intent intent) {
@@ -273,9 +285,7 @@ public final class MainActivity extends Activity {
             JSONObject detail = new JSONObject();
             detail.put("projectId", pendingProjectId);
             detail.put("threadId", pendingThreadId);
-            String script = "window.dispatchEvent(new CustomEvent('palm-open-task',{detail:" + detail.toString() + "}));";
-            pendingProjectId = null;
-            pendingThreadId = null;
+            String script = "window.__PALM_OPEN_TASK__=" + detail.toString() + ";window.dispatchEvent(new CustomEvent('palm-open-task',{detail:window.__PALM_OPEN_TASK__}));";
             webView.evaluateJavascript(script, null);
         } catch (Exception ignored) {
             // Keep the app usable even if a malformed notification target is received.
