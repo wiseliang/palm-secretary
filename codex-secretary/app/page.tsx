@@ -184,7 +184,6 @@ type TaskNotice = {
 type OpenMenu =
   | "project-picker"
   | "project-actions"
-  | "usage"
   | "attachments"
   | `task-actions:${string}`;
 type ProjectDialog = {
@@ -1039,6 +1038,7 @@ export default function Home() {
   const threadIdRef = useRef<string>();
   const projectIdRef = useRef(projectId);
   const attachmentsProjectRef = useRef(projectId);
+  const projectDialogBusyRef = useRef(false);
   const projectLoadGenerationRef = useRef(0);
   const threadLoadGenerationRef = useRef(0);
   const showArchivedRef = useRef(showArchived);
@@ -1051,6 +1051,10 @@ export default function Home() {
   const fileRef = useRef<HTMLInputElement>(null);
   const imageFileRef = useRef<HTMLInputElement>(null);
   const composerRef = useRef<HTMLElement>(null);
+  const closeProjectDialog = useCallback(() => {
+    if (projectDialogBusyRef.current) return;
+    setProjectDialog(undefined);
+  }, []);
 
   const activeProject = projects.find((project) => project.id === projectId);
   const projectReadOnly = Boolean(activeProject?.archivedAt);
@@ -1138,7 +1142,7 @@ export default function Home() {
       if (event.key !== "Escape") return;
       closeMenus();
       setRuntimeOpen(false);
-      setProjectDialog(undefined);
+      closeProjectDialog();
     };
     document.addEventListener("pointerdown", closeMenus);
     document.addEventListener("keydown", closeOnEscape);
@@ -1146,7 +1150,7 @@ export default function Home() {
       document.removeEventListener("pointerdown", closeMenus);
       document.removeEventListener("keydown", closeOnEscape);
     };
-  }, []);
+  }, [closeProjectDialog]);
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -2198,8 +2202,10 @@ export default function Home() {
 
   async function submitProjectDialog(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (projectDialogBusyRef.current || projectDialogBusy) return;
     if (!projectDialog || !projectDialog.name.trim()) return;
     if (projectDialog.mode === "github" && !projectDialog.url?.trim()) return;
+    projectDialogBusyRef.current = true;
     setProjectDialogBusy(true);
     try {
       const succeeded =
@@ -2215,6 +2221,7 @@ export default function Home() {
                 );
       if (succeeded) setProjectDialog(undefined);
     } finally {
+      projectDialogBusyRef.current = false;
       setProjectDialogBusy(false);
     }
   }
@@ -3205,17 +3212,6 @@ export default function Home() {
                   <SlidersHorizontal size={17} />
                   运行设置
                 </button>
-                <button
-                  className="mobile-menu-only"
-                  onClick={() => {
-                    setRuntimeOpen(false);
-                    setOpenMenu("usage");
-                    void loadDashboard();
-                  }}
-                >
-                  <Gauge size={17} />
-                  Codex 用量
-                </button>
               </div>}
             </div>
             <button
@@ -3229,63 +3225,6 @@ export default function Home() {
             >
               <SlidersHorizontal size={19} />
             </button>
-            <div className="usage-control" data-popover-root>
-              <button
-                className="usage-pill"
-                aria-label="查看 Codex 余量"
-                aria-expanded={openMenu === "usage"}
-                onClick={() => {
-                  setRuntimeOpen(false);
-                  setOpenMenu((current) =>
-                    current === "usage" ? undefined : "usage",
-                  );
-                  void loadDashboard();
-                }}
-              >
-                {usageWindows.length ? (
-                  usageWindows.slice(0, 2).map((window) => (
-                    <span className="usage-metric" key={window.id}>
-                      <small>{window.label}</small>
-                      <strong>{window.remainingPercent}%</strong>
-                    </span>
-                  ))
-                ) : (
-                  <span className="usage-metric">
-                    <small>余量</small>
-                    <strong>暂无</strong>
-                  </span>
-                )}
-              </button>
-              {openMenu === "usage" && (
-                <div className="usage-popover">
-                  <div className="usage-heading">
-                    <strong>Codex 用量</strong>
-                    <button
-                      onClick={() => void loadDashboard()}
-                      aria-label="刷新用量"
-                    >
-                      <ArrowClockwise size={15} weight="bold" />
-                    </button>
-                  </div>
-                  {usageWindows.length ? (
-                    usageWindows.map((window) => (
-                      <div className="usage-window" key={window.id}>
-                        <div>
-                          <strong>{window.label}</strong>
-                          <span>剩余 {window.remainingPercent}%</span>
-                        </div>
-                        <i>
-                          <b style={{ width: `${window.remainingPercent}%` }} />
-                        </i>
-                        <small>{resetLabel(window.resetAt)}</small>
-                      </div>
-                    ))
-                  ) : (
-                    <p>暂时无法读取用量，请稍后刷新。</p>
-                  )}
-                </div>
-              )}
-            </div>
           </div>
         </header>
         <nav className="mobile-tabs">
@@ -3325,7 +3264,7 @@ export default function Home() {
             className="dialog-backdrop"
             role="presentation"
             onPointerDown={(event) => {
-              if (event.target === event.currentTarget) setProjectDialog(undefined);
+              if (event.target === event.currentTarget) closeProjectDialog();
             }}
           >
             <form
@@ -3351,7 +3290,8 @@ export default function Home() {
                 <button
                   type="button"
                   aria-label="关闭"
-                  onClick={() => setProjectDialog(undefined)}
+                  disabled={projectDialogBusy}
+                  onClick={closeProjectDialog}
                 >
                   <X size={18} weight="bold" />
                 </button>
@@ -3370,6 +3310,7 @@ export default function Home() {
                       )
                     }
                     required
+                    disabled={projectDialogBusy}
                   />
                 </label>
               )}
@@ -3386,14 +3327,19 @@ export default function Home() {
                   }
                   required
                   maxLength={80}
+                  disabled={projectDialogBusy}
                 />
               </label>
               <p>
                 项目拥有独立文件、任务历史和 Codex 上下文，适合长期维护一项工作。
               </p>
               <footer>
-                <button type="button" onClick={() => setProjectDialog(undefined)}>
-                  取消
+                <button
+                  type="button"
+                  disabled={projectDialogBusy}
+                  onClick={closeProjectDialog}
+                >
+                  {projectDialogBusy ? "正在处理，请稍候" : "取消"}
                 </button>
                 <button type="submit" className="primary" disabled={projectDialogBusy}>
                   {projectDialogBusy ? "处理中…" : "确认"}
@@ -3457,6 +3403,43 @@ export default function Home() {
             {status.sudo?.available ? "Root 运维" : "完全访问"}
           </strong>
         </section>
+        {view === "chat" && (
+          <section
+            className="usage-overview"
+            aria-label="Codex 用量"
+            aria-live="polite"
+          >
+            <div className="usage-overview-title">
+              <Gauge size={17} weight="bold" />
+              <span>Codex 用量</span>
+            </div>
+            <div className="usage-overview-windows">
+              {usageWindows.length ? (
+                usageWindows.slice(0, 2).map((window) => (
+                  <div
+                    className="usage-overview-window"
+                    key={window.id}
+                    title={resetLabel(window.resetAt)}
+                  >
+                    <span>{window.label}</span>
+                    <strong>{window.remainingPercent}%</strong>
+                    <small>{resetLabel(window.resetAt)}</small>
+                  </div>
+                ))
+              ) : (
+                <p>暂时无法读取用量</p>
+              )}
+            </div>
+            <button
+              type="button"
+              onClick={() => void loadDashboard()}
+              aria-label="刷新 Codex 用量"
+              title="刷新 Codex 用量"
+            >
+              <ArrowClockwise size={16} weight="bold" />
+            </button>
+          </section>
+        )}
         {(connection !== "已连接" || status.disk?.warning) && (
           <section
             className={`system-alert ${status.disk?.tasksPaused ? "critical" : ""}`}

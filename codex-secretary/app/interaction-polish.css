@@ -1,4 +1,4 @@
-/* v0.13.7 - resilient project switching and compact mobile controls. */
+/* v0.13.8 - resilient dialogs and direct usage visibility. */
 .mobile-identity { display: none; }
 .mobile-menu-only { display: none !important; }
 .topbar .project-add::before { content: none !important; }
@@ -147,6 +147,34 @@
 .project-dialog footer { justify-content: flex-end; }
 .project-dialog footer button { min-width: 88px; min-height: 42px; border: 1px solid var(--line); border-radius: var(--radius-control); background: var(--surface); color: var(--ink); cursor: pointer; }
 .project-dialog footer button.primary { border-color: var(--accent); background: var(--accent); color: #fff; }
+.project-dialog input:disabled,
+.project-dialog button:disabled { cursor: wait; opacity: .52; }
+.project-dialog footer button:first-child:disabled { min-width: 148px; }
+
+.usage-overview {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) 38px;
+  align-items: center;
+  gap: 12px;
+  width: min(calc(100% - 36px), 820px);
+  min-height: 48px;
+  margin: 8px auto 0;
+  padding: 7px 8px 7px 12px;
+  border: 1px solid color-mix(in srgb, var(--accent) 16%, var(--line));
+  border-radius: var(--radius-card);
+  background: color-mix(in srgb, var(--accent-soft) 52%, var(--surface));
+  color: var(--ink);
+}
+.usage-overview-title { display: flex; align-items: center; gap: 7px; color: var(--accent); font-size: 11px; font-weight: 750; white-space: nowrap; }
+.usage-overview-windows { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: center; min-width: 0; }
+.usage-overview-windows > p { grid-column: 1 / -1; margin: 0; color: var(--muted); font-size: 11px; }
+.usage-overview-window { display: grid; grid-template-columns: auto auto; align-items: baseline; justify-content: start; column-gap: 6px; min-width: 0; padding: 1px 12px; }
+.usage-overview-window + .usage-overview-window { border-left: 1px solid var(--line); }
+.usage-overview-window span { color: var(--muted); font-size: 10px; white-space: nowrap; }
+.usage-overview-window strong { color: var(--accent); font-size: 14px; }
+.usage-overview-window small { grid-column: 1 / -1; color: var(--muted); font-size: 9px; white-space: nowrap; }
+.usage-overview > button { display: grid; place-items: center; width: 36px; height: 36px; padding: 0; border: 0; border-radius: var(--radius-control); background: transparent; color: var(--accent); cursor: pointer; }
+.usage-overview > button:hover { background: var(--accent-soft); }
 
 .attachment-sheet {
   position: fixed;
@@ -194,15 +222,7 @@
   .mobile-identity small.online i { background: var(--success); }
   .project-picker-trigger { width: min(128px, 34vw); height: 44px; }
   .project-add { width: 44px; height: 44px; }
-  .runtime-toggle,
-  .usage-pill { display: none; }
-  .usage-control { width: 0; height: 44px; overflow: visible; }
-  .usage-popover {
-    position: fixed;
-    top: calc(68px + env(safe-area-inset-top));
-    right: 12px;
-    width: min(320px, calc(100vw - 24px));
-  }
+  .runtime-toggle { display: none; }
   .header-project-menu > .menu-trigger { width: 44px; height: 44px; }
   .header-project-menu > div { width: min(260px, calc(100vw - 24px)); }
   .header-project-menu > div > .mobile-menu-only { display: flex !important; }
@@ -234,6 +254,11 @@
     border-radius: 22px 22px 0 0;
   }
   .project-dialog footer { position: sticky; bottom: 0; padding-top: 8px; background: var(--surface-strong); }
+  .usage-overview { width: calc(100% - 24px); min-height: 46px; margin-top: 7px; gap: 7px; padding: 6px 6px 6px 10px; }
+  .usage-overview-title { gap: 5px; font-size: 10px; }
+  .usage-overview-window { column-gap: 4px; padding-inline: 7px; }
+  .usage-overview-window strong { font-size: 13px; }
+  .usage-overview-window small { display: none; }
 }
 
 @media (max-width: 520px) {
