@@ -13,6 +13,7 @@ import {
   Archive,
   ArrowClockwise,
   ArrowUp,
+  CaretDown,
   ChatCircleDots,
   ClockCounterClockwise,
   Copy,
@@ -32,6 +33,7 @@ import {
   Stop,
   Trash,
   UploadSimple,
+  X,
 } from "@phosphor-icons/react";
 
 type ExecutionStep = {
@@ -177,6 +179,16 @@ type TaskNotice = {
   projectId: string;
   threadId: string;
   text: string;
+};
+type OpenMenu =
+  | "project-picker"
+  | "project-actions"
+  | "attachments"
+  | `task-actions:${string}`;
+type ProjectDialog = {
+  mode: "create" | "rename" | "duplicate" | "github";
+  name: string;
+  url?: string;
 };
 
 declare global {
@@ -698,7 +710,7 @@ function UploadCard({
       : item.status === "uploading"
         ? `正在上传 · ${item.progress}%`
         : item.status === "success"
-          ? "上传成功，已添加到对话"
+          ? "上传成功，已添加到当前任务"
           : (item.message ?? "上传失败");
   return (
     <article
@@ -981,6 +993,9 @@ export default function Home() {
   const [usageWindows, setUsageWindows] = useState<UsageWindow[]>([]);
   const [usageOpen, setUsageOpen] = useState(false);
   const [runtimeOpen, setRuntimeOpen] = useState(false);
+  const [openMenu, setOpenMenu] = useState<OpenMenu>();
+  const [projectDialog, setProjectDialog] = useState<ProjectDialog>();
+  const [projectDialogBusy, setProjectDialogBusy] = useState(false);
   const [draggingFiles, setDraggingFiles] = useState(false);
   const [threadId, setThreadId] = useState<string>();
   const [turnId, setTurnId] = useState<string>();
@@ -1084,54 +1099,40 @@ export default function Home() {
   useEffect(() => {
     const closeMenus = (event?: Event) => {
       const target = event?.target;
-      document
-        .querySelectorAll<HTMLDetailsElement>(
-          ".header-project-menu[open], .record-actions-menu[open]",
-        )
-        .forEach((menu) => {
-          if (!(target instanceof Node) || !menu.contains(target))
-            menu.open = false;
-        });
       if (
         !(target instanceof Element) ||
-        !target.closest(".usage-control")
-      )
+        !target.closest("[data-popover-root]")
+      ) {
+        setOpenMenu(undefined);
         setUsageOpen(false);
-    };
-    const closeSelectedMenu = (event: MouseEvent) => {
-      const target = event.target;
-      if (!(target instanceof Element)) return;
-      target
-        .closest<HTMLButtonElement>(
-          ".header-project-menu button, .record-actions-menu button",
-        )
-        ?.closest<HTMLDetailsElement>("details")
-        ?.removeAttribute("open");
+      }
     };
     const closeOnEscape = (event: KeyboardEvent) => {
       if (event.key !== "Escape") return;
       closeMenus();
       setRuntimeOpen(false);
+      setProjectDialog(undefined);
     };
     document.addEventListener("pointerdown", closeMenus);
-    document.addEventListener("click", closeSelectedMenu);
     document.addEventListener("keydown", closeOnEscape);
     return () => {
       document.removeEventListener("pointerdown", closeMenus);
-      document.removeEventListener("click", closeSelectedMenu);
       document.removeEventListener("keydown", closeOnEscape);
     };
   }, []);
 
   useEffect(() => {
-    document
-      .querySelectorAll<HTMLDetailsElement>(
-        ".header-project-menu[open], .record-actions-menu[open]",
-      )
-      .forEach((menu) => (menu.open = false));
-    const timer = window.setTimeout(() => setUsageOpen(false), 0);
+    const timer = window.setTimeout(() => {
+      setOpenMenu(undefined);
+      setUsageOpen(false);
+    }, 0);
     return () => window.clearTimeout(timer);
   }, [projectId]);
+  useEffect(() => {
+    if (!notice) return;
+    const timer = window.setTimeout(() => setNotice(""), 4200);
+    return () => window.clearTimeout(timer);
+  }, [notice]);
   useEffect(() => {
     runningRef.current = running;
   }, [running]);
@@ -1505,7 +1506,7 @@ export default function Home() {
       `/api/threads/${encodeURIComponent(target.threadId)}?projectId=${encodeURIComponent(target.projectId)}`,
     ).then(async (response) => {
       if (!response.ok) {
-        setNotice("无法打开目标对话");
+        setNotice("无法打开目标任务");
         setPendingNavigation(undefined);
         return;
       }
@@ -1979,7 +1980,7 @@ export default function Home() {
         `/api/threads/${encodeURIComponent(thread.threadId)}?projectId=${encodeURIComponent(projectId)}`,
       ).then(async (response) => {
         if (!response.ok) {
-          setNotice("无法打开通知对应的对话");
+          setNotice("无法打开通知对应的任务");
           return;
         }
         const restored = messagesFromThread(await response.json());
@@ -2027,11 +2028,11 @@ export default function Home() {
 
   function newConversation() {
     if (projectReadOnly) {
-      setNotice("项目已归档，请先恢复后再新建对话");
+      setNotice("项目已归档，请先恢复后再新建任务");
       return;
     }
     if (projectBusy) {
-      setNotice("请先停止当前任务再新建对话");
+      setNotice("请先停止当前执行再新建任务");
       return;
     }
     setThreadId(undefined);
@@ -2041,9 +2042,7 @@ export default function Home() {
     setView("chat");
   }
 
-  async function createProject() {
-    const name = window.prompt("新项目名称");
-    if (!name?.trim()) return;
+  async function createProject(name: string) {
     const response = await fetch("/api/projects", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -2055,21 +2054,21 @@ export default function Home() {
     };
     if (!response.ok || !body.project) {
       setNotice(body.error ?? "项目创建失败");
-      return;
+      return false;
     }
     await loadProjects();
     setProjectId(body.project.id);
     setView("chat");
+    return true;
   }
 
-  async function renameProject() {
-    if (!activeProject) return;
+  async function renameProject(name: string) {
+    if (!activeProject) return false;
     if (projectReadOnly) {
       setNotice("项目已归档，请先恢复后再重命名");
-      return;
+      return false;
     }
-    const name = window.prompt("修改项目名称", activeProject.name);
-    if (!name?.trim() || name.trim() === activeProject.name) return;
+    if (!name.trim() || name.trim() === activeProject.name) return true;
     const response = await fetch(
       `/api/projects/${encodeURIComponent(activeProject.id)}`,
       {
@@ -2084,27 +2083,16 @@ export default function Home() {
     };
     if (!response.ok || !body.project) {
       setNotice(body.error ?? "项目重命名失败");
-      return;
+      return false;
     }
     setProjects((items) =>
       items.map((item) => (item.id === body.project?.id ? body.project : item)),
     );
     setNotice("项目名称已更新");
+    return true;
   }
 
-  async function importGitHubProject() {
-    const url = window.prompt(
-      "GitHub HTTPS 仓库地址（公开仓库或服务器已配置凭据的私有仓库）",
-    );
-    if (!url?.trim()) return;
-    const fallback =
-      url
-        .trim()
-        .split("/")
-        .pop()
-        ?.replace(/\.git$/i, "") || "GitHub 项目";
-    const name = window.prompt("项目名称", fallback);
-    if (!name?.trim()) return;
+  async function importGitHubProject(url: string, name: string) {
     setNotice("正在从 GitHub 导入项目…");
     const response = await fetch("/api/projects/github", {
       method: "POST",
@@ -2117,25 +2105,24 @@ export default function Home() {
     };
     if (!response.ok || !body.project) {
       setNotice(body.error ?? "GitHub 导入失败");
-      return;
+      return false;
     }
     await loadProjects();
     setProjectId(body.project.id);
     setNotice(body.error ?? "GitHub 项目已导入");
+    return true;
   }
 
-  async function duplicateProject() {
+  async function duplicateProject(name: string) {
     if (projectReadOnly) {
       setNotice("项目已归档，请先恢复后再复制");
-      return;
+      return false;
     }
     if (projectBusy) {
       setNotice("Codex 正在处理任务，暂时不能复制项目");
-      return;
+      return false;
     }
-    if (!activeProject) return;
-    const name = window.prompt("项目副本名称", `${activeProject.name} 副本`);
-    if (!name?.trim()) return;
+    if (!activeProject) return false;
     const response = await fetch(
       `/api/projects/${encodeURIComponent(projectId)}/duplicate`,
       {
@@ -2150,11 +2137,46 @@ export default function Home() {
     };
     if (!response.ok || !body.project) {
       setNotice(body.error ?? "项目复制失败");
-      return;
+      return false;
     }
     await loadProjects();
     setProjectId(body.project.id);
     setNotice("项目已复制，Git 历史未复制");
+    return true;
+  }
+
+  function openProjectDialog(mode: ProjectDialog["mode"]) {
+    setOpenMenu(undefined);
+    if (mode === "rename")
+      setProjectDialog({ mode, name: activeProject?.name ?? "" });
+    else if (mode === "duplicate")
+      setProjectDialog({ mode, name: `${activeProject?.name ?? "项目"} 副本` });
+    else if (mode === "github")
+      setProjectDialog({ mode, name: "", url: "" });
+    else setProjectDialog({ mode, name: "" });
+  }
+
+  async function submitProjectDialog(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!projectDialog || !projectDialog.name.trim()) return;
+    if (projectDialog.mode === "github" && !projectDialog.url?.trim()) return;
+    setProjectDialogBusy(true);
+    try {
+      const succeeded =
+        projectDialog.mode === "create"
+          ? await createProject(projectDialog.name)
+          : projectDialog.mode === "rename"
+            ? await renameProject(projectDialog.name)
+            : projectDialog.mode === "duplicate"
+              ? await duplicateProject(projectDialog.name)
+              : await importGitHubProject(
+                  projectDialog.url ?? "",
+                  projectDialog.name,
+                );
+      if (succeeded) setProjectDialog(undefined);
+    } finally {
+      setProjectDialogBusy(false);
+    }
   }
 
   async function toggleProjectArchive() {
@@ -2275,7 +2297,7 @@ export default function Home() {
     update: { title?: string; archived?: boolean; favorite?: boolean },
   ) {
     if (projectReadOnly) {
-      setNotice("项目已归档，请先恢复后再修改对话");
+      setNotice("项目已归档，请先恢复后再修改任务");
       return;
     }
     if (
@@ -2284,7 +2306,7 @@ export default function Home() {
         (task) => task.threadId === item.threadId && task.status === "running",
       )
     ) {
-      setNotice("当前对话仍有任务运行，请先停止任务");
+      setNotice("当前任务仍在执行，请先停止执行");
       return;
     }
     const response = await fetch(
@@ -2300,28 +2322,28 @@ export default function Home() {
       error?: string;
     };
     if (!response.ok) {
-      setNotice(body.error ?? "对话更新失败");
+      setNotice(body.error ?? "任务更新失败");
       return;
     }
     await loadProjectData(projectId);
     setNotice(
       update.archived === true
-        ? "对话已归档"
+        ? "任务已归档"
         : update.archived === false
-          ? "对话已恢复"
-          : "对话名称已更新",
+          ? "任务已恢复"
+          : "任务名称已更新",
     );
   }
 
   async function renameThread(item: ProjectThread) {
-    const title = window.prompt("修改对话名称", item.title);
+    const title = window.prompt("修改任务名称", item.title);
     if (!title?.trim() || title.trim() === item.title) return;
     await updateThread(item, { title: title.trim() });
   }
 
   async function deleteThread(item: ProjectThread) {
     if (projectReadOnly) {
-      setNotice("项目已归档，请先恢复后再删除对话");
+      setNotice("项目已归档，请先恢复后再删除任务");
       return;
     }
     if (
@@ -2329,7 +2351,7 @@ export default function Home() {
         (task) => task.threadId === item.threadId && task.status === "running",
       )
     ) {
-      setNotice("当前对话仍有任务运行，请先停止任务");
+      setNotice("当前任务仍在执行，请先停止执行");
       return;
     }
     if (
@@ -2346,12 +2368,12 @@ export default function Home() {
       const body = (await response.json().catch(() => ({}))) as {
         error?: string;
       };
-      setNotice(body.error ?? "对话删除失败");
+      setNotice(body.error ?? "任务删除失败");
       return;
     }
     if (threadId === item.threadId) newConversation();
     await loadProjectData(projectId);
-    setNotice("对话记录已删除");
+    setNotice("任务记录已删除");
   }
 
   async function saveModel(modelName: string, reasoningEffort?: string) {
@@ -2410,7 +2432,7 @@ export default function Home() {
       `/api/threads/${encodeURIComponent(targetThreadId)}?projectId=${encodeURIComponent(targetProjectId)}`,
     );
     if (!response.ok) {
-      setNotice("读取对话失败");
+      setNotice("读取任务失败");
       return;
     }
     const restored = messagesFromThread(await response.json());
@@ -2433,7 +2455,7 @@ export default function Home() {
     setFocusedMessageId(focused?.id);
     setView("chat");
     if (!restored.length)
-      setNotice("已恢复对话上下文；旧消息格式暂无法完整展示");
+      setNotice("已恢复任务上下文；旧消息格式暂无法完整展示");
   }
 
   async function openThread(item: ProjectThread, focusHint = item.title) {
@@ -2555,7 +2577,7 @@ export default function Home() {
     }
     const thread = threads.find((item) => item.threadId === task.threadId);
     if (!thread) {
-      setNotice("原对话不存在，无法重试");
+      setNotice("原任务不存在，无法重试");
       return;
     }
     await openThread(thread);
@@ -2677,7 +2699,7 @@ export default function Home() {
                 ),
               4500,
             );
-            setNotice("附件已添加到当前对话");
+            setNotice("附件已添加到当前任务");
             return true;
           }
           const retryable =
@@ -2737,7 +2759,7 @@ export default function Home() {
       }
       setNotice(
         completed === selected.length
-          ? `已上传 ${completed} 个文件并添加到当前对话`
+          ? `已上传 ${completed} 个文件并添加到当前任务`
           : `已上传 ${completed}/${selected.length} 个文件；失败项可单独重试`,
       );
     },
@@ -2917,7 +2939,7 @@ export default function Home() {
         <a
           className="thread-export-floating"
           href={`/api/threads/${encodeURIComponent(threadId)}/export?projectId=${encodeURIComponent(projectId)}`}
-          aria-label="导出当前对话"
+          aria-label="导出当前任务"
         >
           <Export size={16} weight="bold" />
           <span>导出</span>
@@ -2931,14 +2953,14 @@ export default function Home() {
         <nav>
           <button
             className={`rail-button ${view === "chat" ? "active" : ""}`}
-            aria-label="对话"
+            aria-label="任务"
             onClick={() => setView("chat")}
           >
             <ChatCircleDots
               size={21}
               weight={view === "chat" ? "fill" : "regular"}
             />
-            <span>对话</span>
+            <span>任务</span>
           </button>
           <button
             className={`rail-button ${view === "history" ? "active" : ""}`}
@@ -2949,7 +2971,7 @@ export default function Home() {
               size={21}
               weight={view === "history" ? "fill" : "regular"}
             />
-            <span>记录</span>
+            <span>历史</span>
           </button>
           <button
             className={`rail-button ${view === "files" ? "active" : ""}`}
@@ -2993,13 +3015,18 @@ export default function Home() {
                 <UploadSimple size={28} weight="bold" />
               </span>
               <strong>拖到这里上传</strong>
-              <small>文件会加入当前项目和本轮对话</small>
+              <small>文件会加入当前项目和本次任务</small>
             </div>
           </div>
         )}
         <header className="topbar">
           <div className="identity">
-            <span className="mobile-brand">掌</span>
+            <span className="mobile-identity" aria-label={`Codex ${connection}`}>
+              <b>掌</b>
+              <small className={connection === "已连接" ? "online" : "offline"}>
+                <i /> {connection === "已连接" ? "在线" : connection}
+              </small>
+            </span>
             <div>
               <h1>掌心助理</h1>
               <p>
@@ -3013,68 +3040,109 @@ export default function Home() {
             </div>
           </div>
           <div className="header-actions">
-            <select
-              aria-label="当前项目"
-              value={projectId}
-              onChange={(event) => setProjectId(event.target.value)}
-              disabled={uploading}
-            >
-              {projects.map((project) => (
-                <option key={project.id} value={project.id}>
-                  {project.name}
-                  {project.archivedAt ? "（已归档）" : ""}
-                </option>
-              ))}
-            </select>
+            <div className="project-picker" data-popover-root>
+              <button
+                type="button"
+                className="project-picker-trigger"
+                aria-label="选择项目"
+                aria-haspopup="listbox"
+                aria-expanded={openMenu === "project-picker"}
+                disabled={uploading}
+                onClick={() =>
+                  setOpenMenu((current) =>
+                    current === "project-picker" ? undefined : "project-picker",
+                  )
+                }
+              >
+                <span>{activeProject?.name ?? "选择项目"}</span>
+                <CaretDown size={14} weight="bold" />
+              </button>
+              {openMenu === "project-picker" && (
+                <div className="project-picker-menu" role="listbox">
+                  {projects.map((project) => (
+                    <button
+                      type="button"
+                      role="option"
+                      aria-selected={project.id === projectId}
+                      key={project.id}
+                      onClick={() => {
+                        setProjectId(project.id);
+                        setOpenMenu(undefined);
+                      }}
+                    >
+                      <span>{project.name}</span>
+                      {project.archivedAt && <small>已归档</small>}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
             <button
               className="project-add"
               onClick={newConversation}
-              aria-label="新对话"
+              aria-label="新任务"
               disabled={uploading || projectBusy || projectReadOnly}
             >
               <Plus size={16} weight="bold" />
-              <span>新对话</span>
+              <span>新任务</span>
             </button>
-            <details className="project-menu header-project-menu">
-              <summary aria-label="项目操作">
+            <div className="project-menu header-project-menu" data-popover-root>
+              <button
+                type="button"
+                className="menu-trigger"
+                aria-label="项目操作"
+                aria-haspopup="menu"
+                aria-expanded={openMenu === "project-actions"}
+                onClick={() =>
+                  setOpenMenu((current) =>
+                    current === "project-actions" ? undefined : "project-actions",
+                  )
+                }
+              >
                 <DotsThree size={22} weight="bold" />
-              </summary>
-              <div>
-                <button onClick={() => void createProject()}>
+              </button>
+              {openMenu === "project-actions" && <div role="menu">
+                <button onClick={() => openProjectDialog("create")}>
                   <Plus size={17} weight="bold" />
                   新建项目
                 </button>
-                <button onClick={() => void importGitHubProject()}>
+                <button onClick={() => openProjectDialog("github")}>
                   <GithubLogo size={17} />
                   GitHub 导入
                 </button>
-                <button onClick={() => void openGitReview()}>
+                <button onClick={() => {
+                  setOpenMenu(undefined);
+                  void openGitReview();
+                }}>
                   <GitDiff size={17} />
                   代码变更
                 </button>
                 <button
                   disabled={projectBusy || projectReadOnly}
-                  onClick={() => void duplicateProject()}
+                  onClick={() => openProjectDialog("duplicate")}
                 >
                   <Copy size={17} />
                   复制项目
                 </button>
                 <button
                   disabled={projectBusy && !activeProject?.archivedAt}
-                  onClick={() => void toggleProjectArchive()}
+                  onClick={() => {
+                    setOpenMenu(undefined);
+                    void toggleProjectArchive();
+                  }}
                 >
                   <Archive size={17} />
                   {activeProject?.archivedAt ? "恢复项目" : "归档项目"}
                 </button>
                 <button
                   disabled={projectReadOnly}
-                  onClick={() => void renameProject()}
+                  onClick={() => openProjectDialog("rename")}
                 >
                   <PencilSimple size={17} />
                   重命名
                 </button>
-              </div>
-            </details>
+              </div>}
+            </div>
             <button
               className={`runtime-toggle ${runtimeOpen ? "active" : ""}`}
               aria-label="运行设置"
@@ -3083,12 +3151,13 @@ export default function Home() {
             >
               <SlidersHorizontal size={19} />
             </button>
-            <div className="usage-control">
+            <div className="usage-control" data-popover-root>
               <button
                 className="usage-pill"
                 aria-label="查看 Codex 余量"
                 aria-expanded={usageOpen}
                 onClick={() => {
+                  setOpenMenu(undefined);
                   setUsageOpen((open) => !open);
                   void loadDashboard();
                 }}
@@ -3148,7 +3217,7 @@ export default function Home() {
               size={18}
               weight={view === "chat" ? "fill" : "regular"}
             />
-            <span>对话</span>
+            <span>任务</span>
           </button>
           <button
             className={view === "history" ? "active" : ""}
@@ -3158,7 +3227,7 @@ export default function Home() {
               size={18}
               weight={view === "history" ? "fill" : "regular"}
             />
-            <span>记录</span>
+            <span>历史</span>
           </button>
           <button
             className={view === "files" ? "active" : ""}
@@ -3171,6 +3240,88 @@ export default function Home() {
             <span>文件</span>
           </button>
         </nav>
+        {projectDialog && (
+          <div
+            className="dialog-backdrop"
+            role="presentation"
+            onPointerDown={(event) => {
+              if (event.target === event.currentTarget) setProjectDialog(undefined);
+            }}
+          >
+            <form
+              className="project-dialog"
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="project-dialog-title"
+              onSubmit={submitProjectDialog}
+            >
+              <header>
+                <div>
+                  <small>项目工作区</small>
+                  <h2 id="project-dialog-title">
+                    {projectDialog.mode === "create"
+                      ? "新建项目"
+                      : projectDialog.mode === "rename"
+                        ? "重命名项目"
+                        : projectDialog.mode === "duplicate"
+                          ? "复制项目"
+                          : "从 GitHub 导入"}
+                  </h2>
+                </div>
+                <button
+                  type="button"
+                  aria-label="关闭"
+                  onClick={() => setProjectDialog(undefined)}
+                >
+                  <X size={18} weight="bold" />
+                </button>
+              </header>
+              {projectDialog.mode === "github" && (
+                <label>
+                  <span>仓库地址</span>
+                  <input
+                    autoFocus
+                    type="url"
+                    value={projectDialog.url ?? ""}
+                    placeholder="https://github.com/owner/repository.git"
+                    onChange={(event) =>
+                      setProjectDialog((current) =>
+                        current ? { ...current, url: event.target.value } : current,
+                      )
+                    }
+                    required
+                  />
+                </label>
+              )}
+              <label>
+                <span>项目名称</span>
+                <input
+                  autoFocus={projectDialog.mode !== "github"}
+                  value={projectDialog.name}
+                  placeholder="例如：掌心助理"
+                  onChange={(event) =>
+                    setProjectDialog((current) =>
+                      current ? { ...current, name: event.target.value } : current,
+                    )
+                  }
+                  required
+                  maxLength={80}
+                />
+              </label>
+              <p>
+                项目拥有独立文件、任务历史和 Codex 上下文，适合长期维护一项工作。
+              </p>
+              <footer>
+                <button type="button" onClick={() => setProjectDialog(undefined)}>
+                  取消
+                </button>
+                <button type="submit" className="primary" disabled={projectDialogBusy}>
+                  {projectDialogBusy ? "处理中…" : "确认"}
+                </button>
+              </footer>
+            </form>
+          </div>
+        )}
         <section
           className={`model-bar ${runtimeOpen ? "open" : ""}`}
           aria-label="Codex 模型设置"
@@ -3245,13 +3396,6 @@ export default function Home() {
             </span>
           </section>
         )}
-        {activeProject?.archivedAt && (
-          <section className="readonly-banner" role="status">
-            <Archive size={15} weight="bold" />
-            <span>项目已归档，目前为只读模式</span>
-            <button onClick={() => void toggleProjectArchive()}>恢复项目</button>
-          </section>
-        )}
         {notice && (
           <div className="global-notice" role="status" aria-live="polite">
             <span>{notice}</span>
@@ -3266,6 +3410,9 @@ export default function Home() {
               <div>
                 <p className="eyebrow">任务中心</p>
                 <h2>{activeProject?.name ?? "当前项目"}</h2>
+                <p className="task-definition">
+                  任务会保留上下文；每次发送给 Codex 会产生一条执行记录。
+                </p>
                 {activeProject?.archivedAt && (
                   <span className="archived-badge">已归档 · 只读</span>
                 )}
@@ -3276,7 +3423,7 @@ export default function Home() {
                   onClick={newConversation}
                 >
                   <Plus size={17} weight="bold" />
-                  新对话
+                  新任务
                 </button>
               </div>
             </div>
@@ -3387,7 +3534,7 @@ export default function Home() {
               <input
                 value={recordSearch}
                 onChange={(event) => setRecordSearch(event.target.value)}
-                placeholder="搜索对话、助手回复、任务和文本附件"
+                placeholder="搜索任务、助手回复、执行记录和文本附件"
                 aria-label="全文搜索"
               />
               <button
@@ -3420,9 +3567,9 @@ export default function Home() {
                       >
                         <span>
                           {result.kind === "thread"
-                            ? "对话"
+                            ? "任务"
                             : result.kind === "task"
-                              ? "任务"
+                              ? "执行"
                               : "文件"}
                         </span>
                         <strong>{result.title}</strong>
@@ -3444,8 +3591,8 @@ export default function Home() {
             {!showArchived && matchingTasks.length > 0 && (
               <section className="task-section">
                 <div className="section-heading">
-                  <strong>最近任务</strong>
-                  <span>点击后定位到对应消息</span>
+                  <strong>最近执行</strong>
+                  <span>每次发送给 Codex 的执行记录</span>
                 </div>
                 <div className="task-list">
                   {matchingTasks.map((task) => (
@@ -3517,7 +3664,7 @@ export default function Home() {
             )}
             <section className="thread-section">
               <div className="section-heading">
-                <strong>{showArchived ? "已归档对话" : "对话记录"}</strong>
+                <strong>{showArchived ? "已归档任务" : "任务记录"}</strong>
                 <span>
                   {recordSearch.trim()
                     ? `${matchingThreads.length} 条匹配`
@@ -3539,18 +3686,32 @@ export default function Home() {
                           {new Date(thread.updatedAt).toLocaleString("zh-CN")}
                         </span>
                       </button>
-                      <details className="record-actions-menu">
-                        <summary aria-label={`管理对话 ${thread.title}`}>
+                      <div className="record-actions-menu" data-popover-root>
+                        <button
+                          type="button"
+                          className="menu-trigger"
+                          aria-label={`管理任务 ${thread.title}`}
+                          aria-haspopup="menu"
+                          aria-expanded={openMenu === `task-actions:${thread.threadId}`}
+                          onClick={() =>
+                            setOpenMenu((current) =>
+                              current === `task-actions:${thread.threadId}`
+                                ? undefined
+                                : `task-actions:${thread.threadId}`,
+                            )
+                          }
+                        >
                           <DotsThree size={20} weight="bold" />
-                        </summary>
-                        <div>
+                        </button>
+                        {openMenu === `task-actions:${thread.threadId}` && <div role="menu">
                           <button
                             disabled={projectReadOnly}
-                            onClick={() =>
+                            onClick={() => {
+                              setOpenMenu(undefined);
                               void updateThread(thread, {
                                 favorite: !thread.favorite,
-                              })
-                            }
+                              });
+                            }}
                           >
                             <Star
                               size={16}
@@ -3560,18 +3721,22 @@ export default function Home() {
                           </button>
                           <button
                             disabled={projectReadOnly}
-                            onClick={() => void renameThread(thread)}
+                            onClick={() => {
+                              setOpenMenu(undefined);
+                              void renameThread(thread);
+                            }}
                           >
                             <PencilSimple size={16} />
                             重命名
                           </button>
                           <button
                             disabled={projectReadOnly}
-                            onClick={() =>
+                            onClick={() => {
+                              setOpenMenu(undefined);
                               void updateThread(thread, {
                                 archived: !showArchived,
-                              })
-                            }
+                              });
+                            }}
                           >
                             <Archive size={16} />
                             {showArchived ? "恢复" : "归档"}
@@ -3579,19 +3744,22 @@ export default function Home() {
                           <button
                             className="danger"
                             disabled={projectReadOnly}
-                            onClick={() => void deleteThread(thread)}
+                            onClick={() => {
+                              setOpenMenu(undefined);
+                              void deleteThread(thread);
+                            }}
                           >
                             <Trash size={16} />
                             删除
                           </button>
-                        </div>
-                      </details>
+                        </div>}
+                      </div>
                     </article>
                   ))}
                 </div>
               ) : (
                 <div className="empty-panel">
-                  {showArchived ? "还没有归档的对话。" : "没有匹配的对话。"}
+                  {showArchived ? "还没有归档的任务。" : "没有匹配的任务。"}
                 </div>
               )}
             </section>
@@ -3727,7 +3895,7 @@ export default function Home() {
                     <h2>今天想先处理什么？</h2>
                     <p className="lede">
                       上传的文件会真实保存到当前项目，并把服务器路径交给 Codex
-                      读取。不同项目拥有独立目录和对话记录。
+                      读取。不同项目拥有独立目录和任务记录。
                     </p>
                     <div className="starter-grid">
                       {starterTasks.map((task) => (
@@ -3949,6 +4117,58 @@ export default function Home() {
               ))}
             </div>
           )}
+          {openMenu === "attachments" && (
+            <>
+              <button
+                type="button"
+                className="attachment-sheet-backdrop"
+                aria-label="关闭附件菜单"
+                onClick={() => setOpenMenu(undefined)}
+              />
+              <section
+                className="attachment-sheet"
+                data-popover-root
+                role="dialog"
+                aria-modal="true"
+                aria-label="添加附件"
+              >
+                <i className="sheet-handle" />
+                <header>
+                  <div>
+                    <strong>添加到当前任务</strong>
+                    <small>上传后会显示在本次任务消息中</small>
+                  </div>
+                  <button
+                    type="button"
+                    aria-label="关闭"
+                    onClick={() => setOpenMenu(undefined)}
+                  >
+                    <X size={18} weight="bold" />
+                  </button>
+                </header>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setOpenMenu(undefined);
+                    fileRef.current?.click();
+                  }}
+                >
+                  <span><Paperclip size={20} weight="bold" /></span>
+                  <div><strong>上传文件</strong><small>文档、压缩包和其他文件</small></div>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setOpenMenu(undefined);
+                    imageFileRef.current?.click();
+                  }}
+                >
+                  <span><ImageSquare size={20} weight="bold" /></span>
+                  <div><strong>照片和图片</strong><small>从系统图库选择原图</small></div>
+                </button>
+              </section>
+            </>
+          )}
           <form className="composer" onSubmit={sendTask}>
             <input
               ref={fileRef}
@@ -3977,21 +4197,17 @@ export default function Home() {
               <button
                 type="button"
                 className="round-button"
-                aria-label="添加文件"
-                title="选择文件或直接拖入"
-                onClick={() => fileRef.current?.click()}
+                aria-label="添加附件"
+                title="添加文件或照片"
+                aria-expanded={openMenu === "attachments"}
+                onClick={() =>
+                  setOpenMenu((current) =>
+                    current === "attachments" ? undefined : "attachments",
+                  )
+                }
                 disabled={uploading || Boolean(activeProject?.archivedAt)}
               >
                 <Paperclip size={19} weight="bold" />
-              </button>
-              <button
-                type="button"
-                className="round-button camera-button"
-                aria-label="选择图片"
-                onClick={() => imageFileRef.current?.click()}
-                disabled={uploading || projectReadOnly}
-              >
-                <ImageSquare size={19} />
               </button>
             </div>
             <textarea
@@ -4008,10 +4224,10 @@ export default function Home() {
                   ? "项目已归档，仅可查看"
                   : projectRunningTask &&
                       projectRunningTask.threadId !== threadId
-                    ? "本项目另一对话的任务执行中…"
+                    ? "本项目另一任务正在执行…"
                     : running
                       ? "任务执行中…"
-                      : "交代一个任务……"
+                      : "告诉 Codex 要完成什么…"
               }
               disabled={Boolean(activeProject?.archivedAt)}
               rows={1}

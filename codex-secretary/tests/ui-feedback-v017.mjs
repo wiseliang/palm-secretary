@@ -21,7 +21,7 @@ assert.match(
   /async function openGitReview\(\)\s*\{\s*setView\("history"\);\s*setGitOpen\(true\);\s*await loadGitStatus\(false\);/s,
   "代码变更入口应导航到记录页并打开审核面板",
 );
-assert.match(page, /onClick=\{\(\) => void openGitReview\(\)\}/);
+assert.match(page, /setOpenMenu\(undefined\);\s*void openGitReview\(\);/);
 
 assert.match(
   page,
@@ -45,7 +45,7 @@ for (const operation of [
     `${operation} 必须在函数层阻止归档项目写操作`,
   );
 }
-assert.match(page, /className="readonly-banner"/);
+assert.doesNotMatch(page, /className="readonly-banner"/);
 
 const previewAnchor = page.match(
   /<a\s+href=\{`\/api\/files\/preview\?\$\{query\}`\}[\s\S]*?>/,
@@ -54,7 +54,7 @@ assert.ok(previewAnchor, "应存在文件预览入口");
 assert.ok(!previewAnchor.includes("target="), "内部预览不得依赖 WebView 新窗口");
 
 assert.match(page, /ref=\{imageFileRef\}[\s\S]*?accept="image\/\*"/);
-assert.match(page, /onClick=\{\(\) => imageFileRef\.current\?\.click\(\)\}/);
+assert.match(page, /imageFileRef\.current\?\.click\(\)/);
 
 assert.match(
   page,
@@ -71,7 +71,7 @@ const addButton = page.match(
   /<button\s+className="project-add"[\s\S]*?<\/button>/,
 )?.[0];
 assert.ok(addButton?.includes("onClick={newConversation}"));
-assert.ok(addButton?.includes("新对话"));
-assert.match(page, /onClick=\{\(\) => void createProject\(\)\}[\s\S]*?新建项目/);
+assert.ok(addButton?.includes("新任务"));
+assert.match(page, /openProjectDialog\("create"\)[\s\S]*?新建项目/);
 
 console.log("PALM_V017_UI_FEEDBACK_OK");

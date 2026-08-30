@@ -164,10 +164,11 @@ const androidGradle = await readFile(
 assert.match(androidGradle, /buildConfig\s+true/);
 const projectSelector =
   page.match(
-    /<select[\s\S]{0,500}aria-label="当前项目"[\s\S]{0,500}<\/select>/,
+    /<div className="project-picker"[\s\S]{0,1800}role="listbox"[\s\S]{0,1800}<\/div>/,
   )?.[0] ?? "";
 assert.ok(projectSelector);
-assert.doesNotMatch(projectSelector, /activeProject\?\.archivedAt/);
+assert.match(projectSelector, /project\.archivedAt/);
+assert.doesNotMatch(projectSelector, /disabled=\{Boolean\(project\.archivedAt\)\}/);
 assert.match(bridge, /version: packageVersion/);
 
 console.log("PALM_V015_SAFETY_REGRESSIONS_OK");

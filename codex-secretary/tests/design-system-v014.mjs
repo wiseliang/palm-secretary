@@ -14,7 +14,7 @@ const pkg = JSON.parse(
 );
 
 assert.ok(pkg.dependencies["@phosphor-icons/react"]);
-assert.match(page, /aria-label="对话"[\s\S]{0,120}setView\("chat"\)/);
+assert.match(page, /aria-label="任务"[\s\S]{0,120}setView\("chat"\)/);
 assert.match(page, /header-project-menu/);
 assert.match(page, /runtime-toggle/);
 assert.match(page, /new ResizeObserver\(update\)/);

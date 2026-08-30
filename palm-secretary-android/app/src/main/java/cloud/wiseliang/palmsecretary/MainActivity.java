@@ -192,13 +192,17 @@ public final class MainActivity extends Activity {
             public boolean onShowFileChooser(WebView view, ValueCallback<Uri[]> callback, FileChooserParams params) {
                 if (fileCallback != null) fileCallback.onReceiveValue(null);
                 fileCallback = callback;
-                Intent picker = new Intent(Intent.ACTION_OPEN_DOCUMENT);
-                picker.addCategory(Intent.CATEGORY_OPENABLE);
                 String[] accepted = params.getAcceptTypes();
                 ArrayList<String> mimeTypes = new ArrayList<>();
                 if (accepted != null) {
                     for (String type : accepted) if (type != null && type.contains("/")) mimeTypes.add(type);
                 }
+                boolean imagesOnly = !mimeTypes.isEmpty();
+                for (String type : mimeTypes) {
+                    if (!type.startsWith("image/")) imagesOnly = false;
+                }
+                Intent picker = new Intent(imagesOnly ? Intent.ACTION_GET_CONTENT : Intent.ACTION_OPEN_DOCUMENT);
+                picker.addCategory(Intent.CATEGORY_OPENABLE);
                 picker.setType(mimeTypes.size() == 1 ? mimeTypes.get(0) : "*/*");
                 if (mimeTypes.size() > 1) picker.putExtra(Intent.EXTRA_MIME_TYPES, mimeTypes.toArray(new String[0]));
                 picker.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, params.getMode() == FileChooserParams.MODE_OPEN_MULTIPLE);
