@@ -10,7 +10,7 @@ on:
       - ".github/workflows/android-apk.yml"
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
@@ -40,3 +40,11 @@ jobs:
           path: palm-secretary-android/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
           retention-days: 30
+      - name: Publish downloadable prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp app/build/outputs/apk/debug/app-debug.apk "掌心助理-v0.13.2-安卓内测版.apk"
+          gh release view android-v0.13.2 >/dev/null 2>&1 || \
+            gh release create android-v0.13.2 --target "$GITHUB_SHA" --prerelease --title "掌心助理 v0.13.2 Android 内测版" --notes "自动构建并通过 APK 签名校验的 Android 内测安装包。"
+          gh release upload android-v0.13.2 "掌心助理-v0.13.2-安卓内测版.apk" --clobber
