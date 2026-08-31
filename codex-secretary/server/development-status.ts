@@ -1,12 +1,17 @@
 import { createHash } from 'node:crypto';
 import { execFile } from 'node:child_process';
-import { readFile, stat } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
 const MAX_GIT_OUTPUT = 4 * 1024 * 1024;
 const MAX_UNTRACKED_HASH_BYTES = 5 * 1024 * 1024;
+const MAX_BASELINE_FILE_BYTES = 2 * 1024 * 1024;
+const MAX_BASELINE_TOTAL_BYTES = 6 * 1024 * 1024;
+
+type BaselineFile = { exists: boolean; contentBase64?: string };
 
 export type GitChange = {
   status: string;
@@ -29,6 +34,8 @@ export type GitSnapshot = {
   fingerprint?: string;
   unstagedDiff?: string;
   stagedDiff?: string;
+  baselineFiles?: Record<string, BaselineFile>;
+  baselineIncomplete?: boolean;
 };
 
 export type VerificationCommand = {
@@ -48,6 +55,7 @@ export type DevelopmentResult = {
     changedFiles?: number;
     additions?: number;
     deletions?: number;
+    deltaComplete?: boolean;
     commit?: { sha: string; message: string };
   };
   verification: {
@@ -131,12 +139,40 @@ async function untrackedFileFacts(cwd: string, changes: GitChange[]): Promise<Ar
   return facts;
 }
 
-export async function readGitSnapshot(cwd: string, includeDiffs = false): Promise<GitSnapshot> {
+function safeGitPath(cwd: string, relativePath: string): string | undefined {
+  if (!relativePath || path.isAbsolute(relativePath) || relativePath.split(/[\\/]/).includes('..')) return;
+  const absolute = path.resolve(cwd, relativePath);
+  return absolute.startsWith(`${path.resolve(cwd)}${path.sep}`) ? absolute : undefined;
+}
+
+async function captureBaselineFiles(cwd: string, changes: GitChange[]): Promise<{ files: Record<string, BaselineFile>; incomplete: boolean }> {
+  const paths = new Set(changes.flatMap((change) => [change.path, change.originalPath].filter((value): value is string => Boolean(value))));
+  const files: Record<string, BaselineFile> = {};
+  let totalBytes = 0;
+  let incomplete = false;
+  for (const relativePath of paths) {
+    const absolute = safeGitPath(cwd, relativePath);
+    if (!absolute) { incomplete = true; continue; }
+    const details = await stat(absolute).catch(() => undefined);
+    if (!details?.isFile()) { files[relativePath] = { exists: false }; continue; }
+    if (details.size > MAX_BASELINE_FILE_BYTES || totalBytes + details.size > MAX_BASELINE_TOTAL_BYTES) {
+      files[relativePath] = { exists: true };
+      incomplete = true;
+      continue;
+    }
+    const content = await readFile(absolute);
+    totalBytes += content.length;
+    files[relativePath] = { exists: true, contentBase64: content.toString('base64') };
+  }
+  return { files, incomplete };
+}
+
+export async function readGitSnapshot(cwd: string, includeDiffs = false, captureBaseline = false): Promise<GitSnapshot> {
   try {
     if ((await runGit(cwd, ['rev-parse', '--is-inside-work-tree'])).trim() !== 'true') {
       return { available: false, error: '当前项目还没有 Git 仓库' };
     }
-    const statusText = await runGit(cwd, ['status', '--porcelain=v1', '-z']);
+    const statusText = await runGit(cwd, ['status', '--porcelain=v1', '-z', '--untracked-files=all']);
     const changes = parsePorcelain(statusText);
     const branchText = (await optionalGit(cwd, ['symbolic-ref', '--quiet', '--short', 'HEAD']))?.trim();
     const headText = (await optionalGit(cwd, ['log', '-1', '--format=%H%x00%s']))?.trim();
@@ -160,6 +196,7 @@ export async function readGitSnapshot(cwd: string, includeDiffs = false): Promis
           optionalGit(cwd, ['diff', '--cached', '--no-ext-diff', '--unified=3']),
         ])
       : [undefined, undefined];
+    const baseline = captureBaseline ? await captureBaselineFiles(cwd, changes) : undefined;
     return {
       available: true,
       branch: branchText || undefined,
@@ -170,6 +207,7 @@ export async function readGitSnapshot(cwd: string, includeDiffs = false): Promis
       deletions: totals.deletions,
       ...(sha ? { commit: { sha, message } } : {}),
       fingerprint,
+      ...(baseline ? { baselineFiles: baseline.files, baselineIncomplete: baseline.incomplete } : {}),
       ...(includeDiffs ? {
         unstagedDiff: (unstagedDiff ?? '').slice(0, 1_000_000),
         stagedDiff: (stagedDiff ?? '').slice(0, 1_000_000),
@@ -177,6 +215,85 @@ export async function readGitSnapshot(cwd: string, includeDiffs = false): Promis
     };
   } catch (error) {
     return { available: false, error: error instanceof Error ? error.message : 'Git 状态暂时无法读取' };
+  }
+}
+
+async function gitBlob(cwd: string, sha: string, relativePath: string): Promise<Buffer | undefined> {
+  try {
+    const result = await execFileAsync(gitExecutable(), ['-C', cwd, 'show', `${sha}:${relativePath}`], {
+      encoding: 'buffer', timeout: 30_000, maxBuffer: MAX_GIT_OUTPUT,
+    }) as unknown as { stdout: Buffer };
+    return Buffer.from(result.stdout);
+  } catch { return undefined; }
+}
+
+async function baselineContent(cwd: string, before: GitSnapshot, relativePath: string): Promise<{ content?: Buffer; complete: boolean }> {
+  if (before.baselineFiles && Object.hasOwn(before.baselineFiles, relativePath)) {
+    const file = before.baselineFiles[relativePath];
+    if (!file.exists) return { complete: true };
+    if (!file.contentBase64) return { complete: false };
+    return { content: Buffer.from(file.contentBase64, 'base64'), complete: true };
+  }
+  if (!before.commit?.sha) return { complete: true };
+  return { content: await gitBlob(cwd, before.commit.sha, relativePath), complete: true };
+}
+
+async function currentContent(cwd: string, relativePath: string): Promise<Buffer | undefined> {
+  const absolute = safeGitPath(cwd, relativePath);
+  if (!absolute) return;
+  const details = await stat(absolute).catch(() => undefined);
+  return details?.isFile() ? readFile(absolute) : undefined;
+}
+
+async function commitChangedPaths(cwd: string, before: GitSnapshot, after: GitSnapshot): Promise<string[]> {
+  if (before.commit?.sha && after.commit?.sha && before.commit.sha !== after.commit.sha) {
+    return (await optionalGit(cwd, ['diff', '--name-only', '-z', before.commit.sha, after.commit.sha]) ?? '').split('\0').filter(Boolean);
+  }
+  if (!before.commit?.sha && after.commit?.sha) {
+    return (await optionalGit(cwd, ['ls-tree', '-r', '--name-only', '-z', after.commit.sha]) ?? '').split('\0').filter(Boolean);
+  }
+  return [];
+}
+
+async function noIndexNumstat(cwd: string, beforeDirectory: string, afterDirectory: string): Promise<string> {
+  try {
+    return await runGit(cwd, ['diff', '--no-index', '--numstat', '-M', '--', beforeDirectory, afterDirectory]);
+  } catch (error) {
+    const stdout = (error as { stdout?: unknown }).stdout;
+    if (typeof stdout === 'string') return stdout;
+    throw error;
+  }
+}
+
+async function developmentDelta(cwd: string, before: GitSnapshot, after: GitSnapshot): Promise<{ changedFiles?: number; additions?: number; deletions?: number; complete: boolean }> {
+  if (!before.available || !after.available || before.baselineIncomplete) return { complete: false };
+  const candidates = new Set<string>([
+    ...(before.changes ?? []).flatMap((change) => [change.path, change.originalPath].filter((value): value is string => Boolean(value))),
+    ...(after.changes ?? []).flatMap((change) => [change.path, change.originalPath].filter((value): value is string => Boolean(value))),
+    ...await commitChangedPaths(cwd, before, after),
+  ]);
+  if (!candidates.size) return { changedFiles: 0, additions: 0, deletions: 0, complete: true };
+  const temporary = await mkdtemp(path.join(tmpdir(), 'palm-git-delta-'));
+  const beforeDirectory = path.join(temporary, 'before');
+  const afterDirectory = path.join(temporary, 'after');
+  await Promise.all([mkdir(beforeDirectory), mkdir(afterDirectory)]);
+  try {
+    for (const relativePath of candidates) {
+      const safeBefore = safeGitPath(beforeDirectory, relativePath);
+      const safeAfter = safeGitPath(afterDirectory, relativePath);
+      if (!safeBefore || !safeAfter) return { complete: false };
+      const baseline = await baselineContent(cwd, before, relativePath);
+      if (!baseline.complete) return { complete: false };
+      const current = await currentContent(cwd, relativePath);
+      if (baseline.content) { await mkdir(path.dirname(safeBefore), { recursive: true }); await writeFile(safeBefore, baseline.content); }
+      if (current) { await mkdir(path.dirname(safeAfter), { recursive: true }); await writeFile(safeAfter, current); }
+    }
+    const numstat = await noIndexNumstat(cwd, beforeDirectory, afterDirectory);
+    const lines = numstat.split('\n').filter(Boolean);
+    const totals = parseNumstat(numstat);
+    return { changedFiles: lines.length, additions: totals.additions, deletions: totals.deletions, complete: true };
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
   }
 }
 
@@ -191,12 +308,14 @@ export function verificationCommand(commandValue: unknown, exitCodeValue: unknow
   return { command: command.trim().slice(0, 500), status: exitCode === 0 ? 'passed' : 'failed', exitCode };
 }
 
-export function aggregateDevelopmentResult(
+export async function aggregateDevelopmentResult(
+  cwd: string,
   before: GitSnapshot | undefined,
   after: GitSnapshot,
   commands: VerificationCommand[],
   fileChangeDetected = false,
-): DevelopmentResult {
+  taskStatus: 'completed' | 'failed' | 'interrupted' = 'completed',
+): Promise<DevelopmentResult> {
   const gitChanged = Boolean(
     before?.available && after.available && (
       before.fingerprint !== after.fingerprint ||
@@ -205,6 +324,7 @@ export function aggregateDevelopmentResult(
     ),
   );
   const detected = gitChanged || ((!before?.available || !after.available) && fileChangeDetected);
+  const delta = detected && before ? await developmentDelta(cwd, before, after) : { changedFiles: 0, additions: 0, deletions: 0, complete: true };
   const verificationStatus = commands.some((command) => command.status === 'failed')
     ? 'failed'
     : commands.length > 0 && commands.every((command) => command.status === 'passed')
@@ -212,7 +332,9 @@ export function aggregateDevelopmentResult(
       : 'unverified';
   let summary: DevelopmentResult['summary'];
   if (!detected) summary = { status: 'clean', label: '本次执行没有检测到代码变化' };
-  else if (!after.available) summary = { status: 'unknown', label: '检测到文件修改，但暂时无法完整判断开发状态' };
+  else if (taskStatus === 'interrupted') summary = { status: 'unknown', label: '任务被中断，请确认代码状态后再继续' };
+  else if (taskStatus === 'failed') summary = { status: 'failed', label: '任务执行失败，代码尚未达到可提交状态' };
+  else if (!after.available || !delta.complete) summary = { status: 'unknown', label: '检测到代码修改，但暂时无法完整判断开发状态' };
   else if (verificationStatus === 'failed') summary = { status: 'failed', label: '验证失败，需要继续处理' };
   else if (verificationStatus === 'passed') summary = { status: 'ready', label: '修改已完成并通过验证，可以提交' };
   else summary = { status: 'unverified', label: '代码已有修改，但尚未完成验证' };
@@ -224,9 +346,10 @@ export function aggregateDevelopmentResult(
       branch: after.branch,
       detached: after.detached,
       dirty: after.dirty,
-      changedFiles: after.changes?.length,
-      additions: after.additions,
-      deletions: after.deletions,
+      changedFiles: delta.changedFiles,
+      additions: delta.additions,
+      deletions: delta.deletions,
+      deltaComplete: delta.complete,
       commit: after.commit,
     },
     verification: { status: verificationStatus, commands: [...commands] },

@@ -119,8 +119,13 @@ export class ProjectStore {
       task.status = 'interrupted'; task.updatedAt = interruptedAt; task.completedAt = interruptedAt;
       task.errorMessage = '服务重启时任务仍在运行，请确认结果后再重新执行'; delete task.outputBaseline; recovered = true;
       const gitAfter = await readGitSnapshot(this.projectWorkdir(task.projectId));
-      task.developmentResult = aggregateDevelopmentResult(task.gitBaseline, gitAfter, task.verificationCommands ?? [], Boolean(task.fileChangeDetected));
+      task.developmentResult = await aggregateDevelopmentResult(
+        this.projectWorkdir(task.projectId), task.gitBaseline, gitAfter,
+        task.verificationCommands ?? [], Boolean(task.fileChangeDetected), 'interrupted',
+      );
       delete task.gitBaseline;
+      delete task.verificationCommands;
+      delete task.fileChangeDetected;
     }
     if (recovered) await this.persist();
     await this.migrateLegacyFiles();
@@ -277,7 +282,7 @@ export class ProjectStore {
 
   listTasks(projectId: string): ProjectTask[] {
     this.getProject(projectId);
-    return this.state.tasks.filter((task) => task.projectId === projectId).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)).slice(0, 200);
+    return this.state.tasks.filter((task) => task.projectId === projectId).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)).slice(0, 200).map((task) => this.publicTask(task));
   }
 
   listCompletedTasksSince(since: string): ProjectTask[] {
@@ -287,7 +292,7 @@ export class ProjectStore {
       .filter((task) => task.status !== 'running' && task.completedAt && Date.parse(task.completedAt) > sinceTime)
       .sort((a, b) => (a.completedAt ?? '').localeCompare(b.completedAt ?? ''))
       .slice(0, 500)
-      .map((task) => ({ ...task, attachments: [...task.attachments], outputPaths: [...task.outputPaths] }));
+      .map((task) => this.publicTask(task));
   }
 
   hasRunningTaskForThread(threadId: string, projectId: string): boolean {
@@ -313,7 +318,7 @@ export class ProjectStore {
         taskId: turnId, turnId, threadId, projectId,
         title: title.trim().slice(0, 120) || '新任务', status: 'running', startedAt: now, updatedAt: now,
         attachments: [...attachments], outputPaths: [], outputBaseline: outputBaseline ?? await this.snapshotOutbox(projectId), clientRequestId,
-        gitBaseline: gitBaseline ?? await readGitSnapshot(this.projectWorkdir(projectId)), verificationCommands: [],
+        gitBaseline: gitBaseline ?? await readGitSnapshot(this.projectWorkdir(projectId), false, true), verificationCommands: [],
       };
       this.state.tasks.push(task);
     }
@@ -368,16 +373,19 @@ export class ProjectStore {
       .filter(([name, signature]) => task.outputBaseline?.[name] !== signature)
       .map(([name]) => `outbox/${name}`);
     const gitAfter = await readGitSnapshot(this.projectWorkdir(task.projectId));
-    task.developmentResult = aggregateDevelopmentResult(
-      task.gitBaseline,
+    task.developmentResult = await aggregateDevelopmentResult(
+      this.projectWorkdir(task.projectId), task.gitBaseline,
       gitAfter,
       task.verificationCommands ?? [],
       Boolean(task.fileChangeDetected),
+      status === 'interrupted' ? 'interrupted' : status === 'failed' ? 'failed' : 'completed',
     );
     delete task.outputBaseline;
     delete task.gitBaseline;
+    delete task.verificationCommands;
+    delete task.fileChangeDetected;
     await this.persist();
-    return { ...task, attachments: [...task.attachments], outputPaths: [...task.outputPaths] };
+    return this.publicTask(task);
   }
 
   async interruptRunningTasks(reason: string, taskIds = this.runningTaskIds()): Promise<number> {
@@ -394,14 +402,17 @@ export class ProjectStore {
         .filter(([name, signature]) => task.outputBaseline?.[name] !== signature)
         .map(([name]) => `outbox/${name}`);
       const gitAfter = await readGitSnapshot(this.projectWorkdir(task.projectId));
-      task.developmentResult = aggregateDevelopmentResult(
-        task.gitBaseline,
+      task.developmentResult = await aggregateDevelopmentResult(
+        this.projectWorkdir(task.projectId), task.gitBaseline,
         gitAfter,
         task.verificationCommands ?? [],
         Boolean(task.fileChangeDetected),
+        'interrupted',
       );
       delete task.outputBaseline;
       delete task.gitBaseline;
+      delete task.verificationCommands;
+      delete task.fileChangeDetected;
     }
     if (tasks.length) await this.persist();
     return tasks.length;
@@ -410,6 +421,15 @@ export class ProjectStore {
   assertThreadProject(threadId: string, projectId: string): void {
     const thread = this.state.threads.find((item) => item.threadId === threadId);
     if (!thread || thread.projectId !== projectId) throw new Error('该对话不属于当前项目');
+  }
+
+  private publicTask(task: ProjectTask): ProjectTask {
+    const visible = { ...task };
+    delete visible.outputBaseline;
+    delete visible.gitBaseline;
+    delete visible.verificationCommands;
+    delete visible.fileChangeDetected;
+    return { ...visible, attachments: [...task.attachments], outputPaths: [...task.outputPaths] };
   }
 
   async rememberThread(threadId: string, projectId: string, title: string): Promise<ProjectThread> {

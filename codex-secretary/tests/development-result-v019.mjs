@@ -30,10 +30,10 @@ try {
   const before = await readGitSnapshot(repository);
   assert.equal(before.available, true);
   assert.equal(before.dirty, false);
-  const clean = aggregateDevelopmentResult(before, await readGitSnapshot(repository), [], false);
+  const clean = await aggregateDevelopmentResult(repository, before, await readGitSnapshot(repository), [], false);
   assert.equal(clean.detected, false, "没有 Git 或文件事件变化时不得显示开发结果卡");
   assert.equal(clean.summary.status, "clean");
-  assert.equal(aggregateDevelopmentResult(before, before, [], true).summary.status, "clean", "已撤销的文件事件不能误报开发变化");
+  assert.equal((await aggregateDevelopmentResult(repository, before, before, [], true)).summary.status, "clean", "已撤销的文件事件不能误报开发变化");
 
   await writeFile(path.join(repository, "tracked.txt"), "one\ntwo\nthree\n");
   await runGit(repository, "add", "tracked.txt");
@@ -58,16 +58,29 @@ try {
   assert.equal(verificationCommand(["/bin/bash", "-lc", "npm run build"], 0)?.status, "passed", "必须识别 Codex 常用 shell 包装命令");
   assert.equal(verificationCommand("echo tests passed", 0), undefined, "普通输出不得伪装成验证");
 
-  const ready = aggregateDevelopmentResult(before, after, [passedCommand], false);
+  const ready = await aggregateDevelopmentResult(repository, before, after, [passedCommand], false);
   assert.equal(ready.summary.status, "ready");
-  const failed = aggregateDevelopmentResult(before, after, [passedCommand, failedCommand], false);
+  assert.equal(ready.git.changedFiles, 4);
+  const failed = await aggregateDevelopmentResult(repository, before, after, [passedCommand, failedCommand], false);
   assert.equal(failed.summary.status, "failed");
-  const unverified = aggregateDevelopmentResult(before, after, [], false);
+  const unverified = await aggregateDevelopmentResult(repository, before, after, [], false);
   assert.equal(unverified.summary.status, "unverified");
+  const terminalFailed = await aggregateDevelopmentResult(repository, before, after, [passedCommand], false, "failed");
+  assert.equal(terminalFailed.summary.status, "failed", "任务失败时绝不能显示 ready");
+  const interrupted = await aggregateDevelopmentResult(repository, before, after, [passedCommand], false, "interrupted");
+  assert.equal(interrupted.summary.status, "unknown", "任务中断时必须要求人工确认");
+
+  const dirtyBefore = await readGitSnapshot(repository, false, true);
+  await appendFile(path.join(repository, "tracked.txt"), "task-only\n");
+  const dirtyAfter = await readGitSnapshot(repository);
+  const taskOnly = await aggregateDevelopmentResult(repository, dirtyBefore, dirtyAfter, [], false);
+  assert.equal(taskOnly.git.changedFiles, 1, "任务前已有脏文件不得计入本次执行文件数");
+  assert.equal(taskOnly.git.additions, 1, "本次执行增量必须排除任务前已有行数");
+  await writeFile(path.join(repository, "tracked.txt"), "one\ntwo\nthree\nfour\n");
 
   const unavailable = await readGitSnapshot(path.join(root, "missing"));
   assert.equal(unavailable.available, false);
-  const unknown = aggregateDevelopmentResult(before, unavailable, [], true);
+  const unknown = await aggregateDevelopmentResult(repository, before, unavailable, [], true);
   assert.equal(unknown.summary.status, "unknown", "Git 读取失败必须安全降级");
 
   const initialRepository = path.join(root, "initial-repository");
@@ -82,6 +95,11 @@ try {
 
   await runGit(repository, "add", ".");
   await runGit(repository, "commit", "-m", "development changes");
+  const committed = await readGitSnapshot(repository);
+  const committedResult = await aggregateDevelopmentResult(repository, before, committed, [passedCommand], false);
+  assert.equal(committed.dirty, false);
+  assert.equal(committedResult.git.changedFiles, 4, "任务内提交后仍须显示 before HEAD 到 after HEAD 的真实文件数");
+  assert.ok((committedResult.git.additions ?? 0) >= 5, "任务内提交后不能显示 +0 / -0");
   await runGit(repository, "checkout", "--detach");
   const detached = await readGitSnapshot(repository);
   assert.equal(detached.detached, true);
@@ -102,6 +120,7 @@ try {
   await store.setProjectWorkdir(project.id, "repository");
   await store.rememberThread("thread-dev", project.id, "修改应用");
   await store.rememberTask("turn-dev", "thread-dev", project.id, "修改应用");
+  assert.equal(store.listTasks(project.id)[0].gitBaseline, undefined, "任务 API 数据不得暴露基线文件内容");
   await writeFile(path.join(projectRepository, "app.js"), "export const value = 2;\n");
   await store.recordTaskExecution("thread-dev", "turn-dev", { type: "fileChange", changes: [{ path: "app.js" }] });
   await store.recordTaskExecution("thread-dev", "turn-dev", { type: "commandExecution", command: "npm test", exitCode: 0 });

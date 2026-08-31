@@ -874,7 +874,7 @@ app.get('/api/ws', { websocket: true }, (socket, request) => {
         if (imageExtensions.has(path.extname(filePath).toLowerCase())) input.push({ type: 'localImage', path: filePath, detail: 'auto' });
       }
       const outputBaseline = await projects.outputBaseline(message.projectId);
-      const gitBaseline = await readGitSnapshot(projectRoot);
+      const gitBaseline = await readGitSnapshot(projectRoot, false, true);
       const turn = await bridge.call('turn/start', {
         threadId,
         input,

@@ -100,6 +100,7 @@ type DevelopmentResult = {
     changedFiles?: number;
     additions?: number;
     deletions?: number;
+    deltaComplete?: boolean;
     commit?: { sha: string; message: string };
   };
   verification: {
@@ -998,11 +999,13 @@ function DevelopmentResultCard({
       <div className="development-result-grid">
         <div>
           <small>代码变更</small>
-          {result.git.available ? (
+          {result.git.available && result.git.deltaComplete !== false ? (
             <strong>
               {result.git.changedFiles ?? 0} 个文件 · +{result.git.additions ?? 0} / -
               {result.git.deletions ?? 0}
             </strong>
+          ) : result.git.available ? (
+            <strong>本次变更统计暂时不可用</strong>
           ) : (
             <strong>Git 状态暂时无法读取</strong>
           )}
