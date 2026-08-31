@@ -11,7 +11,6 @@ export const config = {
   port: Number(process.env.APP_PORT ?? 4511),
   origin: process.env.APP_ORIGIN?.replace(/\/$/, '') ?? 'http://localhost:3000',
   passwordHash: process.env.APP_PASSWORD_HASH?.trim() ?? '',
-  tailscaleOwnerLogin: process.env.TAILSCALE_OWNER_LOGIN?.trim().toLowerCase() ?? '',
   sessionSecret: required('SESSION_SECRET'),
   workspace: path.resolve(process.env.WORKSPACE_ROOT ?? '/home/codex/workspace'),
   codexBin: process.env.CODEX_BIN ?? '/home/codex/.local/bin/codex-proxy',

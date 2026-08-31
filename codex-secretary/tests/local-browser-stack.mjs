@@ -1,8 +1,11 @@
 import { spawn } from 'node:child_process';
 import path from 'node:path';
+import { hashPassword } from '../dist-server/auth.js';
 
 const root = process.cwd();
 const children = [];
+const previewPassword = 'browser-test-password';
+const previewPasswordHash = await hashPassword(previewPassword);
 const start = (command, args, env = {}) => {
   const child = spawn(command, args, {
     cwd: root,
@@ -19,7 +22,7 @@ start(process.execPath, ['dist-server/index.js'], {
   APP_PORT: '4511',
   APP_ORIGIN: 'http://127.0.0.1:8088',
   SESSION_SECRET: 'browser-test-secret-long-enough',
-  TAILSCALE_OWNER_LOGIN: 'test@example.com',
+  APP_PASSWORD_HASH: previewPasswordHash,
   WORKSPACE_ROOT: path.join(root, '.browser-workspace'),
   CODEX_BIN: process.execPath,
   CODEX_ARGS_PREFIX_JSON: JSON.stringify([path.join(root, 'tests', 'mock-app-server.mjs')]),

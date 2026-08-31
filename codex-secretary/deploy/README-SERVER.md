@@ -10,8 +10,8 @@
 2. 确认 `codex` 普通用户可执行 Node.js 22；不要让 Codex 获得 root 权限，也不要把它加入 docker 组。
 3. 执行 `chmod 0755 deploy/install-release.sh && sudo deploy/install-release.sh`。
 4. 安装并登录 Tailscale。首次 `tailscale up --hostname=palm-secretary --accept-dns=false` 会返回登录地址，需要由服务器所有者在浏览器完成。
-5. 读取 `tailscale status --json` 中本机的 MagicDNS 名称和所有者 `LoginName`，分别写入 `APP_ORIGIN` 与 `TAILSCALE_OWNER_LOGIN`。Tailscale Serve 会注入并保护身份请求头，因此所有者从 tailnet 访问时自动登录。
-6. 推荐把 `APP_PASSWORD_HASH` 留空，关闭密码入口。若将来需要密码后备入口，再生成至少 20 位随机密码，用 `npm run password:hash -- "密码"` 得到哈希；只把哈希写入环境文件。
+5. 把实际访问地址写入 `APP_ORIGIN`；公网部署示例为 `https://ai.example.com`，私网部署也可使用 Tailscale MagicDNS HTTPS 地址。
+6. 生成至少 20 位随机密码，用 `npm run password:hash -- "密码"` 得到哈希并写入 `APP_PASSWORD_HASH`。只保存哈希；应用不信任任何代理身份 Header。
 7. 创建 `/etc/palm-secretary/app.env`，权限 `root:codex 0640`，内容参考 `.env.example`。`SESSION_SECRET` 使用 `openssl rand -hex 32` 生成。
 8. 启动 `palm-secretary-web` 和 `palm-secretary-api`，再安全地 reload Nginx。
 9. 执行 `tailscale serve --bg http://127.0.0.1:8088`。不要使用 `tailscale funnel`。
@@ -24,7 +24,8 @@
 ## 安全边界
 
 - API、Web、Nginx 内部入口都只监听 `127.0.0.1`。
-- 只信任与 `TAILSCALE_OWNER_LOGIN` 完全匹配的 Tailscale 身份；Nginx 内部入口不得改为公网监听。
+- 所有客户端只使用密码登录与 `palm_session` Cookie；`Tailscale-User-Login` 等代理身份 Header 不参与认证。
+- Nginx 内部入口不得改为公网监听，并应主动清空 `Tailscale-User-Login` Header 作为纵深防护。
 - App Server 使用 stdio 子进程，不开启远程 WebSocket 监听。
 - Codex 只能写 `/home/codex/workspace` 和自己的 `.codex` 目录。
 - 低于 6GB 显示磁盘警告，低于 4GB 自动拒绝新任务和上传。
