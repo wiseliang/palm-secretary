@@ -199,6 +199,7 @@
 .development-result-grid strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
 .development-result-grid span { overflow: hidden; color: var(--muted); text-overflow: ellipsis; white-space: nowrap; font-size: 9px; }
 .development-git-summary { grid-column: 1 / -1; }
+.development-github-summary { min-height: 64px; }
 .development-verification-details { border-top: 1px solid var(--line); padding-top: 10px; }
 .development-verification-details summary { width: fit-content; color: var(--muted); cursor: pointer; font-size: 10px; font-weight: 700; }
 .development-verification-details > div { display: grid; gap: 5px; margin-top: 8px; }
@@ -208,7 +209,11 @@
 .development-unverified-note { margin: -2px 0 0; color: var(--muted); font-size: 10px; }
 .development-result-card > footer { padding-top: 11px; border-top: 1px solid var(--line); }
 .development-result-card > footer strong { font-size: 11px; line-height: 1.45; }
-.development-result-card > footer button { display: inline-flex; align-items: center; justify-content: center; flex: none; gap: 6px; min-height: 38px; padding: 0 11px; border: 0; border-radius: var(--radius-control); background: var(--accent); color: #fff; font-size: 10px; font-weight: 750; }
+.development-result-actions { display: flex !important; align-items: center; justify-content: flex-end; gap: 6px !important; }
+.development-result-actions button, .development-result-actions a { display: inline-flex; align-items: center; justify-content: center; flex: none; gap: 6px; min-height: 38px; padding: 0 11px; border: 1px solid transparent; border-radius: var(--radius-control); background: var(--accent); color: #fff; font-size: 10px; font-weight: 750; text-decoration: none; cursor: pointer; }
+.development-result-actions a { border-color: var(--line); background: var(--surface-strong); color: var(--ink); }
+.development-result-actions .development-refresh { border-color: var(--line); background: transparent; color: var(--muted); }
+.development-result-actions button:disabled { cursor: wait; opacity: .58; }
 
 .attachment-sheet {
   position: fixed;
@@ -299,7 +304,8 @@
   .development-result-grid { grid-template-columns: minmax(0, 1fr); }
   .development-git-summary { grid-column: auto; }
   .development-result-card > footer { align-items: stretch; flex-direction: column; }
-  .development-result-card > footer button { width: 100%; }
+  .development-result-actions { display: grid !important; grid-template-columns: repeat(2, minmax(0, 1fr)); width: 100%; }
+  .development-result-actions button, .development-result-actions a { min-width: 0; width: 100%; padding-inline: 8px; }
 }
 
 @media (max-width: 520px) {

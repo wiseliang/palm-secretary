@@ -16,6 +16,7 @@ import { createSession, verifyPassword, verifySession } from './auth.js';
 import { CodexBridge } from './app-server.js';
 import { ProjectStore } from './project-store.js';
 import { readGitSnapshot } from './development-status.js';
+import { enrichDevelopmentResultWithGithub } from './github-status.js';
 
 const app = Fastify({ logger: { level: process.env.LOG_LEVEL ?? 'info' }, trustProxy: '127.0.0.1' });
 const bridge = new CodexBridge();
@@ -509,7 +510,7 @@ app.get<{ Params: { id: string } }>('/api/projects/:id/git', async (request, rep
   } catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : 'Git 状态读取失败' }); }
 });
 
-app.get<{ Params: { id: string }; Querystring: { taskId?: string } }>('/api/projects/:id/development-status', async (request, reply) => {
+app.get<{ Params: { id: string }; Querystring: { taskId?: string; refresh?: string } }>('/api/projects/:id/development-status', async (request, reply) => {
   if (!requireOwner(request, reply)) return;
   try {
     const tasks = projects.listTasks(request.params.id);
@@ -517,7 +518,11 @@ app.get<{ Params: { id: string }; Querystring: { taskId?: string } }>('/api/proj
       ? tasks.find((item) => item.taskId === request.query.taskId)
       : tasks.find((item) => item.developmentResult);
     if (!task?.developmentResult) return reply.code(404).send({ error: '暂时没有可用的开发结果' });
-    return { taskId: task.taskId, developmentStatus: task.developmentResult };
+    const root = await projectGitRoot(request.params.id);
+    const developmentStatus = root
+      ? await enrichDevelopmentResultWithGithub(root, task.developmentResult, { refresh: request.query.refresh === '1' })
+      : task.developmentResult;
+    return { taskId: task.taskId, developmentStatus };
   } catch (error) {
     return reply.code(400).send({ error: error instanceof Error ? error.message : '开发状态读取失败' });
   }
