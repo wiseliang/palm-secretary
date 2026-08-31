@@ -75,11 +75,7 @@ await app.register(websocket);
 app.addContentTypeParser('application/octet-stream', { parseAs: 'buffer', bodyLimit: 9 * 1024 * 1024 }, (_request, body, done) => done(null, body));
 
 function authenticated(request: FastifyRequest): boolean {
-  const tailscaleLogin = request.headers['tailscale-user-login'];
-  const trustedTailscaleOwner = config.tailscaleOwnerLogin
-    && typeof tailscaleLogin === 'string'
-    && tailscaleLogin.trim().toLowerCase() === config.tailscaleOwnerLogin;
-  return Boolean(trustedTailscaleOwner) || verifySession(request.cookies.palm_session, config.sessionSecret);
+  return verifySession(request.cookies.palm_session, config.sessionSecret);
 }
 
 function originAllowed(request: FastifyRequest): boolean {
@@ -251,7 +247,7 @@ app.get('/api/health', async () => ({ ok: true }));
 
 app.post('/api/auth/login', async (request, reply) => {
   if (!originAllowed(request)) return reply.code(403).send({ error: '来源校验失败' });
-  if (!config.passwordHash) return reply.code(403).send({ error: '密码登录未启用，请通过 Tailscale 私网访问' });
+  if (!config.passwordHash) return reply.code(503).send({ error: '管理员尚未配置密码登录' });
   const ip = loginRateLimitKey(request);
   const now = Date.now();
   const attempt = loginAttempts.get(ip);

@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process';
 import { mkdir, readFile, rm, stat, utimes, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import WebSocket from 'ws';
+import { hashPassword } from '../dist-server/auth.js';
 
 const root = process.cwd();
 const workspace = path.join(root, '.test-workspace-v02');
@@ -20,13 +21,15 @@ await writeFile(stalePart, 'stale'); await writeFile(freshPart, 'fresh');
 const old = new Date(Date.now() - 25 * 60 * 60 * 1000); await utimes(stalePart, old, old);
 
 const port = 4591;
-const commonHeaders = { Origin: `http://127.0.0.1:${port}`, 'Tailscale-User-Login': 'test@example.com' };
+const commonHeaders = { Origin: `http://127.0.0.1:${port}` };
+const testPassword = 'integration-password-v02';
+const testPasswordHash = await hashPassword(testPassword);
 const child = spawn(process.execPath, ['dist-server/index.js'], {
   cwd: root,
   env: {
     ...process.env,
     APP_HOST: '127.0.0.1', APP_PORT: String(port), APP_ORIGIN: `http://127.0.0.1:${port}`,
-    SESSION_SECRET: 'test-secret-that-is-long-enough-for-v02', TAILSCALE_OWNER_LOGIN: 'test@example.com',
+    SESSION_SECRET: 'test-secret-that-is-long-enough-for-v02', APP_PASSWORD_HASH: testPasswordHash,
     WORKSPACE_ROOT: workspace, CODEX_BIN: process.execPath,
     CODEX_ARGS_PREFIX_JSON: JSON.stringify([path.join(root, 'tests', 'mock-app-server.mjs')]), MOCK_LOG: logFile,
     TASK_STOP_FREE_BYTES: '1', DISK_WARNING_FREE_BYTES: '1', MAX_UPLOAD_BYTES: '32', LOG_LEVEL: 'error',
@@ -36,9 +39,10 @@ const child = spawn(process.execPath, ['dist-server/index.js'], {
 
 let stderr = '';
 child.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
+let sessionCookie = '';
 
 async function api(url, init = {}) {
-  return fetch(`http://127.0.0.1:${port}${url}`, { ...init, headers: { ...commonHeaders, ...(init.headers ?? {}) } });
+  return fetch(`http://127.0.0.1:${port}${url}`, { ...init, headers: { ...commonHeaders, ...(sessionCookie ? { Cookie: sessionCookie } : {}), ...(init.headers ?? {}) } });
 }
 
 try {
@@ -46,6 +50,22 @@ try {
     if ((await fetch(`http://127.0.0.1:${port}/api/health`).catch(() => null))?.ok) break;
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
+  const spoofedSession = await fetch(`http://127.0.0.1:${port}/api/session`, {
+    headers: { ...commonHeaders, 'Tailscale-User-Login': 'test@example.com' },
+  });
+  if ((await spoofedSession.json()).authenticated !== false) throw new Error('伪造 Tailscale 身份头绕过了登录');
+  const spoofedProtected = await fetch(`http://127.0.0.1:${port}/api/projects`, {
+    headers: { ...commonHeaders, 'Tailscale-User-Login': 'test@example.com' },
+  });
+  if (spoofedProtected.status !== 401) throw new Error(`伪造 Tailscale 身份头访问受保护接口返回 ${spoofedProtected.status}`);
+  const loginResponse = await fetch(`http://127.0.0.1:${port}/api/auth/login`, {
+    method: 'POST',
+    headers: { ...commonHeaders, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ password: testPassword }),
+  });
+  if (!loginResponse.ok) throw new Error(`密码登录失败: ${loginResponse.status}`);
+  sessionCookie = loginResponse.headers.get('set-cookie')?.split(';', 1)[0] ?? '';
+  if (!sessionCookie.startsWith('palm_session=')) throw new Error('密码登录未返回 Session Cookie');
   if (await stat(stalePart).catch(() => null)) throw new Error('过期上传分片未在启动时清理');
   if (!(await stat(freshPart).catch(() => null))) throw new Error('未过期上传分片被错误清理');
   const createdResponse = await api('/api/projects', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: '附件测试项目' }) });
@@ -89,7 +109,7 @@ try {
 
   const events = [];
   const firstRequestId = crypto.randomUUID();
-  const socket = new WebSocket(`ws://127.0.0.1:${port}/api/ws`, { headers: commonHeaders });
+  const socket = new WebSocket(`ws://127.0.0.1:${port}/api/ws`, { headers: { ...commonHeaders, Cookie: sessionCookie } });
   await new Promise((resolve, reject) => {
     const timeout = setTimeout(() => reject(new Error('WebSocket 测试超时')), 5000);
     socket.on('message', (raw) => {
@@ -103,7 +123,7 @@ try {
   const accepted = events.find((event) => event.type === 'turn.accepted');
   if (!accepted?.threadId) throw new Error('未收到 threadId');
 
-  const duplicateSocket = new WebSocket(`ws://127.0.0.1:${port}/api/ws`, { headers: commonHeaders });
+  const duplicateSocket = new WebSocket(`ws://127.0.0.1:${port}/api/ws`, { headers: { ...commonHeaders, Cookie: sessionCookie } });
   const duplicateAccepted = await new Promise((resolve, reject) => {
     const timeout = setTimeout(() => reject(new Error('幂等重放测试超时')), 5000);
     duplicateSocket.on('message', (raw) => {
@@ -120,7 +140,7 @@ try {
   if (invalidModel.status !== 400) throw new Error('不可用模型未被拒绝');
   const switched = await api(`/api/projects/${encodeURIComponent(project.id)}/model`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ model: 'mock-fast', reasoningEffort: 'low' }) });
   if (!switched.ok) throw new Error('已有对话模型切换失败');
-  const socket2 = new WebSocket(`ws://127.0.0.1:${port}/api/ws`, { headers: commonHeaders });
+  const socket2 = new WebSocket(`ws://127.0.0.1:${port}/api/ws`, { headers: { ...commonHeaders, Cookie: sessionCookie } });
   await new Promise((resolve, reject) => {
     const timeout = setTimeout(() => reject(new Error('已有对话模型切换超时')), 5000);
     socket2.on('message', (raw) => {

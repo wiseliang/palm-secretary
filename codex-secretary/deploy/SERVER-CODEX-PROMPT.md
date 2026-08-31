@@ -46,19 +46,13 @@
 
 ### 5. 写入私密环境文件
 
-从 `tailscale status --json` 获取：
-
-- `.Self.DNSName` 去掉末尾句点，得到设备 MagicDNS 名称。
-- `.Self.UserID` 对应 `.User[用户ID].LoginName`，得到所有者登录名。
-
-若任一值为空则停止。创建 `/etc/palm-secretary/app.env`，所有者 `root:codex`、权限 `0640`。内容为：
+确定实际 HTTPS 访问地址并生成至少 20 位随机登录密码；使用 `npm run password:hash -- "密码"` 生成哈希。创建 `/etc/palm-secretary/app.env`，所有者 `root:codex`、权限 `0640`。应用只接受密码登录产生的 Session Cookie，不信任 Tailscale 身份 Header。内容为：
 
 ```dotenv
 APP_HOST=127.0.0.1
 APP_PORT=4511
-APP_ORIGIN=https://<MagicDNS名称>
-TAILSCALE_OWNER_LOGIN=<所有者LoginName>
-APP_PASSWORD_HASH=
+APP_ORIGIN=https://<实际访问域名>
+APP_PASSWORD_HASH=<生成的 scrypt 哈希，绝不输出>
 SESSION_SECRET=<用 openssl rand -hex 32 生成，绝不输出>
 SESSION_HOURS=168
 WORKSPACE_ROOT=/home/codex/workspace
