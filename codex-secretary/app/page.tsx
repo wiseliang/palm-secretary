@@ -116,6 +116,32 @@ type DevelopmentResult = {
       exitCode: number;
     }>;
   };
+  github?: {
+    available: boolean;
+    repository?: string;
+    pullRequestState: "none" | "open" | "merged" | "closed" | "unknown";
+    pullRequest?: {
+      number: number;
+      title: string;
+      state: "open" | "merged" | "closed";
+      draft: boolean;
+      mergeable?: boolean;
+      url: string;
+      headSha: string;
+      baseBranch: string;
+    };
+    ci?: {
+      status: "pending" | "success" | "failed" | "cancelled" | "unknown";
+      checks: Array<{
+        name: string;
+        status: "pending" | "success" | "failed" | "cancelled" | "unknown";
+        url?: string;
+      }>;
+      url?: string;
+    };
+    error?: string;
+    fetchedAt?: string;
+  };
   summary: {
     status: "ready" | "unverified" | "failed" | "clean" | "unknown";
     label: string;
@@ -970,9 +996,13 @@ function mergeExecutionStep(
 function DevelopmentResultCard({
   result,
   onReview,
+  onRefresh,
+  refreshing,
 }: {
   result: DevelopmentResult;
   onReview: () => void;
+  onRefresh: () => void;
+  refreshing: boolean;
 }) {
   if (!result.detected || result.summary.status === "clean") return null;
   const verificationLabel =
@@ -981,9 +1011,45 @@ function DevelopmentResultCard({
       : result.verification.status === "failed"
         ? "验证失败"
         : "尚未验证";
+  const github = result.github;
+  const pull = github?.pullRequest;
+  const ci = github?.ci;
+  const githubVisible = Boolean(github?.repository);
+  const badge = result.summary.status !== "ready"
+    ? result.summary.status === "failed" ? "需处理" : result.summary.status === "unknown" ? "待确认" : "待验证"
+    : pull?.state === "open" && !pull.draft && pull.mergeable !== false && ci?.status === "success"
+      ? "可合并"
+      : pull ? "PR 检查" : "可提交";
+  const pullLabel = !github?.available
+    ? "GitHub 状态暂时无法读取"
+    : !pull
+      ? "当前分支暂无 PR"
+      : pull.state === "merged"
+        ? `#${pull.number} · 已合并`
+        : pull.state === "closed"
+          ? `#${pull.number} · 已关闭`
+          : pull.draft
+            ? `#${pull.number} · 草稿`
+            : `#${pull.number} · 等待合并`;
+  const ciLabel = ci?.status === "success"
+    ? "全部通过 ✓"
+    : ci?.status === "failed"
+      ? "存在失败 ×"
+      : ci?.status === "pending"
+        ? "正在运行…"
+        : ci?.status === "cancelled"
+          ? "已取消"
+          : "状态尚未确认";
+  const cardTone = result.summary.status === "ready" && pull
+    ? pull.state === "closed" || pull.mergeable === false || ci?.status === "failed" || ci?.status === "cancelled"
+      ? "failed"
+      : pull.draft || ci?.status === "pending" || ci?.status === "unknown"
+        ? "unverified"
+        : result.summary.status
+    : result.summary.status;
   return (
     <section
-      className={`development-result-card ${result.summary.status}`}
+      className={`development-result-card ${cardTone}`}
       aria-label="开发结果"
     >
       <header>
@@ -991,15 +1057,7 @@ function DevelopmentResultCard({
           <small>本次执行</small>
           <strong>开发结果</strong>
         </div>
-        <span>
-          {result.summary.status === "ready"
-            ? "可提交"
-            : result.summary.status === "failed"
-              ? "需处理"
-              : result.summary.status === "unknown"
-                ? "待确认"
-                : "待验证"}
-        </span>
+        <span>{badge}</span>
       </header>
       <div className="development-result-grid">
         <div>
@@ -1042,6 +1100,26 @@ function DevelopmentResultCard({
             <span>{result.git.error ?? "Git 状态暂时无法读取"}</span>
           )}
         </div>
+        {githubVisible ? (
+          <>
+            <div className="development-github-summary">
+              <small>PR</small>
+              <strong>{pullLabel}</strong>
+              <span>{pull?.title ?? github?.repository}</span>
+            </div>
+            {pull ? (
+              <div className="development-github-summary">
+                <small>CI</small>
+                <strong>{ciLabel}</strong>
+                <span>
+                  {ci?.checks.length
+                    ? ci.checks.slice(0, 3).map((check) => `${check.name} ${check.status === "success" ? "✓" : check.status === "failed" ? "×" : check.status === "pending" ? "…" : "·"}`).join(" · ")
+                    : "尚未检测到 GitHub Checks"}
+                </span>
+              </div>
+            ) : null}
+          </>
+        ) : null}
       </div>
       {result.verification.commands.length ? (
         <details className="development-verification-details">
@@ -1063,12 +1141,22 @@ function DevelopmentResultCard({
           <small>结论</small>
           <strong>{result.summary.label}</strong>
         </div>
-        {result.git.available && (
-          <button type="button" onClick={onReview}>
-            <GitDiff size={16} />
-            查看修改
-          </button>
-        )}
+        <div className="development-result-actions">
+          {result.git.available && (
+            <button type="button" onClick={onReview}>
+              <GitDiff size={16} />
+              查看修改
+            </button>
+          )}
+          {pull ? <a href={pull.url} target="_blank" rel="noreferrer">查看 PR</a> : null}
+          {ci?.url ? <a href={ci.url} target="_blank" rel="noreferrer">查看 CI</a> : null}
+          {githubVisible ? (
+            <button type="button" className="development-refresh" onClick={onRefresh} disabled={refreshing}>
+              <ArrowClockwise size={15} />
+              {refreshing ? "刷新中" : "刷新"}
+            </button>
+          ) : null}
+        </div>
       </footer>
     </section>
   );
@@ -1144,6 +1232,8 @@ export default function Home() {
   const [projectId, setProjectId] = useState("default");
   const [threads, setThreads] = useState<ProjectThread[]>([]);
   const [tasks, setTasks] = useState<ProjectTask[]>([]);
+  const [developmentStatuses, setDevelopmentStatuses] = useState<Record<string, DevelopmentResult>>({});
+  const [developmentRefreshing, setDevelopmentRefreshing] = useState<Record<string, boolean>>({});
   const [files, setFiles] = useState<UploadedFile[]>([]);
   const [recordSearch, setRecordSearch] = useState("");
   const [showArchived, setShowArchived] = useState(false);
@@ -1186,6 +1276,7 @@ export default function Home() {
   const attachmentsProjectRef = useRef(projectId);
   const projectDialogBusyRef = useRef(false);
   const projectLoadGenerationRef = useRef(0);
+  const developmentRequestedRef = useRef(new Set<string>());
   const threadLoadGenerationRef = useRef(0);
   const showArchivedRef = useRef(showArchived);
   const [filesProjectId, setFilesProjectId] = useState(projectId);
@@ -1216,7 +1307,7 @@ export default function Home() {
   const developmentByTurn = new Map(
     tasks
       .filter((task) => task.developmentResult?.detected)
-      .map((task) => [task.turnId, task.developmentResult as DevelopmentResult]),
+      .map((task) => [task.turnId, developmentStatuses[task.taskId] ?? task.developmentResult as DevelopmentResult]),
   );
   const recentOutputs = files
     .filter((file) => file.path.startsWith("outbox/"))
@@ -1490,6 +1581,37 @@ export default function Home() {
     [loadProjectCore, loadThreads],
   );
 
+  const loadDevelopmentStatus = useCallback(
+    async (task: ProjectTask, refresh = false) => {
+      if (!task.developmentResult?.detected) return;
+      const requestKey = `${task.projectId}:${task.taskId}`;
+      if (!refresh && developmentRequestedRef.current.has(requestKey)) return;
+      developmentRequestedRef.current.add(requestKey);
+      setDevelopmentRefreshing((current) => ({ ...current, [task.taskId]: true }));
+      try {
+        const response = await fetch(
+          `/api/projects/${encodeURIComponent(task.projectId)}/development-status?taskId=${encodeURIComponent(task.taskId)}${refresh ? "&refresh=1" : ""}`,
+        );
+        if (!response.ok) {
+          developmentRequestedRef.current.delete(requestKey);
+          return;
+        }
+        const body = (await response.json()) as { developmentStatus?: DevelopmentResult };
+        if (body.developmentStatus && projectIdRef.current === task.projectId) {
+          setDevelopmentStatuses((current) => ({
+            ...current,
+            [task.taskId]: body.developmentStatus as DevelopmentResult,
+          }));
+        }
+      } catch {
+        developmentRequestedRef.current.delete(requestKey);
+      } finally {
+        setDevelopmentRefreshing((current) => ({ ...current, [task.taskId]: false }));
+      }
+    },
+    [],
+  );
+
   const refreshThreadMessages = useCallback(
     async (
       targetThreadId: string,
@@ -1660,6 +1782,9 @@ export default function Home() {
     const timer = window.setTimeout(() => {
       setThreads([]);
       setTasks([]);
+      setDevelopmentStatuses({});
+      setDevelopmentRefreshing({});
+      developmentRequestedRef.current.clear();
       setFiles([]);
       setFilesProjectId(projectId);
       setDraft(window.localStorage.getItem(`palm:draft:${projectId}`) ?? "");
@@ -1680,6 +1805,28 @@ export default function Home() {
     }, 0);
     return () => window.clearTimeout(timer);
   }, [authenticated, projectId, loadProjectCore, loadThreads]);
+
+  useEffect(() => {
+    if (!authenticated || !projectId) return;
+    const visibleTurns = new Set(messages.map((message) => message.turnId).filter(Boolean));
+    tasks
+      .filter((task) => task.developmentResult?.detected && visibleTurns.has(task.turnId))
+      .forEach((task) => void loadDevelopmentStatus(task));
+  }, [authenticated, loadDevelopmentStatus, messages, projectId, tasks]);
+
+  useEffect(() => {
+    const pendingIds = Object.entries(developmentStatuses)
+      .filter(([, result]) => result.github?.ci?.status === "pending")
+      .map(([taskId]) => taskId);
+    if (!pendingIds.length) return;
+    const timer = window.setTimeout(() => {
+      for (const taskId of pendingIds) {
+        const task = tasks.find((item) => item.taskId === taskId);
+        if (task) void loadDevelopmentStatus(task, true);
+      }
+    }, 30_000);
+    return () => window.clearTimeout(timer);
+  }, [developmentStatuses, loadDevelopmentStatus, tasks]);
 
   useEffect(() => {
     showArchivedRef.current = showArchived;
@@ -4287,6 +4434,13 @@ export default function Home() {
                           <DevelopmentResultCard
                             result={developmentByTurn.get(message.turnId)!}
                             onReview={() => void openGitReview()}
+                            refreshing={tasks.some(
+                              (task) => task.turnId === message.turnId && developmentRefreshing[task.taskId],
+                            )}
+                            onRefresh={() => {
+                              const task = tasks.find((item) => item.turnId === message.turnId);
+                              if (task) void loadDevelopmentStatus(task, true);
+                            }}
                           />
                         )}
                       {message.pending && <i className="typing-dot" />}

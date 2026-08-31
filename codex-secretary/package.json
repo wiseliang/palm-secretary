@@ -1,6 +1,6 @@
 {
   "name": "palm-secretary",
-  "version": "0.14.0",
+  "version": "0.15.0",
   "private": true,
   "engines": {
     "node": ">=22.13.0"
@@ -28,6 +28,7 @@
     "test:v018": "node tests/interaction-polish-v018.mjs",
     "test:v019": "node tests/development-result-v019.mjs",
     "test:v020": "node --experimental-strip-types tests/websocket-reconnect-v020.mjs",
+    "test:v021": "node tests/github-pr-ci-v021.mjs",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern dist-server --ignore-pattern .next"
   },
   "dependencies": {

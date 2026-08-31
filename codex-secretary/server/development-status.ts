@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
+import type { GithubDevelopmentStatus } from './github-status.js';
 
 const execFileAsync = promisify(execFile);
 const MAX_GIT_OUTPUT = 4 * 1024 * 1024;
@@ -62,6 +63,7 @@ export type DevelopmentResult = {
     status: 'passed' | 'failed' | 'unverified';
     commands: VerificationCommand[];
   };
+  github?: GithubDevelopmentStatus;
   summary: {
     status: 'ready' | 'unverified' | 'failed' | 'clean' | 'unknown';
     label: string;
