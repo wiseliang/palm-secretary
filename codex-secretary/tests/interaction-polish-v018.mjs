@@ -61,5 +61,8 @@ assert.match(css, /\.project-picker-menu[\s\S]*overflow-x: hidden/);
 assert.match(css, /touch-action: pan-y/);
 assert.match(css, /position: fixed;[\s\S]*right: 12px;[\s\S]*left: 12px/);
 assert.doesNotMatch(css, /\.usage-overview-window small \{ display: none; \}/);
+assert.match(css, /--mobile-topbar-height: 52px; --mobile-tabs-height: 48px/);
+assert.match(css, /padding: calc\(6px \+ env\(safe-area-inset-top\)\) 12px 1px/);
+assert.match(css, /\.mobile-tabs \{ height: var\(--mobile-tabs-height\); padding: 2px 14px 6px; \}/);
 
 console.log("interaction polish v018 passed");
