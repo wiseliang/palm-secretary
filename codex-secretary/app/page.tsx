@@ -255,6 +255,7 @@ type ProjectDialog = {
 declare global {
   interface Window {
     __PALM_SHARED_FILES__?: NativeSharedFile[];
+    __PALM_SHARE_ERROR__?: string;
     __PALM_OPEN_TASK__?: { projectId: string; threadId: string };
     PalmNative?: {
       notifyTask?: (
@@ -3207,6 +3208,7 @@ export default function Home() {
     };
     const errorListener = (event: Event) => {
       const detail = event instanceof CustomEvent ? event.detail : undefined;
+      window.__PALM_SHARE_ERROR__ = undefined;
       setNotice(
         typeof detail === "string" && detail
           ? detail
@@ -3215,6 +3217,12 @@ export default function Home() {
     };
     window.addEventListener("palm-share", listener);
     window.addEventListener("palm-share-error", errorListener);
+    if (window.__PALM_SHARE_ERROR__)
+      errorListener(
+        new CustomEvent("palm-share-error", {
+          detail: window.__PALM_SHARE_ERROR__,
+        }),
+      );
     void consumeSharedFiles();
     return () => {
       window.removeEventListener("palm-share", listener);
