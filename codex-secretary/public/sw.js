@@ -1,4 +1,4 @@
-const CACHE = 'palm-secretary-shell-v10';
+const CACHE = 'palm-secretary-shell-v11';
 const SHELL = ['/', '/manifest.webmanifest', '/icon-192.png', '/icon-512.png'];
 
 self.addEventListener('install', (event) => {
@@ -13,7 +13,15 @@ self.addEventListener('activate', (event) => {
 
 self.addEventListener('fetch', (event) => {
   const url = new URL(event.request.url);
-  if (url.origin !== self.location.origin || url.pathname.startsWith('/api/') || event.request.method !== 'GET') return;
+  // Android exposes externally shared files through a short-lived WebView
+  // request intercepted by MainActivity. A service-worker fetch would bypass
+  // that WebViewClient hook and hit the public server instead, returning 404.
+  if (
+    url.origin !== self.location.origin ||
+    url.pathname.startsWith('/api/') ||
+    url.pathname.startsWith('/__native_share/') ||
+    event.request.method !== 'GET'
+  ) return;
   event.respondWith(fetch(event.request).then((response) => {
     const copy = response.clone();
     caches.open(CACHE).then((cache) => cache.put(event.request, copy));

@@ -26,6 +26,8 @@ import android.webkit.DownloadListener;
 import android.webkit.JavascriptInterface;
 import android.webkit.SslErrorHandler;
 import android.webkit.MimeTypeMap;
+import android.webkit.ServiceWorkerClient;
+import android.webkit.ServiceWorkerController;
 import android.webkit.URLUtil;
 import android.webkit.ValueCallback;
 import android.webkit.WebChromeClient;
@@ -165,6 +167,16 @@ public final class MainActivity extends Activity {
         }
         webView.addJavascriptInterface(new TaskNotificationBridge(), "PalmNative");
 
+        // A registered service worker owns same-origin fetches. Those requests
+        // do not reliably pass through WebViewClient.shouldInterceptRequest,
+        // so expose the native share stream through both interception paths.
+        ServiceWorkerController.getInstance().setServiceWorkerClient(new ServiceWorkerClient() {
+            @Override
+            public WebResourceResponse shouldInterceptRequest(WebResourceRequest request) {
+                return interceptSharedRequest(request.getUrl());
+            }
+        });
+
         webView.setWebViewClient(new WebViewClient() {
             @Override
             public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
@@ -192,34 +204,8 @@ public final class MainActivity extends Activity {
 
             @Override
             public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
-                Uri requestUri = request.getUrl();
-                if (!APP_HOST.equalsIgnoreCase(requestUri.getHost()) || requestUri.getPath() == null || !requestUri.getPath().startsWith("/__native_share/")) {
-                    return super.shouldInterceptRequest(view, request);
-                }
-                String id = requestUri.getLastPathSegment();
-                SharedFile shared;
-                synchronized (sharedFiles) {
-                    shared = sharedFiles.get(id);
-                }
-                if (shared == null) return new WebResourceResponse("text/plain", "UTF-8", 404, "Not Found", new LinkedHashMap<>(), new ByteArrayInputStream(new byte[0]));
-                try {
-                    InputStream input = new DeletingInputStream(new FileInputStream(shared.cacheFile), shared.cacheFile);
-                    synchronized (sharedFiles) {
-                        sharedFiles.remove(id);
-                    }
-                    Map<String, String> headers = new LinkedHashMap<>();
-                    headers.put("Cache-Control", "no-store");
-                    headers.put("Content-Length", Long.toString(shared.size));
-                    headers.put("Content-Disposition", "attachment; filename=\"" + shared.name.replace("\"", "") + "\"");
-                    return new WebResourceResponse(shared.mimeType, null, 200, "OK", headers, input);
-                } catch (Exception error) {
-                    synchronized (sharedFiles) {
-                        sharedFiles.remove(id);
-                    }
-                    shared.cacheFile.delete();
-                    dispatchShareError("无法读取分享文件，请重新分享后再试");
-                    return new WebResourceResponse("text/plain", "UTF-8", 404, "Not Found", new LinkedHashMap<>(), new ByteArrayInputStream(new byte[0]));
-                }
+                WebResourceResponse response = interceptSharedRequest(request.getUrl());
+                return response == null ? super.shouldInterceptRequest(view, request) : response;
             }
 
             @Override
@@ -271,6 +257,37 @@ public final class MainActivity extends Activity {
         });
 
         webView.setDownloadListener(createDownloadListener());
+    }
+
+    private WebResourceResponse interceptSharedRequest(Uri requestUri) {
+        if (requestUri == null
+            || !APP_HOST.equalsIgnoreCase(requestUri.getHost())
+            || requestUri.getPath() == null
+            || !requestUri.getPath().startsWith("/__native_share/")) return null;
+        String id = requestUri.getLastPathSegment();
+        SharedFile shared;
+        synchronized (sharedFiles) {
+            shared = sharedFiles.get(id);
+        }
+        if (shared == null) return new WebResourceResponse("text/plain", "UTF-8", 404, "Not Found", new LinkedHashMap<>(), new ByteArrayInputStream(new byte[0]));
+        try {
+            InputStream input = new DeletingInputStream(new FileInputStream(shared.cacheFile), shared.cacheFile);
+            synchronized (sharedFiles) {
+                sharedFiles.remove(id);
+            }
+            Map<String, String> headers = new LinkedHashMap<>();
+            headers.put("Cache-Control", "no-store");
+            headers.put("Content-Length", Long.toString(shared.size));
+            headers.put("Content-Disposition", "attachment; filename=\"" + shared.name.replace("\"", "") + "\"");
+            return new WebResourceResponse(shared.mimeType, null, 200, "OK", headers, input);
+        } catch (Exception error) {
+            synchronized (sharedFiles) {
+                sharedFiles.remove(id);
+            }
+            shared.cacheFile.delete();
+            dispatchShareError("无法读取分享文件，请重新分享后再试");
+            return new WebResourceResponse("text/plain", "UTF-8", 404, "Not Found", new LinkedHashMap<>(), new ByteArrayInputStream(new byte[0]));
+        }
     }
 
     private void configureNotifications() {
@@ -444,6 +461,8 @@ public final class MainActivity extends Activity {
                 if (uri != null && !incoming.contains(uri)) incoming.add(uri);
             }
         }
+        Uri dataUri = intent.getData();
+        if (dataUri != null && !incoming.contains(dataUri)) incoming.add(dataUri);
         if (incoming.isEmpty()) return;
         ArrayList<Uri> selected = new ArrayList<>(incoming.subList(0, Math.min(10, incoming.size())));
         String fallbackMime = intent.getType();
