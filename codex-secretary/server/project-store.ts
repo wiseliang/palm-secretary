@@ -1,6 +1,14 @@
 import { randomUUID } from 'node:crypto';
 import { access, cp, mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import {
+  aggregateDevelopmentResult,
+  readGitSnapshot,
+  verificationCommand,
+  type DevelopmentResult,
+  type GitSnapshot,
+  type VerificationCommand,
+} from './development-status.js';
 
 export type Project = {
   id: string;
@@ -39,9 +47,13 @@ export type ProjectTask = {
   errorMessage?: string;
   outputBaseline?: Record<string, string>;
   clientRequestId?: string;
+  gitBaseline?: GitSnapshot;
+  verificationCommands?: VerificationCommand[];
+  fileChangeDetected?: boolean;
+  developmentResult?: DevelopmentResult;
 };
 
-type StoreState = { version: 7; projects: Project[]; threads: ProjectThread[]; tasks: ProjectTask[] };
+type StoreState = { version: 8; projects: Project[]; threads: ProjectThread[]; tasks: ProjectTask[] };
 
 const PROJECT_ID = /^[a-z0-9][a-z0-9-]{0,63}$/;
 const UPLOAD_NAME = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}-/i;
@@ -49,7 +61,7 @@ const UPLOAD_NAME = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}
 export class ProjectStore {
   private readonly stateDir: string;
   private readonly stateFile: string;
-  private state: StoreState = { version: 7, projects: [], threads: [], tasks: [] };
+  private state: StoreState = { version: 8, projects: [], threads: [], tasks: [] };
   private writeQueue: Promise<void> = Promise.resolve();
 
   constructor(private readonly workspace: string) {
@@ -60,20 +72,25 @@ export class ProjectStore {
   async initialize(): Promise<void> {
     await mkdir(this.stateDir, { recursive: true, mode: 0o700 });
     try {
-      const parsed = JSON.parse(await readFile(this.stateFile, 'utf8')) as StoreState | (Omit<StoreState, 'version'> & { version: 3 | 4 | 5 | 6 }) | (Omit<StoreState, 'version' | 'tasks'> & { version: 2 });
-      if (![2, 3, 4, 5, 6, 7].includes(parsed.version) || !Array.isArray(parsed.projects) || !Array.isArray(parsed.threads)) throw new Error('版本不兼容');
+      const parsed = JSON.parse(await readFile(this.stateFile, 'utf8')) as StoreState | (Omit<StoreState, 'version'> & { version: 3 | 4 | 5 | 6 | 7 }) | (Omit<StoreState, 'version' | 'tasks'> & { version: 2 });
+      if (![2, 3, 4, 5, 6, 7, 8].includes(parsed.version) || !Array.isArray(parsed.projects) || !Array.isArray(parsed.threads)) throw new Error('版本不兼容');
       const parsedTasks = parsed.version === 2 ? [] : parsed.tasks;
       const tasks: ProjectTask[] = Array.isArray(parsedTasks)
-        ? parsedTasks.map((task: ProjectTask) => ({ ...task, attachments: Array.isArray(task.attachments) ? task.attachments : [], outputPaths: Array.isArray(task.outputPaths) ? task.outputPaths : [] }))
+        ? parsedTasks.map((task: ProjectTask) => ({
+            ...task,
+            attachments: Array.isArray(task.attachments) ? task.attachments : [],
+            outputPaths: Array.isArray(task.outputPaths) ? task.outputPaths : [],
+            verificationCommands: Array.isArray(task.verificationCommands) ? task.verificationCommands : [],
+          }))
         : [];
-      this.state = { version: 7, projects: parsed.projects, threads: parsed.threads, tasks };
-      if (parsed.version !== 7) await this.persist();
+      this.state = { version: 8, projects: parsed.projects, threads: parsed.threads, tasks };
+      if (parsed.version !== 8) await this.persist();
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
         await writeFile(`${this.stateFile}.invalid-${Date.now()}`, await readFile(this.stateFile), { mode: 0o600 }).catch(() => undefined);
       }
       const now = new Date().toISOString();
-      this.state = { version: 7, projects: [{ id: 'default', name: '默认项目', directory: 'default', createdAt: now, updatedAt: now }], threads: [], tasks: [] };
+      this.state = { version: 8, projects: [{ id: 'default', name: '默认项目', directory: 'default', createdAt: now, updatedAt: now }], threads: [], tasks: [] };
       await this.persist();
     }
     if (!this.state.projects.some((project) => project.id === 'default')) {
@@ -101,6 +118,14 @@ export class ProjectStore {
         .map(([name]) => `outbox/${name}`);
       task.status = 'interrupted'; task.updatedAt = interruptedAt; task.completedAt = interruptedAt;
       task.errorMessage = '服务重启时任务仍在运行，请确认结果后再重新执行'; delete task.outputBaseline; recovered = true;
+      const gitAfter = await readGitSnapshot(this.projectWorkdir(task.projectId));
+      task.developmentResult = await aggregateDevelopmentResult(
+        this.projectWorkdir(task.projectId), task.gitBaseline, gitAfter,
+        task.verificationCommands ?? [], Boolean(task.fileChangeDetected), 'interrupted',
+      );
+      delete task.gitBaseline;
+      delete task.verificationCommands;
+      delete task.fileChangeDetected;
     }
     if (recovered) await this.persist();
     await this.migrateLegacyFiles();
@@ -257,7 +282,7 @@ export class ProjectStore {
 
   listTasks(projectId: string): ProjectTask[] {
     this.getProject(projectId);
-    return this.state.tasks.filter((task) => task.projectId === projectId).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)).slice(0, 200);
+    return this.state.tasks.filter((task) => task.projectId === projectId).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)).slice(0, 200).map((task) => this.publicTask(task));
   }
 
   listCompletedTasksSince(since: string): ProjectTask[] {
@@ -267,7 +292,7 @@ export class ProjectStore {
       .filter((task) => task.status !== 'running' && task.completedAt && Date.parse(task.completedAt) > sinceTime)
       .sort((a, b) => (a.completedAt ?? '').localeCompare(b.completedAt ?? ''))
       .slice(0, 500)
-      .map((task) => ({ ...task, attachments: [...task.attachments], outputPaths: [...task.outputPaths] }));
+      .map((task) => this.publicTask(task));
   }
 
   hasRunningTaskForThread(threadId: string, projectId: string): boolean {
@@ -284,7 +309,7 @@ export class ProjectStore {
     return this.snapshotOutbox(projectId);
   }
 
-  async rememberTask(turnId: string, threadId: string, projectId: string, title: string, attachments: string[] = [], outputBaseline?: Record<string, string>, clientRequestId?: string): Promise<ProjectTask> {
+  async rememberTask(turnId: string, threadId: string, projectId: string, title: string, attachments: string[] = [], outputBaseline?: Record<string, string>, clientRequestId?: string, gitBaseline?: GitSnapshot): Promise<ProjectTask> {
     this.assertThreadProject(threadId, projectId);
     const now = new Date().toISOString();
     let task = this.state.tasks.find((item) => item.turnId === turnId);
@@ -293,11 +318,41 @@ export class ProjectStore {
         taskId: turnId, turnId, threadId, projectId,
         title: title.trim().slice(0, 120) || '新任务', status: 'running', startedAt: now, updatedAt: now,
         attachments: [...attachments], outputPaths: [], outputBaseline: outputBaseline ?? await this.snapshotOutbox(projectId), clientRequestId,
+        gitBaseline: gitBaseline ?? await readGitSnapshot(this.projectWorkdir(projectId), false, true), verificationCommands: [],
       };
       this.state.tasks.push(task);
     }
     await this.persist();
     return task;
+  }
+
+  async recordTaskExecution(threadId: string, turnId: string | undefined, itemValue: unknown): Promise<void> {
+    if (!itemValue || typeof itemValue !== 'object') return;
+    const item = itemValue as Record<string, unknown>;
+    const task = turnId
+      ? this.state.tasks.find((entry) => entry.threadId === threadId && entry.turnId === turnId && entry.status === 'running')
+      : [...this.state.tasks].reverse().find((entry) => entry.threadId === threadId && entry.status === 'running');
+    if (!task) return;
+    let changed = false;
+    if (item.type === 'fileChange') {
+      task.fileChangeDetected = true;
+      changed = true;
+    }
+    if (item.type === 'commandExecution') {
+      const verification = verificationCommand(item.command, item.exitCode);
+      if (verification) {
+        const commands = task.verificationCommands ?? [];
+        const existing = commands.findIndex((entry) => entry.command === verification.command);
+        task.verificationCommands = existing < 0
+          ? [...commands, verification]
+          : commands.map((entry, index) => index === existing ? verification : entry);
+        changed = true;
+      }
+    }
+    if (changed) {
+      task.updatedAt = new Date().toISOString();
+      await this.persist();
+    }
   }
 
   async finishTask(threadId: string, turnId: string | undefined, status: ProjectTask['status'], errorMessage?: string): Promise<ProjectTask | undefined> {
@@ -317,9 +372,20 @@ export class ProjectStore {
     task.outputPaths = Object.entries(currentOutputs)
       .filter(([name, signature]) => task.outputBaseline?.[name] !== signature)
       .map(([name]) => `outbox/${name}`);
+    const gitAfter = await readGitSnapshot(this.projectWorkdir(task.projectId));
+    task.developmentResult = await aggregateDevelopmentResult(
+      this.projectWorkdir(task.projectId), task.gitBaseline,
+      gitAfter,
+      task.verificationCommands ?? [],
+      Boolean(task.fileChangeDetected),
+      status === 'interrupted' ? 'interrupted' : status === 'failed' ? 'failed' : 'completed',
+    );
     delete task.outputBaseline;
+    delete task.gitBaseline;
+    delete task.verificationCommands;
+    delete task.fileChangeDetected;
     await this.persist();
-    return { ...task, attachments: [...task.attachments], outputPaths: [...task.outputPaths] };
+    return this.publicTask(task);
   }
 
   async interruptRunningTasks(reason: string, taskIds = this.runningTaskIds()): Promise<number> {
@@ -335,7 +401,18 @@ export class ProjectStore {
       task.outputPaths = Object.entries(currentOutputs)
         .filter(([name, signature]) => task.outputBaseline?.[name] !== signature)
         .map(([name]) => `outbox/${name}`);
+      const gitAfter = await readGitSnapshot(this.projectWorkdir(task.projectId));
+      task.developmentResult = await aggregateDevelopmentResult(
+        this.projectWorkdir(task.projectId), task.gitBaseline,
+        gitAfter,
+        task.verificationCommands ?? [],
+        Boolean(task.fileChangeDetected),
+        'interrupted',
+      );
       delete task.outputBaseline;
+      delete task.gitBaseline;
+      delete task.verificationCommands;
+      delete task.fileChangeDetected;
     }
     if (tasks.length) await this.persist();
     return tasks.length;
@@ -344,6 +421,15 @@ export class ProjectStore {
   assertThreadProject(threadId: string, projectId: string): void {
     const thread = this.state.threads.find((item) => item.threadId === threadId);
     if (!thread || thread.projectId !== projectId) throw new Error('该对话不属于当前项目');
+  }
+
+  private publicTask(task: ProjectTask): ProjectTask {
+    const visible = { ...task };
+    delete visible.outputBaseline;
+    delete visible.gitBaseline;
+    delete visible.verificationCommands;
+    delete visible.fileChangeDetected;
+    return { ...visible, attachments: [...task.attachments], outputPaths: [...task.outputPaths] };
   }
 
   async rememberThread(threadId: string, projectId: string, title: string): Promise<ProjectThread> {

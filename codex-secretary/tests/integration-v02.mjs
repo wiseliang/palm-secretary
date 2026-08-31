@@ -150,7 +150,7 @@ try {
   const defaultTasks = (await (await api('/api/tasks?projectId=default')).json()).tasks;
   if (defaultTasks.length !== 0) throw new Error('任务记录跨项目泄露');
   const migratedState = JSON.parse(await readFile(path.join(workspace, '.palm', 'state.json'), 'utf8'));
-  if (migratedState.version !== 7 || !Array.isArray(migratedState.tasks)) throw new Error('旧状态未迁移为 v7');
+  if (migratedState.version !== 8 || !Array.isArray(migratedState.tasks)) throw new Error('旧状态未迁移为 v8');
 
   const requests = (await readFile(logFile, 'utf8')).trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
   const threadStart = requests.find((request) => request.method === 'thread/start');

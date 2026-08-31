@@ -36,6 +36,11 @@ import {
   UploadSimple,
   X,
 } from "@phosphor-icons/react";
+import {
+  socketIsReusable,
+  socketNeedsResumeReconnect,
+  websocketReconnectDelay,
+} from "./websocket-reconnect";
 
 type ExecutionStep = {
   id: string;
@@ -45,6 +50,7 @@ type ExecutionStep = {
 };
 type ChatMessage = {
   id: string;
+  turnId?: string;
   role: "user" | "assistant";
   text: string;
   pending?: boolean;
@@ -86,6 +92,34 @@ type ProjectTask = {
   attachments: string[];
   outputPaths: string[];
   errorMessage?: string;
+  developmentResult?: DevelopmentResult;
+};
+type DevelopmentResult = {
+  detected: boolean;
+  git: {
+    available: boolean;
+    error?: string;
+    branch?: string;
+    detached?: boolean;
+    dirty?: boolean;
+    changedFiles?: number;
+    additions?: number;
+    deletions?: number;
+    deltaComplete?: boolean;
+    commit?: { sha: string; message: string };
+  };
+  verification: {
+    status: "passed" | "failed" | "unverified";
+    commands: Array<{
+      command: string;
+      status: "passed" | "failed";
+      exitCode: number;
+    }>;
+  };
+  summary: {
+    status: "ready" | "unverified" | "failed" | "clean" | "unknown";
+    label: string;
+  };
 };
 type CodexModel = {
   id: string;
@@ -933,6 +967,113 @@ function mergeExecutionStep(
       );
 }
 
+function DevelopmentResultCard({
+  result,
+  onReview,
+}: {
+  result: DevelopmentResult;
+  onReview: () => void;
+}) {
+  if (!result.detected || result.summary.status === "clean") return null;
+  const verificationLabel =
+    result.verification.status === "passed"
+      ? "验证通过"
+      : result.verification.status === "failed"
+        ? "验证失败"
+        : "尚未验证";
+  return (
+    <section
+      className={`development-result-card ${result.summary.status}`}
+      aria-label="开发结果"
+    >
+      <header>
+        <div>
+          <small>本次执行</small>
+          <strong>开发结果</strong>
+        </div>
+        <span>
+          {result.summary.status === "ready"
+            ? "可提交"
+            : result.summary.status === "failed"
+              ? "需处理"
+              : result.summary.status === "unknown"
+                ? "待确认"
+                : "待验证"}
+        </span>
+      </header>
+      <div className="development-result-grid">
+        <div>
+          <small>代码变更</small>
+          {result.git.available && result.git.deltaComplete !== false ? (
+            <strong>
+              {result.git.changedFiles ?? 0} 个文件 · +{result.git.additions ?? 0} / -
+              {result.git.deletions ?? 0}
+            </strong>
+          ) : result.git.available ? (
+            <strong>本次变更统计暂时不可用</strong>
+          ) : (
+            <strong>Git 状态暂时无法读取</strong>
+          )}
+        </div>
+        <div>
+          <small>验证</small>
+          <strong>
+            {verificationLabel}{" "}
+            {result.verification.status === "passed"
+              ? "✓"
+              : result.verification.status === "failed"
+                ? "×"
+                : "!"}
+          </strong>
+        </div>
+        <div className="development-git-summary">
+          <small>Git</small>
+          {result.git.available ? (
+            <>
+              <strong>{result.git.detached ? "detached HEAD" : result.git.branch ?? "未知分支"}</strong>
+              <span>
+                {result.git.commit
+                  ? `最新提交 ${result.git.commit.sha.slice(0, 7)} · ${result.git.commit.message || "无提交说明"}`
+                  : "仓库还没有提交"}
+                {result.git.dirty ? " · 有未提交修改" : " · 工作区干净"}
+              </span>
+            </>
+          ) : (
+            <span>{result.git.error ?? "Git 状态暂时无法读取"}</span>
+          )}
+        </div>
+      </div>
+      {result.verification.commands.length ? (
+        <details className="development-verification-details">
+          <summary>验证命令</summary>
+          <div>
+            {result.verification.commands.map((command, index) => (
+              <code key={`${command.command}-${index}`}>
+                <b>{command.status === "passed" ? "✓" : "×"}</b>
+                {command.command}
+              </code>
+            ))}
+          </div>
+        </details>
+      ) : (
+        <p className="development-unverified-note">本次未检测到测试或构建验证</p>
+      )}
+      <footer>
+        <div>
+          <small>结论</small>
+          <strong>{result.summary.label}</strong>
+        </div>
+        {result.git.available && (
+          <button type="button" onClick={onReview}>
+            <GitDiff size={16} />
+            查看修改
+          </button>
+        )}
+      </footer>
+    </section>
+  );
+}
+
 function messagesFromThread(value: unknown): ChatMessage[] {
   const root = (value && typeof value === "object" ? value : {}) as Record<
     string,
@@ -944,6 +1085,9 @@ function messagesFromThread(value: unknown): ChatMessage[] {
   const turns = Array.isArray(thread.turns) ? thread.turns : [];
   const result: ChatMessage[] = [];
   for (const turn of turns) {
+    const turnId = turn && typeof turn === "object" && typeof (turn as Record<string, unknown>).id === "string"
+      ? (turn as Record<string, unknown>).id as string
+      : undefined;
     const turnStart = result.length;
     let turnSteps: ExecutionStep[] = [];
     const items =
@@ -966,13 +1110,14 @@ function messagesFromThread(value: unknown): ChatMessage[] {
         const parsed = parseUserMessage(text);
         result.push({
           id: crypto.randomUUID(),
+          turnId,
           role: "user",
           text: parsed.text,
           attachments: parsed.attachments,
         });
       }
       if (type === "agentMessage")
-        result.push({ id: crypto.randomUUID(), role: "assistant", text });
+        result.push({ id: crypto.randomUUID(), turnId, role: "assistant", text });
     }
     if (turnSteps.length) {
       const assistantIndex = result.findLastIndex(
@@ -1048,6 +1193,7 @@ export default function Home() {
   const runningRef = useRef(false);
   const pendingTurnRef = useRef<PendingTurn>();
   const reconnectRef = useRef<number>();
+  const reconnectAttemptRef = useRef(0);
   const reconnectNowRef = useRef<() => void>(() => undefined);
   const fileRef = useRef<HTMLInputElement>(null);
   const imageFileRef = useRef<HTMLInputElement>(null);
@@ -1067,6 +1213,11 @@ export default function Home() {
     activeProject?.reasoningEffort ?? activeModel?.defaultReasoningEffort ?? "";
   const projectRunningTask = tasks.find((task) => task.status === "running");
   const projectBusy = running || Boolean(projectRunningTask);
+  const developmentByTurn = new Map(
+    tasks
+      .filter((task) => task.developmentResult?.detected)
+      .map((task) => [task.turnId, task.developmentResult as DevelopmentResult]),
+  );
   const recentOutputs = files
     .filter((file) => file.path.startsWith("outbox/"))
     .slice(0, 3);
@@ -1573,7 +1724,26 @@ export default function Home() {
   useEffect(() => {
     if (!authenticated) return;
     let disposed = false;
+    const clearReconnectTimer = () => {
+      if (!reconnectRef.current) return;
+      window.clearTimeout(reconnectRef.current);
+      reconnectRef.current = undefined;
+    };
+    const scheduleReconnect = () => {
+      if (disposed || reconnectRef.current) return;
+      const attempt = reconnectAttemptRef.current;
+      reconnectAttemptRef.current += 1;
+      const delay = websocketReconnectDelay(attempt);
+      reconnectRef.current = window.setTimeout(() => {
+        reconnectRef.current = undefined;
+        connect();
+      }, delay);
+    };
     const connect = () => {
+      if (disposed) return;
+      const current = socketRef.current;
+      if (socketIsReusable(current?.readyState)) return;
+      clearReconnectTimer();
       setConnection(socketRef.current ? "正在重连" : "连接中");
       const protocol = location.protocol === "https:" ? "wss:" : "ws:";
       const socketHost =
@@ -1583,6 +1753,11 @@ export default function Home() {
       const socket = new WebSocket(`${protocol}//${socketHost}/api/ws`);
       socketRef.current = socket;
       socket.onopen = () => {
+        if (disposed || socketRef.current !== socket) {
+          socket.close();
+          return;
+        }
+        reconnectAttemptRef.current = 0;
         setConnection("已连接");
         if (threadIdRef.current) {
           socket.send(
@@ -1622,22 +1797,30 @@ export default function Home() {
         void recoverFinishedTasks();
       };
       reconnectNowRef.current = () => {
-        if (
-          disposed ||
-          socketRef.current?.readyState === WebSocket.OPEN ||
-          socketRef.current?.readyState === WebSocket.CONNECTING
-        )
-          return;
-        if (reconnectRef.current) window.clearTimeout(reconnectRef.current);
+        if (disposed) return;
+        const activeSocket = socketRef.current;
+        if (socketIsReusable(activeSocket?.readyState)) return;
+        clearReconnectTimer();
         connect();
       };
-      socket.onclose = () => {
-        if (!disposed) {
-          setConnection("正在重连");
-          reconnectRef.current = window.setTimeout(connect, 1800);
+      socket.onerror = () => {
+        if (socketRef.current === socket) setConnection("正在重连");
+      };
+      socket.onclose = (event) => {
+        if (disposed || socketRef.current !== socket) return;
+        socketRef.current = null;
+        setConnection("正在重连");
+        if (event.code || event.reason) {
+          console.info("Palm WebSocket closed", {
+            code: event.code,
+            reason: event.reason,
+            clean: event.wasClean,
+          });
         }
+        scheduleReconnect();
       };
       socket.onmessage = (event) => {
+        if (disposed || socketRef.current !== socket) return;
         let message: {
           type: string;
           threadId?: string;
@@ -1669,7 +1852,16 @@ export default function Home() {
           threadIdRef.current = message.threadId;
           setThreadId(message.threadId);
           const turn = (message.payload?.turn ?? {}) as { id?: string };
-          if (turn.id) setTurnId(turn.id);
+          if (turn.id) {
+            setTurnId(turn.id);
+            setMessages((items) =>
+              items.map((item) =>
+                item.role === "assistant" && item.pending && !item.turnId
+                  ? { ...item, turnId: turn.id }
+                  : item,
+              ),
+            );
+          }
           void loadProjectData(projectId);
           return;
         }
@@ -1883,9 +2075,11 @@ export default function Home() {
     connect();
     return () => {
       disposed = true;
-      if (reconnectRef.current) window.clearTimeout(reconnectRef.current);
-      socketRef.current?.close();
+      clearReconnectTimer();
+      reconnectAttemptRef.current = 0;
+      const activeSocket = socketRef.current;
       socketRef.current = null;
+      activeSocket?.close(1000, "页面连接已更新");
     };
   }, [
     authenticated,
@@ -1922,10 +2116,8 @@ export default function Home() {
       if (document.visibilityState !== "visible") return;
       if (syncing) return;
       syncing = true;
-      if (socketRef.current?.readyState !== WebSocket.OPEN) {
-        try {
-          socketRef.current?.close();
-        } catch {}
+      const socketState = socketRef.current?.readyState;
+      if (socketNeedsResumeReconnect(socketState)) {
         reconnectNowRef.current();
       }
       void loadDashboard();
@@ -4089,6 +4281,14 @@ export default function Home() {
                           ))}
                         </div>
                       ) : null}
+                      {message.role === "assistant" &&
+                        message.turnId &&
+                        developmentByTurn.get(message.turnId) && (
+                          <DevelopmentResultCard
+                            result={developmentByTurn.get(message.turnId)!}
+                            onReview={() => void openGitReview()}
+                          />
+                        )}
                       {message.pending && <i className="typing-dot" />}
                       {message.role === "assistant" &&
                         message.text &&

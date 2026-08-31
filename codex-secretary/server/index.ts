@@ -15,6 +15,7 @@ import { config } from './config.js';
 import { createSession, verifyPassword, verifySession } from './auth.js';
 import { CodexBridge } from './app-server.js';
 import { ProjectStore } from './project-store.js';
+import { readGitSnapshot } from './development-status.js';
 
 const app = Fastify({ logger: { level: process.env.LOG_LEVEL ?? 'info' }, trustProxy: '127.0.0.1' });
 const bridge = new CodexBridge();
@@ -167,9 +168,18 @@ bridge.on('message', async (message: Record<string, unknown>) => {
   }
   const params = message.params as { threadId?: unknown } | undefined;
   const threadId = typeof params?.threadId === 'string' ? params.threadId : undefined;
+  const paramsRecord = params as Record<string, unknown> | undefined;
+  const eventTurn = paramsRecord && typeof paramsRecord.turn === 'object' ? paramsRecord.turn as Record<string, unknown> : undefined;
+  const eventTurnId = typeof eventTurn?.id === 'string'
+    ? eventTurn.id
+    : typeof paramsRecord?.turnId === 'string' ? paramsRecord.turnId : undefined;
+  if (threadId && message.method === 'item/completed') {
+    await projects.recordTaskExecution(threadId, eventTurnId, paramsRecord?.item).catch((error) => {
+      app.log.warn({ err: error }, '任务执行记录写入失败');
+    });
+  }
   if (threadId && typeof message.method === 'string' && ['turn/completed', 'turn/failed', 'turn/interrupted'].includes(message.method)) {
-    const turn = params && typeof (params as Record<string, unknown>).turn === 'object' ? (params as Record<string, unknown>).turn as Record<string, unknown> : undefined;
-    const turnId = typeof turn?.id === 'string' ? turn.id : typeof (params as Record<string, unknown> | undefined)?.turnId === 'string' ? (params as Record<string, unknown>).turnId as string : undefined;
+    const turnId = eventTurnId;
     const status = message.method === 'turn/completed' ? 'completed' : message.method === 'turn/interrupted' ? 'interrupted' : 'failed';
     const failure = params && typeof (params as Record<string, unknown>).error === 'object'
       ? (params as Record<string, unknown>).error as Record<string, unknown> : undefined;
@@ -466,7 +476,7 @@ app.put<{ Params: { id: string } }>('/api/projects/:id/model', async (request, r
 async function projectGitRoot(projectId: string): Promise<string | undefined> {
   const root = projects.projectWorkdir(projectId);
   for (const candidate of [root]) {
-    if ((await stat(path.join(candidate, '.git')).catch(() => null))?.isDirectory()) return candidate;
+    if (await stat(path.join(candidate, '.git')).catch(() => null)) return candidate;
   }
   return undefined;
 }
@@ -483,24 +493,34 @@ app.get<{ Params: { id: string } }>('/api/projects/:id/git', async (request, rep
   try {
     const root = await projectGitRoot(request.params.id);
     if (!root) return { repository: false, changes: [], diff: '' };
-    const [branch, statusText, unstagedDiff, stagedDiff] = await Promise.all([
-      git(request.params.id, ['branch', '--show-current']), git(request.params.id, ['status', '--porcelain=v1', '-z']),
-      git(request.params.id, ['diff', '--no-ext-diff', '--unified=3']), git(request.params.id, ['diff', '--cached', '--no-ext-diff', '--unified=3']),
-    ]);
-    const entries = statusText.split('\0').filter(Boolean);
-    const changes: Array<{ status: string; indexStatus: string; worktreeStatus: string; path: string; originalPath?: string }> = [];
-    for (let index = 0; index < entries.length; index += 1) {
-      const entry = entries[index];
-      const indexStatus = entry[0] ?? ' ';
-      const worktreeStatus = entry[1] ?? ' ';
-      const filePath = entry.slice(3);
-      const renamed = indexStatus === 'R' || indexStatus === 'C' || worktreeStatus === 'R' || worktreeStatus === 'C';
-      const originalPath = renamed ? entries[++index] : undefined;
-      changes.push({ status: `${indexStatus}${worktreeStatus}`, indexStatus, worktreeStatus, path: filePath, ...(originalPath ? { originalPath } : {}) });
-    }
+    const snapshot = await readGitSnapshot(root, true);
+    if (!snapshot.available) return { repository: false, changes: [], diff: '', error: snapshot.error };
+    const changes = snapshot.changes ?? [];
     const untracked = changes.filter((change) => change.status === '??').map((change) => change.path);
-    return { projectId: request.params.id, repository: true, branch: branch || 'detached', changes, untracked, unstagedDiff: unstagedDiff.slice(0, 1_000_000), stagedDiff: stagedDiff.slice(0, 1_000_000) };
+    return {
+      projectId: request.params.id,
+      repository: true,
+      branch: snapshot.detached ? 'detached HEAD' : snapshot.branch,
+      changes,
+      untracked,
+      unstagedDiff: snapshot.unstagedDiff,
+      stagedDiff: snapshot.stagedDiff,
+    };
   } catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : 'Git 状态读取失败' }); }
+});
+
+app.get<{ Params: { id: string }; Querystring: { taskId?: string } }>('/api/projects/:id/development-status', async (request, reply) => {
+  if (!requireOwner(request, reply)) return;
+  try {
+    const tasks = projects.listTasks(request.params.id);
+    const task = request.query.taskId
+      ? tasks.find((item) => item.taskId === request.query.taskId)
+      : tasks.find((item) => item.developmentResult);
+    if (!task?.developmentResult) return reply.code(404).send({ error: '暂时没有可用的开发结果' });
+    return { taskId: task.taskId, developmentStatus: task.developmentResult };
+  } catch (error) {
+    return reply.code(400).send({ error: error instanceof Error ? error.message : '开发状态读取失败' });
+  }
 });
 
 app.post<{ Params: { id: string } }>('/api/projects/:id/git', async (request, reply) => {
@@ -854,6 +874,7 @@ app.get('/api/ws', { websocket: true }, (socket, request) => {
         if (imageExtensions.has(path.extname(filePath).toLowerCase())) input.push({ type: 'localImage', path: filePath, detail: 'auto' });
       }
       const outputBaseline = await projects.outputBaseline(message.projectId);
+      const gitBaseline = await readGitSnapshot(projectRoot, false, true);
       const turn = await bridge.call('turn/start', {
         threadId,
         input,
@@ -863,7 +884,7 @@ app.get('/api/ws', { websocket: true }, (socket, request) => {
         approvalPolicy: 'never',
         sandboxPolicy: { type: 'dangerFullAccess' },
       }) as { turn?: { id?: string } };
-      if (turn.turn?.id) await projects.rememberTask(turn.turn.id, threadId, message.projectId, message.text, message.attachments ?? [], outputBaseline, requestId);
+      if (turn.turn?.id) await projects.rememberTask(turn.turn.id, threadId, message.projectId, message.text, message.attachments ?? [], outputBaseline, requestId, gitBaseline);
       const accepted: TurnAcceptance = { threadId, payload: turn, clientRequestId: requestId };
       settlePending(accepted);
       socket.send(JSON.stringify({ type: 'turn.accepted', ...accepted }));

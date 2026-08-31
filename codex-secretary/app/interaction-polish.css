@@ -1,4 +1,4 @@
-/* v0.13.9 - resilient dialogs and timestamped usage visibility. */
+/* v0.14.0 - resilient interactions and per-turn development results. */
 .mobile-identity { display: none; }
 .mobile-menu-only { display: none !important; }
 .topbar .project-add::before { content: none !important; }
@@ -179,6 +179,37 @@
 .usage-overview > button { display: grid; place-items: center; width: 36px; height: 36px; padding: 0; border: 0; border-radius: var(--radius-control); background: transparent; color: var(--accent); cursor: pointer; }
 .usage-overview > button:hover { background: var(--accent-soft); }
 
+.development-result-card {
+  display: grid; gap: 13px; width: min(100%, 620px); margin-top: 16px; padding: 16px;
+  border: 1px solid color-mix(in srgb, var(--accent) 22%, var(--line)); border-radius: var(--radius-card);
+  background: color-mix(in srgb, var(--accent-soft) 34%, var(--surface)); box-shadow: 0 10px 30px rgba(31, 50, 87, .07);
+  color: var(--ink); overflow: hidden;
+}
+.development-result-card.failed { border-color: color-mix(in srgb, #b54a40 34%, var(--line)); background: color-mix(in srgb, #fff0ed 56%, var(--surface)); }
+.development-result-card.unverified, .development-result-card.unknown { border-color: color-mix(in srgb, var(--warning) 32%, var(--line)); background: color-mix(in srgb, #fbf5e8 54%, var(--surface)); }
+.development-result-card > header, .development-result-card > footer { display: flex; align-items: center; justify-content: space-between; gap: 14px; }
+.development-result-card > header > div, .development-result-card > footer > div { display: grid; min-width: 0; gap: 2px; }
+.development-result-card > header small, .development-result-card > footer small, .development-result-grid small { color: var(--muted); font-size: 9px; font-weight: 700; letter-spacing: .04em; }
+.development-result-card > header strong { font-size: 15px; }
+.development-result-card > header > span { padding: 5px 8px; border-radius: 999px; background: var(--accent-soft); color: var(--accent); font-size: 9px; font-weight: 800; }
+.development-result-card.failed > header > span { background: #f4e5e1; color: #a34238; }
+.development-result-card.unverified > header > span, .development-result-card.unknown > header > span { background: #f3ead8; color: #8b653d; }
+.development-result-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.development-result-grid > div { display: grid; min-width: 0; gap: 4px; padding: 10px; border: 1px solid var(--line); border-radius: var(--radius-control); background: color-mix(in srgb, var(--surface-strong) 82%, transparent); }
+.development-result-grid strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
+.development-result-grid span { overflow: hidden; color: var(--muted); text-overflow: ellipsis; white-space: nowrap; font-size: 9px; }
+.development-git-summary { grid-column: 1 / -1; }
+.development-verification-details { border-top: 1px solid var(--line); padding-top: 10px; }
+.development-verification-details summary { width: fit-content; color: var(--muted); cursor: pointer; font-size: 10px; font-weight: 700; }
+.development-verification-details > div { display: grid; gap: 5px; margin-top: 8px; }
+.development-verification-details code { display: grid; grid-template-columns: 15px minmax(0, 1fr); gap: 5px; min-width: 0; padding: 7px 8px; border-radius: 8px; background: color-mix(in srgb, var(--surface-strong) 80%, transparent); color: var(--muted); overflow-wrap: anywhere; font-size: 9px; line-height: 1.45; }
+.development-verification-details code b { color: var(--accent); }
+.development-result-card.failed .development-verification-details code b { color: #a34238; }
+.development-unverified-note { margin: -2px 0 0; color: var(--muted); font-size: 10px; }
+.development-result-card > footer { padding-top: 11px; border-top: 1px solid var(--line); }
+.development-result-card > footer strong { font-size: 11px; line-height: 1.45; }
+.development-result-card > footer button { display: inline-flex; align-items: center; justify-content: center; flex: none; gap: 6px; min-height: 38px; padding: 0 11px; border: 0; border-radius: var(--radius-control); background: var(--accent); color: #fff; font-size: 10px; font-weight: 750; }
+
 .attachment-sheet {
   position: fixed;
   z-index: 92;
@@ -264,6 +295,11 @@
   .usage-overview-window { column-gap: 4px; padding-inline: 7px; }
   .usage-overview-window strong { font-size: 13px; }
   .usage-overview-window small { display: none; }
+  .development-result-card { gap: 11px; width: 100%; margin-top: 13px; padding: 13px; }
+  .development-result-grid { grid-template-columns: minmax(0, 1fr); }
+  .development-git-summary { grid-column: auto; }
+  .development-result-card > footer { align-items: stretch; flex-direction: column; }
+  .development-result-card > footer button { width: 100%; }
 }
 
 @media (max-width: 520px) {
