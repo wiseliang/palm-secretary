@@ -19,6 +19,11 @@ assert.match(manifest, /android\.intent\.action\.SEND/, 'Android 必须注册单
 assert.match(manifest, /android\.intent\.action\.SEND_MULTIPLE/, 'Android 必须注册多文件分享');
 assert.match(android, /shouldInterceptRequest/, 'Android 必须提供受控文件流');
 assert.match(android, /dispatchSharedFiles/, 'Android 必须把分享事件交给网页');
+assert.match(android, /cacheSharedFile/, 'Android 必须在分享授权失效前复制到私有缓存');
+assert.match(android, /new FileInputStream\(shared\.cacheFile\)/, 'WebView 必须读取稳定的私有缓存文件');
+assert.match(android, /MAX_SHARED_FILE_BYTES/, '原生分享必须限制文件大小');
+assert.doesNotMatch(android, /openInputStream\(shared\.uri\)/, '网页请求阶段不得继续依赖外部临时 URI');
+assert.match(page, /__PALM_SHARE_ERROR__/, '网页必须接收页面加载前发生的原生分享错误');
 assert.match(android, /palm-resume/, 'Android 恢复时必须触发网页同步');
 
 console.log('PALM_V08_RESUME_SHARE_OK');

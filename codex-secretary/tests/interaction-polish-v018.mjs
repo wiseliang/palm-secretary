@@ -54,7 +54,12 @@ assert.match(page, /className="usage-overview"/);
 assert.match(page, /className="usage-overview-window"/);
 assert.doesNotMatch(page, /className="usage-popover"/);
 assert.match(css, /grid-template-columns: auto minmax\(0, 1fr\) 38px/);
-assert.match(page, /setUsageUpdatedAt\(Date\.now\(\)\)/);
-assert.match(page, /更新于 \$\{new Date\(usageUpdatedAt\)\.toLocaleTimeString/);
+assert.doesNotMatch(page, /usageUpdatedAt|更新于 \$\{new Date/);
+assert.match(page, /setUsageClock\(Date\.now\(\)\)/);
+assert.match(page, /resetLabel\(window\.resetAt, usageClock\)/);
+assert.match(css, /\.project-picker-menu[\s\S]*overflow-x: hidden/);
+assert.match(css, /touch-action: pan-y/);
+assert.match(css, /position: fixed;[\s\S]*right: 12px;[\s\S]*left: 12px/);
+assert.doesNotMatch(css, /\.usage-overview-window small \{ display: none; \}/);
 
 console.log("interaction polish v018 passed");

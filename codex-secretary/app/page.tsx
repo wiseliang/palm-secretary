@@ -255,6 +255,7 @@ type ProjectDialog = {
 declare global {
   interface Window {
     __PALM_SHARED_FILES__?: NativeSharedFile[];
+    __PALM_SHARE_ERROR__?: string;
     __PALM_OPEN_TASK__?: { projectId: string; threadId: string };
     PalmNative?: {
       notifyTask?: (
@@ -390,9 +391,9 @@ function usageWindowsFrom(value: unknown): UsageWindow[] {
     );
 }
 
-function resetLabel(resetAt?: number): string {
+function resetLabel(resetAt?: number, now = Date.now()): string {
   if (!resetAt) return "重置时间待同步";
-  const remainingMs = resetAt - Date.now();
+  const remainingMs = resetAt - now;
   if (remainingMs <= 0) return "即将重置";
   const hours = Math.floor(remainingMs / 3_600_000);
   const minutes = Math.ceil((remainingMs % 3_600_000) / 60_000);
@@ -1253,7 +1254,7 @@ export default function Home() {
   const [attachments, setAttachments] = useState<UploadedFile[]>([]);
   const [status, setStatus] = useState<ServerStatus>({});
   const [usageWindows, setUsageWindows] = useState<UsageWindow[]>([]);
-  const [usageUpdatedAt, setUsageUpdatedAt] = useState<number>();
+  const [usageClock, setUsageClock] = useState(() => Date.now());
   const [runtimeOpen, setRuntimeOpen] = useState(false);
   const [openMenu, setOpenMenu] = useState<OpenMenu>();
   const [projectDialog, setProjectDialog] = useState<ProjectDialog>();
@@ -1480,9 +1481,15 @@ export default function Home() {
         usage?: unknown;
       };
       setUsageWindows(usageWindowsFrom(value.rateLimits ?? value.usage));
-      setUsageUpdatedAt(Date.now());
+      setUsageClock(Date.now());
     }
   }, []);
+
+  useEffect(() => {
+    if (!authenticated) return;
+    const timer = window.setInterval(() => setUsageClock(Date.now()), 60_000);
+    return () => window.clearInterval(timer);
+  }, [authenticated]);
 
   const loadProjects = useCallback(async () => {
     const response = await fetch("/api/projects");
@@ -3201,6 +3208,7 @@ export default function Home() {
     };
     const errorListener = (event: Event) => {
       const detail = event instanceof CustomEvent ? event.detail : undefined;
+      window.__PALM_SHARE_ERROR__ = undefined;
       setNotice(
         typeof detail === "string" && detail
           ? detail
@@ -3209,6 +3217,12 @@ export default function Home() {
     };
     window.addEventListener("palm-share", listener);
     window.addEventListener("palm-share-error", errorListener);
+    if (window.__PALM_SHARE_ERROR__)
+      errorListener(
+        new CustomEvent("palm-share-error", {
+          detail: window.__PALM_SHARE_ERROR__,
+        }),
+      );
     void consumeSharedFiles();
     return () => {
       window.removeEventListener("palm-share", listener);
@@ -3752,17 +3766,7 @@ export default function Home() {
           >
             <div className="usage-overview-title">
               <Gauge size={17} weight="bold" />
-              <div>
-                <span>Codex 用量</span>
-                <small>
-                  {usageUpdatedAt
-                    ? `更新于 ${new Date(usageUpdatedAt).toLocaleTimeString(
-                        "zh-CN",
-                        { hour: "2-digit", minute: "2-digit" },
-                      )}`
-                    : "尚未刷新"}
-                </small>
-              </div>
+              <span>Codex 用量</span>
             </div>
             <div className="usage-overview-windows">
               {usageWindows.length ? (
@@ -3770,11 +3774,11 @@ export default function Home() {
                   <div
                     className="usage-overview-window"
                     key={window.id}
-                    title={resetLabel(window.resetAt)}
+                    title={resetLabel(window.resetAt, usageClock)}
                   >
                     <span>{window.label}</span>
                     <strong>{window.remainingPercent}%</strong>
-                    <small>{resetLabel(window.resetAt)}</small>
+                    <small>{resetLabel(window.resetAt, usageClock)}</small>
                   </div>
                 ))
               ) : (

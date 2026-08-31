@@ -43,10 +43,17 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.UUID;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.FilterInputStream;
+import java.io.IOException;
 import java.io.InputStream;
 import java.io.ByteArrayInputStream;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -61,28 +68,62 @@ public final class MainActivity extends Activity {
     private static final String TASK_CHANNEL_ID = "palm_tasks";
     private static final String EXTRA_PROJECT_ID = "palm_project_id";
     private static final String EXTRA_THREAD_ID = "palm_thread_id";
+    private static final long MAX_SHARED_FILE_BYTES = 95L * 1024L * 1024L;
 
     private WebView webView;
     private ProgressBar progress;
     private ValueCallback<Uri[]> fileCallback;
     private boolean resumed;
+    private volatile boolean pageReady;
     private String pendingProjectId;
     private String pendingThreadId;
     private final Map<String, SharedFile> sharedFiles = new LinkedHashMap<>();
+    private final ExecutorService shareExecutor = Executors.newSingleThreadExecutor();
+    private volatile String pendingShareError;
 
     private static final class SharedFile {
         final String id;
-        final Uri uri;
+        final File cacheFile;
         final String name;
         final String mimeType;
         final long size;
 
-        SharedFile(String id, Uri uri, String name, String mimeType, long size) {
+        SharedFile(String id, File cacheFile, String name, String mimeType, long size) {
             this.id = id;
-            this.uri = uri;
+            this.cacheFile = cacheFile;
             this.name = name;
             this.mimeType = mimeType;
             this.size = size;
+        }
+    }
+
+    private static final class SharedFileInfo {
+        final String name;
+        final String mimeType;
+        final long size;
+
+        SharedFileInfo(String name, String mimeType, long size) {
+            this.name = name;
+            this.mimeType = mimeType;
+            this.size = size;
+        }
+    }
+
+    private static final class DeletingInputStream extends FilterInputStream {
+        private final File file;
+
+        DeletingInputStream(InputStream input, File file) {
+            super(input);
+            this.file = file;
+        }
+
+        @Override
+        public void close() throws IOException {
+            try {
+                super.close();
+            } finally {
+                if (file.exists()) file.delete();
+            }
         }
     }
 
@@ -135,14 +176,17 @@ public final class MainActivity extends Activity {
 
             @Override
             public void onPageStarted(WebView view, String url, Bitmap favicon) {
+                pageReady = false;
                 progress.setVisibility(View.VISIBLE);
             }
 
             @Override
             public void onPageFinished(WebView view, String url) {
+                pageReady = true;
                 progress.setVisibility(View.GONE);
                 CookieManager.getInstance().flush();
                 dispatchSharedFiles();
+                if (pendingShareError != null) dispatchShareError(pendingShareError);
                 dispatchTaskTarget();
             }
 
@@ -155,16 +199,25 @@ public final class MainActivity extends Activity {
                 String id = requestUri.getLastPathSegment();
                 SharedFile shared;
                 synchronized (sharedFiles) {
-                    shared = sharedFiles.remove(id);
+                    shared = sharedFiles.get(id);
                 }
                 if (shared == null) return new WebResourceResponse("text/plain", "UTF-8", 404, "Not Found", new LinkedHashMap<>(), new ByteArrayInputStream(new byte[0]));
                 try {
-                    InputStream input = getContentResolver().openInputStream(shared.uri);
+                    InputStream input = new DeletingInputStream(new FileInputStream(shared.cacheFile), shared.cacheFile);
+                    synchronized (sharedFiles) {
+                        sharedFiles.remove(id);
+                    }
                     Map<String, String> headers = new LinkedHashMap<>();
                     headers.put("Cache-Control", "no-store");
+                    headers.put("Content-Length", Long.toString(shared.size));
                     headers.put("Content-Disposition", "attachment; filename=\"" + shared.name.replace("\"", "") + "\"");
                     return new WebResourceResponse(shared.mimeType, null, 200, "OK", headers, input);
                 } catch (Exception error) {
+                    synchronized (sharedFiles) {
+                        sharedFiles.remove(id);
+                    }
+                    shared.cacheFile.delete();
+                    dispatchShareError("无法读取分享文件，请重新分享后再试");
                     return new WebResourceResponse("text/plain", "UTF-8", 404, "Not Found", new LinkedHashMap<>(), new ByteArrayInputStream(new byte[0]));
                 }
             }
@@ -391,19 +444,28 @@ public final class MainActivity extends Activity {
                 if (uri != null && !incoming.contains(uri)) incoming.add(uri);
             }
         }
-        for (Uri uri : incoming.subList(0, Math.min(10, incoming.size()))) {
-            try {
-                getContentResolver().takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION);
-            } catch (Exception ignored) {
+        if (incoming.isEmpty()) return;
+        ArrayList<Uri> selected = new ArrayList<>(incoming.subList(0, Math.min(10, incoming.size())));
+        String fallbackMime = intent.getType();
+        shareExecutor.execute(() -> {
+            ArrayList<SharedFile> prepared = new ArrayList<>();
+            String errorMessage = null;
+            for (Uri uri : selected) {
+                try {
+                    prepared.add(cacheSharedFile(uri, fallbackMime));
+                } catch (Exception error) {
+                    errorMessage = error.getMessage() == null ? "接收外部分享文件失败，请重试" : error.getMessage();
+                }
             }
-            SharedFile shared = describeSharedFile(uri, intent.getType());
             synchronized (sharedFiles) {
-                sharedFiles.put(shared.id, shared);
+                for (SharedFile shared : prepared) sharedFiles.put(shared.id, shared);
             }
-        }
+            if (!prepared.isEmpty()) dispatchSharedFiles();
+            if (errorMessage != null) dispatchShareError(errorMessage);
+        });
     }
 
-    private SharedFile describeSharedFile(Uri uri, String fallbackMime) {
+    private SharedFileInfo describeSharedFile(Uri uri, String fallbackMime) {
         String name = "分享文件";
         long size = -1L;
         try (Cursor cursor = getContentResolver().query(uri, new String[] { OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE }, null, null, null)) {
@@ -419,7 +481,34 @@ public final class MainActivity extends Activity {
         }
         String mime = getContentResolver().getType(uri);
         if (mime == null || mime.isEmpty()) mime = fallbackMime == null ? "application/octet-stream" : fallbackMime;
-        return new SharedFile(UUID.randomUUID().toString(), uri, name, mime, size);
+        return new SharedFileInfo(name, mime, size);
+    }
+
+    private SharedFile cacheSharedFile(Uri uri, String fallbackMime) throws IOException {
+        SharedFileInfo info = describeSharedFile(uri, fallbackMime);
+        if (info.size > MAX_SHARED_FILE_BYTES) throw new IOException("分享文件超过 95MB，无法上传");
+        String id = UUID.randomUUID().toString();
+        File directory = new File(getCacheDir(), "shared-files");
+        if (!directory.exists() && !directory.mkdirs()) throw new IOException("无法创建分享文件缓存");
+        File target = new File(directory, id);
+        long copied = 0L;
+        try (InputStream input = getContentResolver().openInputStream(uri);
+             FileOutputStream output = new FileOutputStream(target)) {
+            if (input == null) throw new IOException("无法读取分享文件，请重新分享后再试");
+            byte[] buffer = new byte[64 * 1024];
+            int count;
+            while ((count = input.read(buffer)) != -1) {
+                copied += count;
+                if (copied > MAX_SHARED_FILE_BYTES) throw new IOException("分享文件超过 95MB，无法上传");
+                output.write(buffer, 0, count);
+            }
+            output.flush();
+        } catch (Exception error) {
+            target.delete();
+            if (error instanceof IOException) throw (IOException) error;
+            throw new IOException("无法读取分享文件，请重新分享后再试", error);
+        }
+        return new SharedFile(id, target, info.name, info.mimeType, copied);
     }
 
     private void dispatchSharedFiles() {
@@ -442,6 +531,17 @@ public final class MainActivity extends Activity {
         String json = payload.toString();
         webView.post(() -> webView.evaluateJavascript(
             "window.__PALM_SHARED_FILES__=" + json + ";window.dispatchEvent(new CustomEvent('palm-share',{detail:" + json + "}));",
+            null
+        ));
+    }
+
+    private void dispatchShareError(String message) {
+        pendingShareError = message;
+        if (webView == null || !pageReady) return;
+        String json = JSONObject.quote(message);
+        pendingShareError = null;
+        webView.post(() -> webView.evaluateJavascript(
+            "window.__PALM_SHARE_ERROR__=" + json + ";window.dispatchEvent(new CustomEvent('palm-share-error',{detail:" + json + "}));",
             null
         ));
     }
@@ -524,6 +624,11 @@ public final class MainActivity extends Activity {
     @Override
     protected void onDestroy() {
         if (fileCallback != null) fileCallback.onReceiveValue(null);
+        shareExecutor.shutdownNow();
+        synchronized (sharedFiles) {
+            for (SharedFile shared : sharedFiles.values()) shared.cacheFile.delete();
+            sharedFiles.clear();
+        }
         webView.stopLoading();
         webView.destroy();
         super.onDestroy();
