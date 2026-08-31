@@ -265,8 +265,14 @@
 .attachment-sheet > button small { color: var(--muted); font-size: 11px; }
 
 @media (max-width: 759px) {
-  :root { --mobile-topbar-height: 60px; }
-  .topbar { min-height: var(--mobile-topbar-height); padding-block: 8px; }
+  :root { --mobile-topbar-height: 52px; --mobile-tabs-height: 48px; }
+  .topbar {
+    height: calc(var(--mobile-topbar-height) + env(safe-area-inset-top));
+    min-height: calc(var(--mobile-topbar-height) + env(safe-area-inset-top));
+    padding: calc(6px + env(safe-area-inset-top)) 12px 1px;
+  }
+  .mobile-tabs { height: var(--mobile-tabs-height); padding: 2px 14px 6px; }
+  .mobile-tabs button { height: 40px; min-height: 40px; }
   .mobile-identity { display: grid; place-items: center; gap: 1px; width: 38px; flex: none; }
   .mobile-identity b { display: grid; place-items: center; width: 30px; height: 28px; border-radius: 10px; background: var(--accent); color: #fff; font-size: 15px; }
   .mobile-identity small { display: flex; align-items: center; gap: 3px; color: var(--muted); font-size: 9px; white-space: nowrap; }
@@ -279,7 +285,7 @@
   .header-project-menu > div { width: min(260px, calc(100vw - 24px)); }
   .project-picker-menu {
     position: fixed;
-    top: calc(var(--mobile-topbar-height) + env(safe-area-inset-top) + 4px);
+    top: calc(var(--mobile-topbar-height) + env(safe-area-inset-top) + 2px);
     right: 12px;
     left: 12px;
     width: auto;
