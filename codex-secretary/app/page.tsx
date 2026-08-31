@@ -36,6 +36,11 @@ import {
   UploadSimple,
   X,
 } from "@phosphor-icons/react";
+import {
+  socketIsReusable,
+  socketNeedsResumeReconnect,
+  websocketReconnectDelay,
+} from "./websocket-reconnect";
 
 type ExecutionStep = {
   id: string;
@@ -1188,6 +1193,7 @@ export default function Home() {
   const runningRef = useRef(false);
   const pendingTurnRef = useRef<PendingTurn>();
   const reconnectRef = useRef<number>();
+  const reconnectAttemptRef = useRef(0);
   const reconnectNowRef = useRef<() => void>(() => undefined);
   const fileRef = useRef<HTMLInputElement>(null);
   const imageFileRef = useRef<HTMLInputElement>(null);
@@ -1718,7 +1724,26 @@ export default function Home() {
   useEffect(() => {
     if (!authenticated) return;
     let disposed = false;
+    const clearReconnectTimer = () => {
+      if (!reconnectRef.current) return;
+      window.clearTimeout(reconnectRef.current);
+      reconnectRef.current = undefined;
+    };
+    const scheduleReconnect = () => {
+      if (disposed || reconnectRef.current) return;
+      const attempt = reconnectAttemptRef.current;
+      reconnectAttemptRef.current += 1;
+      const delay = websocketReconnectDelay(attempt);
+      reconnectRef.current = window.setTimeout(() => {
+        reconnectRef.current = undefined;
+        connect();
+      }, delay);
+    };
     const connect = () => {
+      if (disposed) return;
+      const current = socketRef.current;
+      if (socketIsReusable(current?.readyState)) return;
+      clearReconnectTimer();
       setConnection(socketRef.current ? "正在重连" : "连接中");
       const protocol = location.protocol === "https:" ? "wss:" : "ws:";
       const socketHost =
@@ -1728,6 +1753,11 @@ export default function Home() {
       const socket = new WebSocket(`${protocol}//${socketHost}/api/ws`);
       socketRef.current = socket;
       socket.onopen = () => {
+        if (disposed || socketRef.current !== socket) {
+          socket.close();
+          return;
+        }
+        reconnectAttemptRef.current = 0;
         setConnection("已连接");
         if (threadIdRef.current) {
           socket.send(
@@ -1767,22 +1797,30 @@ export default function Home() {
         void recoverFinishedTasks();
       };
       reconnectNowRef.current = () => {
-        if (
-          disposed ||
-          socketRef.current?.readyState === WebSocket.OPEN ||
-          socketRef.current?.readyState === WebSocket.CONNECTING
-        )
-          return;
-        if (reconnectRef.current) window.clearTimeout(reconnectRef.current);
+        if (disposed) return;
+        const activeSocket = socketRef.current;
+        if (socketIsReusable(activeSocket?.readyState)) return;
+        clearReconnectTimer();
         connect();
       };
-      socket.onclose = () => {
-        if (!disposed) {
-          setConnection("正在重连");
-          reconnectRef.current = window.setTimeout(connect, 1800);
+      socket.onerror = () => {
+        if (socketRef.current === socket) setConnection("正在重连");
+      };
+      socket.onclose = (event) => {
+        if (disposed || socketRef.current !== socket) return;
+        socketRef.current = null;
+        setConnection("正在重连");
+        if (event.code || event.reason) {
+          console.info("Palm WebSocket closed", {
+            code: event.code,
+            reason: event.reason,
+            clean: event.wasClean,
+          });
         }
+        scheduleReconnect();
       };
       socket.onmessage = (event) => {
+        if (disposed || socketRef.current !== socket) return;
         let message: {
           type: string;
           threadId?: string;
@@ -2037,9 +2075,11 @@ export default function Home() {
     connect();
     return () => {
       disposed = true;
-      if (reconnectRef.current) window.clearTimeout(reconnectRef.current);
-      socketRef.current?.close();
+      clearReconnectTimer();
+      reconnectAttemptRef.current = 0;
+      const activeSocket = socketRef.current;
       socketRef.current = null;
+      activeSocket?.close(1000, "页面连接已更新");
     };
   }, [
     authenticated,
@@ -2076,10 +2116,8 @@ export default function Home() {
       if (document.visibilityState !== "visible") return;
       if (syncing) return;
       syncing = true;
-      if (socketRef.current?.readyState !== WebSocket.OPEN) {
-        try {
-          socketRef.current?.close();
-        } catch {}
+      const socketState = socketRef.current?.readyState;
+      if (socketNeedsResumeReconnect(socketState)) {
         reconnectNowRef.current();
       }
       void loadDashboard();

@@ -54,3 +54,4 @@ jobs:
       - run: npm run test:v017
       - run: npm run test:v018
       - run: npm run test:v019
+      - run: npm run test:v020
