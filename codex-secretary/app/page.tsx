@@ -195,6 +195,11 @@ type NativeSharedFile = {
   mimeType?: string;
   size?: number;
 };
+type ShareTargetDialog = {
+  files: NativeSharedFile[];
+  projectId: string;
+  threadId: string;
+};
 type PendingTurn = {
   clientRequestId: string;
   projectId: string;
@@ -264,6 +269,7 @@ declare global {
         threadId: string,
       ) => void;
       ackTaskTarget?: () => void;
+      discardSharedFiles?: (idsJson: string) => void;
     };
   }
 }
@@ -1259,6 +1265,10 @@ export default function Home() {
   const [openMenu, setOpenMenu] = useState<OpenMenu>();
   const [projectDialog, setProjectDialog] = useState<ProjectDialog>();
   const [projectDialogBusy, setProjectDialogBusy] = useState(false);
+  const [shareDialog, setShareDialog] = useState<ShareTargetDialog>();
+  const [shareThreads, setShareThreads] = useState<ProjectThread[]>([]);
+  const [shareThreadsLoading, setShareThreadsLoading] = useState(false);
+  const [shareDialogBusy, setShareDialogBusy] = useState(false);
   const [draggingFiles, setDraggingFiles] = useState(false);
   const [threadId, setThreadId] = useState<string>();
   const [turnId, setTurnId] = useState<string>();
@@ -1276,6 +1286,7 @@ export default function Home() {
   const projectIdRef = useRef(projectId);
   const attachmentsProjectRef = useRef(projectId);
   const projectDialogBusyRef = useRef(false);
+  const shareDialogBusyRef = useRef(false);
   const projectLoadGenerationRef = useRef(0);
   const developmentRequestedRef = useRef(new Set<string>());
   const threadLoadGenerationRef = useRef(0);
@@ -1293,6 +1304,18 @@ export default function Home() {
   const closeProjectDialog = useCallback(() => {
     if (projectDialogBusyRef.current) return;
     setProjectDialog(undefined);
+  }, []);
+  const closeShareDialog = useCallback((discard = true) => {
+    if (shareDialogBusyRef.current) return;
+    setShareDialog((current) => {
+      if (discard && current?.files.length) {
+        window.PalmNative?.discardSharedFiles?.(
+          JSON.stringify(current.files.map((file) => file.id)),
+        );
+      }
+      return undefined;
+    });
+    setShareThreads([]);
   }, []);
 
   const activeProject = projects.find((project) => project.id === projectId);
@@ -1387,6 +1410,7 @@ export default function Home() {
       closeMenus();
       setRuntimeOpen(false);
       closeProjectDialog();
+      closeShareDialog();
     };
     document.addEventListener("pointerdown", closeMenus);
     document.addEventListener("keydown", closeOnEscape);
@@ -1394,7 +1418,7 @@ export default function Home() {
       document.removeEventListener("pointerdown", closeMenus);
       document.removeEventListener("keydown", closeOnEscape);
     };
-  }, [closeProjectDialog]);
+  }, [closeProjectDialog, closeShareDialog]);
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -2995,10 +3019,20 @@ export default function Home() {
   const upload = useCallback(
     async (
       file?: File,
-      existingUploadId?: string,
-      manageBusy = true,
-    ): Promise<boolean> => {
-      if (!file || (uploading && manageBusy)) return false;
+      options: {
+        existingUploadId?: string;
+        manageBusy?: boolean;
+        targetProjectId?: string;
+        attachOnSuccess?: boolean;
+      } = {},
+    ): Promise<UploadedFile | undefined> => {
+      const {
+        existingUploadId,
+        manageBusy = true,
+        targetProjectId = projectId,
+        attachOnSuccess = true,
+      } = options;
+      if (!file || (uploading && manageBusy)) return undefined;
       const uploadId = existingUploadId ?? crypto.randomUUID();
       const updateFeedback = (
         next: UploadFeedback | ((current: UploadFeedback) => UploadFeedback),
@@ -3030,9 +3064,9 @@ export default function Home() {
           message: "文件超过公网安全上限 95MB",
           retryable: false,
         });
-        return false;
+        return undefined;
       }
-      const url = `/api/files/upload?projectId=${encodeURIComponent(projectId)}`;
+      const url = `/api/files/upload?projectId=${encodeURIComponent(targetProjectId)}`;
       setNotice("");
       if (manageBusy) setUploading(true);
       updateFeedback({
@@ -3051,7 +3085,7 @@ export default function Home() {
           }));
           result =
             file.size > 8 * 1024 * 1024
-              ? await uploadChunked(file, projectId, uploadId, (progress) =>
+              ? await uploadChunked(file, targetProjectId, uploadId, (progress) =>
                   updateFeedback((current) => ({
                     ...current,
                     progress,
@@ -3071,13 +3105,15 @@ export default function Home() {
             result.body?.file
           ) {
             const saved = result.body.file;
-            setAttachments((items) =>
-              items.some((item) => item.path === saved.path)
-                ? items
-                : [...items, saved],
-            );
-            if (projectIdRef.current === projectId) {
-              setFilesProjectId(projectId);
+            if (attachOnSuccess && projectIdRef.current === targetProjectId) {
+              setAttachments((items) =>
+                items.some((item) => item.path === saved.path)
+                  ? items
+                  : [...items, saved],
+              );
+            }
+            if (projectIdRef.current === targetProjectId) {
+              setFilesProjectId(targetProjectId);
               setFiles((items) =>
                 items.some((item) => item.path === saved.path)
                   ? items
@@ -3097,8 +3133,8 @@ export default function Home() {
                 ),
               4500,
             );
-            setNotice("附件已添加到当前任务");
-            return true;
+            if (attachOnSuccess) setNotice("附件已添加到当前任务");
+            return saved;
           }
           const retryable =
             result.status === 0 ||
@@ -3128,8 +3164,8 @@ export default function Home() {
           result.status > 0 &&
           ![408, 409, 429, 500, 502, 503, 504, 507].includes(result.status)
         )
-          await abortChunkUpload(file, projectId, uploadId);
-        return false;
+          await abortChunkUpload(file, targetProjectId, uploadId);
+        return undefined;
       } finally {
         if (manageBusy) setUploading(false);
       }
@@ -3151,7 +3187,7 @@ export default function Home() {
       let completed = 0;
       try {
         for (const file of selected)
-          if (await upload(file, undefined, false)) completed += 1;
+          if (await upload(file, { manageBusy: false })) completed += 1;
       } finally {
         setUploading(false);
       }
@@ -3165,47 +3201,160 @@ export default function Home() {
   );
 
   useEffect(() => {
-    if (!authenticated) return;
-    let consuming = false;
-    const consumeSharedFiles = async (event?: Event) => {
-      if (consuming) return;
-      const detail = event instanceof CustomEvent ? event.detail : undefined;
-      const shared = (
-        Array.isArray(detail) ? detail : window.__PALM_SHARED_FILES__
-      ) as NativeSharedFile[] | undefined;
-      if (!shared?.length) return;
-      consuming = true;
-      window.__PALM_SHARED_FILES__ = [];
-      setView("chat");
-      setNotice(`正在接收外部分享的 ${shared.length} 个文件…`);
-      try {
-        const imported: File[] = [];
-        for (const item of shared.slice(0, 10)) {
-          const response = await fetch(
-            `/__native_share/${encodeURIComponent(item.id)}`,
-          );
-          if (!response.ok) throw new Error(`无法读取 ${item.name}`);
+    if (!shareDialog?.projectId) return;
+    const controller = new AbortController();
+    void fetch(
+      `/api/threads?projectId=${encodeURIComponent(shareDialog.projectId)}&archived=0`,
+      { signal: controller.signal },
+    )
+      .then(async (response) => {
+        if (!response.ok) throw new Error();
+        const body = (await response.json()) as { threads?: ProjectThread[] };
+        const loaded = body.threads ?? [];
+        setShareThreads(loaded);
+        setShareDialog((current) => {
+          if (!current || current.projectId !== shareDialog.projectId) return current;
+          if (current.threadId === "__new__" || loaded.some((thread) => thread.threadId === current.threadId)) return current;
+          return { ...current, threadId: "__new__" };
+        });
+      })
+      .catch(() => {
+        if (!controller.signal.aborted) setShareThreads([]);
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setShareThreadsLoading(false);
+      });
+    return () => controller.abort();
+  }, [shareDialog?.projectId]);
+
+  async function submitSharedFiles(event: FormEvent) {
+    event.preventDefault();
+    if (!shareDialog || shareDialogBusyRef.current) return;
+    const targetProject = projectsRef.current.find((project) => project.id === shareDialog.projectId);
+    if (!targetProject || targetProject.archivedAt) {
+      setNotice("目标项目不可写，请选择其他项目");
+      return;
+    }
+    if (shareDialog.projectId === projectIdRef.current && shareDialog.threadId === "__new__" && projectBusy) {
+      setNotice("当前项目仍有任务执行，请选择已有对话或稍后新建");
+      return;
+    }
+    shareDialogBusyRef.current = true;
+    setShareDialogBusy(true);
+    setUploading(true);
+    setNotice(`正在导入 ${shareDialog.files.length} 个分享文件…`);
+    const savedFiles: UploadedFile[] = [];
+    const failedFiles: NativeSharedFile[] = [];
+    try {
+      for (const item of shareDialog.files.slice(0, 10)) {
+        try {
+          const response = await fetch(`/__native_share/${encodeURIComponent(item.id)}`);
+          if (!response.ok) throw new Error();
           const blob = await response.blob();
-          imported.push(
+          const saved = await upload(
             new File([blob], item.name, {
               type: item.mimeType || blob.type || "application/octet-stream",
             }),
+            {
+              manageBusy: false,
+              targetProjectId: shareDialog.projectId,
+              attachOnSuccess: false,
+            },
           );
+          if (!saved) {
+            failedFiles.push(item);
+            continue;
+          }
+          savedFiles.push(saved);
+          window.PalmNative?.discardSharedFiles?.(JSON.stringify([item.id]));
+        } catch {
+          failedFiles.push(item);
         }
-        await uploadFiles(imported);
-      } catch (error) {
-        setNotice(
-          error instanceof Error
-            ? error.message
-            : "接收外部分享文件失败，请重试",
-        );
-      } finally {
-        consuming = false;
       }
+      const existing = readPendingAttachments(shareDialog.projectId);
+      const pending = [...existing];
+      for (const file of savedFiles) {
+        if (!pending.some((item) => item.path === file.path)) pending.push(file);
+      }
+      if (savedFiles.length) {
+        window.localStorage.setItem(
+          pendingAttachmentKey(shareDialog.projectId),
+          JSON.stringify(pending),
+        );
+      }
+      if (failedFiles.length) {
+        setShareDialog((current) => current ? { ...current, files: failedFiles } : current);
+        setNotice(
+          savedFiles.length
+            ? `已添加 ${savedFiles.length} 个文件，另有 ${failedFiles.length} 个失败项可直接重试`
+            : `${failedFiles.length} 个分享文件上传失败，可直接重试`,
+        );
+        return;
+      }
+      if (!savedFiles.length) throw new Error("没有可导入的分享文件");
+      if (shareDialog.projectId === projectIdRef.current) {
+        if (shareDialog.threadId === "__new__") {
+          threadIdRef.current = undefined;
+          setThreadId(undefined);
+          setMessages([]);
+        } else {
+          await openThreadById(shareDialog.projectId, shareDialog.threadId);
+        }
+        attachmentsProjectRef.current = shareDialog.projectId;
+        setAttachments(pending);
+        setView("chat");
+      } else {
+        if (shareDialog.threadId !== "__new__") {
+          setPendingNavigation({
+            projectId: shareDialog.projectId,
+            threadId: shareDialog.threadId,
+            view: "chat",
+          });
+        }
+        setProjectId(shareDialog.projectId);
+        setView("chat");
+      }
+      setNotice(`已将 ${savedFiles.length} 个文件添加到所选对话`);
+      setShareDialog(undefined);
+      setShareThreads([]);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "接收外部分享文件失败，请重试");
+    } finally {
+      shareDialogBusyRef.current = false;
+      setShareDialogBusy(false);
+      setUploading(false);
+    }
+  }
+
+  useEffect(() => {
+    if (!authenticated) return;
+    const queueSharedFiles = (event?: Event) => {
+      const detail = event instanceof CustomEvent ? event.detail : undefined;
+      const shared = (Array.isArray(detail) ? detail : window.__PALM_SHARED_FILES__) as NativeSharedFile[] | undefined;
+      if (!shared?.length) return;
+      window.__PALM_SHARED_FILES__ = [];
+      setShareThreadsLoading(true);
+      setShareDialog((current) => {
+        const files = [...(current?.files ?? [])];
+        for (const item of shared.slice(0, 10)) {
+          if (!files.some((file) => file.id === item.id)) files.push(item);
+        }
+        const currentProjectId = projectIdRef.current;
+        const targetProjectId = projectsRef.current.find(
+          (project) => project.id === currentProjectId && !project.archivedAt,
+        )?.id ?? projectsRef.current.find((project) => !project.archivedAt)?.id ?? currentProjectId;
+        return current
+          ? { ...current, files: files.slice(0, 10) }
+          : {
+              files: files.slice(0, 10),
+              projectId: targetProjectId,
+              threadId: targetProjectId === currentProjectId
+                ? threadIdRef.current ?? "__new__"
+                : "__new__",
+            };
+      });
     };
-    const listener = (event: Event) => {
-      void consumeSharedFiles(event);
-    };
+    const listener = (event: Event) => queueSharedFiles(event);
     const errorListener = (event: Event) => {
       const detail = event instanceof CustomEvent ? event.detail : undefined;
       window.__PALM_SHARE_ERROR__ = undefined;
@@ -3223,12 +3372,12 @@ export default function Home() {
           detail: window.__PALM_SHARE_ERROR__,
         }),
       );
-    void consumeSharedFiles();
+    queueSharedFiles();
     return () => {
       window.removeEventListener("palm-share", listener);
       window.removeEventListener("palm-share-error", errorListener);
     };
-  }, [authenticated, projectId, uploadFiles]);
+  }, [authenticated]);
 
   function dragEnter(event: DragEvent<HTMLElement>) {
     if (!event.dataTransfer.types.includes("Files")) return;
@@ -3698,6 +3847,140 @@ export default function Home() {
                 </button>
                 <button type="submit" className="primary" disabled={projectDialogBusy}>
                   {projectDialogBusy ? "处理中…" : "确认"}
+                </button>
+              </footer>
+            </form>
+          </div>
+        )}
+        {shareDialog && (
+          <div
+            className="dialog-backdrop"
+            role="presentation"
+            onPointerDown={(event) => {
+              if (event.target === event.currentTarget) closeShareDialog();
+            }}
+          >
+            <form
+              className="project-dialog share-target-dialog"
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="share-target-title"
+              onSubmit={submitSharedFiles}
+            >
+              <header>
+                <div>
+                  <small>外部分享</small>
+                  <h2 id="share-target-title">发送到掌心助理</h2>
+                </div>
+                <button
+                  type="button"
+                  aria-label="关闭"
+                  disabled={shareDialogBusy}
+                  onClick={() => closeShareDialog()}
+                >
+                  <X size={18} weight="bold" />
+                </button>
+              </header>
+              <div className="shared-file-summary">
+                <Paperclip size={18} />
+                <div>
+                  <strong>{shareDialog.files.length} 个文件</strong>
+                  <span>
+                    {shareDialog.files.map((file) => file.name).join("、")}
+                  </span>
+                </div>
+              </div>
+              <label>
+                <span>目标项目</span>
+                <select
+                  value={shareDialog.projectId}
+                  disabled={shareDialogBusy}
+                  onChange={(event) =>
+                    {
+                      setShareThreadsLoading(true);
+                      setShareThreads([]);
+                      setShareDialog((current) =>
+                        current
+                          ? {
+                              ...current,
+                              projectId: event.target.value,
+                              threadId: "__new__",
+                            }
+                          : current,
+                      );
+                    }
+                  }
+                >
+                  {projects
+                    .filter((project) => !project.archivedAt)
+                    .map((project) => (
+                      <option key={project.id} value={project.id}>
+                        {project.name}
+                      </option>
+                    ))}
+                </select>
+              </label>
+              <fieldset className="share-thread-picker" disabled={shareDialogBusy}>
+                <legend>目标对话</legend>
+                <label className={shareDialog.threadId === "__new__" ? "selected" : ""}>
+                  <input
+                    type="radio"
+                    name="share-thread"
+                    value="__new__"
+                    checked={shareDialog.threadId === "__new__"}
+                    onChange={() =>
+                      setShareDialog((current) =>
+                        current ? { ...current, threadId: "__new__" } : current,
+                      )
+                    }
+                  />
+                  <span>
+                    <strong>新建任务</strong>
+                    <small>从一个新的对话开始处理这些文件</small>
+                  </span>
+                </label>
+                {shareThreadsLoading ? (
+                  <p>正在读取对话…</p>
+                ) : (
+                  shareThreads.slice(0, 12).map((thread) => (
+                    <label
+                      key={thread.threadId}
+                      className={shareDialog.threadId === thread.threadId ? "selected" : ""}
+                    >
+                      <input
+                        type="radio"
+                        name="share-thread"
+                        value={thread.threadId}
+                        checked={shareDialog.threadId === thread.threadId}
+                        onChange={() =>
+                          setShareDialog((current) =>
+                            current ? { ...current, threadId: thread.threadId } : current,
+                          )
+                        }
+                      />
+                      <span>
+                        <strong>{thread.title}</strong>
+                        <small>{new Date(thread.updatedAt).toLocaleString("zh-CN")}</small>
+                      </span>
+                    </label>
+                  ))
+                )}
+              </fieldset>
+              <p>文件会上传到所选项目，并作为待发送附件放入目标对话；确认发送前不会执行任务。</p>
+              <footer>
+                <button
+                  type="button"
+                  disabled={shareDialogBusy}
+                  onClick={() => closeShareDialog()}
+                >
+                  {shareDialogBusy ? "正在导入，请稍候" : "取消"}
+                </button>
+                <button
+                  type="submit"
+                  className="primary"
+                  disabled={shareDialogBusy || shareThreadsLoading}
+                >
+                  {shareDialogBusy ? "导入中…" : "添加到对话"}
                 </button>
               </footer>
             </form>
@@ -4235,7 +4518,9 @@ export default function Home() {
                   <UploadCard
                     key={item.uploadId}
                     item={item}
-                    onRetry={() => void upload(item.file, item.uploadId)}
+                    onRetry={() =>
+                      void upload(item.file, { existingUploadId: item.uploadId })
+                    }
                     onDismiss={() =>
                       setUploadFeedbacks((items) =>
                         items.filter(
@@ -4529,7 +4814,9 @@ export default function Home() {
                 <UploadCard
                   key={item.uploadId}
                   item={item}
-                  onRetry={() => void upload(item.file, item.uploadId)}
+                  onRetry={() =>
+                    void upload(item.file, { existingUploadId: item.uploadId })
+                  }
                   onDismiss={() =>
                     setUploadFeedbacks((items) =>
                       items.filter((entry) => entry.uploadId !== item.uploadId),

@@ -33,6 +33,15 @@ assert.match(android, /intent\.getData\(\)/, 'Android 必须兼容通过 Intent.
 assert.match(android, /MAX_SHARED_FILE_BYTES/, '原生分享必须限制文件大小');
 assert.doesNotMatch(android, /openInputStream\(shared\.uri\)/, '网页请求阶段不得继续依赖外部临时 URI');
 assert.match(page, /__PALM_SHARE_ERROR__/, '网页必须接收页面加载前发生的原生分享错误');
+assert.match(page, /id="share-target-title"/, '外部分享必须先显示目标选择界面');
+assert.match(page, /目标项目/, '外部分享必须允许选择项目');
+assert.match(page, /目标对话/, '外部分享必须允许选择已有对话或新任务');
+assert.match(page, /targetProjectId: shareDialog\.projectId/, '上传请求必须使用用户选择的项目，不能沿用旧项目闭包');
+assert.match(page, /setPendingNavigation\(\{[\s\S]{0,180}threadId: shareDialog\.threadId/, '跨项目分享必须精确导航到所选对话');
+assert.match(android, /discardSharedFiles/, '取消分享目标选择后必须清理原生私有缓存');
+assert.match(page, /discardSharedFiles\?\.\(JSON\.stringify\(\[item\.id\]\)\)/, '只有服务端上传成功后才能确认清理原生缓存');
+assert.doesNotMatch(android, /DeletingInputStream/, '读取原生缓存不得立即删除，上传失败必须可以重试');
+assert.match(page, /setShareDialog\(\(current\) => current \? \{ \.\.\.current, files: failedFiles \}/, '失败的分享文件必须保留在目标选择界面供重试');
 assert.match(android, /palm-resume/, 'Android 恢复时必须触发网页同步');
 
 console.log('PALM_V08_RESUME_SHARE_OK');

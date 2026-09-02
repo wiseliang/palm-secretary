@@ -3,6 +3,7 @@ import { access, cp, mkdir, readFile, readdir, rename, rm, stat, writeFile } fro
 import path from 'node:path';
 import {
   aggregateDevelopmentResult,
+  isDevelopmentPath,
   readGitSnapshot,
   verificationCommand,
   type DevelopmentResult,
@@ -335,8 +336,15 @@ export class ProjectStore {
     if (!task) return;
     let changed = false;
     if (item.type === 'fileChange') {
-      task.fileChangeDetected = true;
-      changed = true;
+      const developmentFileChanged = Array.isArray(item.changes) && item.changes.some((changeValue) => {
+        if (!changeValue || typeof changeValue !== 'object') return false;
+        const changePath = (changeValue as Record<string, unknown>).path;
+        return typeof changePath === 'string' && isDevelopmentPath(changePath);
+      });
+      if (developmentFileChanged) {
+        task.fileChangeDetected = true;
+        changed = true;
+      }
     }
     if (item.type === 'commandExecution') {
       const verification = verificationCommand(item.command, item.exitCode);

@@ -267,13 +267,55 @@ async function noIndexNumstat(cwd: string, beforeDirectory: string, afterDirecto
   }
 }
 
+const DEVELOPMENT_EXTENSIONS = new Set([
+  '.c', '.cc', '.clj', '.cljs', '.cpp', '.cs', '.css', '.cxx', '.dart', '.ejs', '.erl', '.ex', '.exs',
+  '.fs', '.fsx', '.go', '.gradle', '.graphql', '.gql', '.h', '.hpp', '.htm', '.html', '.java', '.js', '.jsx',
+  '.kt', '.kts', '.less', '.lua', '.m', '.mm', '.mjs', '.php', '.proto', '.ps1', '.py', '.rb', '.rs', '.sass',
+  '.scala', '.scss', '.sh', '.sql', '.svelte', '.swift', '.tsx', '.ts', '.vue', '.xml', '.zsh',
+]);
+
+const DEVELOPMENT_FILES = new Set([
+  '.dockerignore', '.editorconfig', '.env.example', '.gitattributes', '.gitignore', '.npmrc', '.nvmrc',
+  'cargo.lock', 'cargo.toml', 'composer.json', 'composer.lock', 'dockerfile', 'eslint.config.js',
+  'eslint.config.mjs', 'gemfile', 'gemfile.lock', 'go.mod', 'go.sum', 'gradle.properties', 'gradlew', 'gradlew.bat',
+  'makefile', 'next.config.js', 'next.config.mjs', 'next.config.ts', 'package-lock.json', 'package.json',
+  'pnpm-lock.yaml', 'pyproject.toml', 'requirements.txt', 'settings.gradle', 'settings.gradle.kts',
+  'tailwind.config.js', 'tailwind.config.ts', 'tsconfig.json', 'vite.config.js', 'vite.config.ts', 'yarn.lock',
+]);
+
+const NON_DEVELOPMENT_EXTENSIONS = new Set([
+  '.7z', '.aac', '.avi', '.bmp', '.csv', '.doc', '.docx', '.flac', '.gif', '.heic', '.jpeg', '.jpg',
+  '.jsonl', '.key', '.log', '.m4a', '.md', '.mov', '.mp3', '.mp4', '.numbers', '.ods', '.odt', '.pages',
+  '.pdf', '.png', '.ppt', '.pptx', '.rtf', '.svg', '.tar', '.tif', '.tiff', '.tsv', '.txt', '.wav', '.webm',
+  '.webp', '.xls', '.xlsm', '.xlsx', '.zip',
+]);
+
+const DEVELOPMENT_DIRECTORIES = new Set([
+  '.github', '.husky', 'api', 'app', 'bin', 'buildSrc', 'cmd', 'config', 'deploy', 'deployment', 'docker',
+  'entry', 'gradle', 'infra', 'lib', 'migrations', 'packages', 'scripts', 'server', 'src', 'test', 'tests', 'tools',
+]);
+
+/** A Git change is development work only when its path is code, build/configuration, or test infrastructure. */
+export function isDevelopmentPath(relativePath: string): boolean {
+  const normalized = relativePath.replace(/\\/g, '/').replace(/^\.\//, '');
+  if (!normalized || normalized.split('/').some((part) => part === '..')) return false;
+  const parts = normalized.split('/');
+  const basename = parts.at(-1)?.toLowerCase() ?? '';
+  if (DEVELOPMENT_FILES.has(basename)) return true;
+  const extension = path.extname(basename).toLowerCase();
+  // User documents remain non-development even under a conventional source directory.
+  if (NON_DEVELOPMENT_EXTENSIONS.has(extension)) return false;
+  if (parts.slice(0, -1).some((part) => DEVELOPMENT_DIRECTORIES.has(part))) return true;
+  return DEVELOPMENT_EXTENSIONS.has(extension);
+}
+
 async function developmentDelta(cwd: string, before: GitSnapshot, after: GitSnapshot): Promise<{ changedFiles?: number; additions?: number; deletions?: number; complete: boolean }> {
   if (!before.available || !after.available || before.baselineIncomplete) return { complete: false };
   const candidates = new Set<string>([
     ...(before.changes ?? []).flatMap((change) => [change.path, change.originalPath].filter((value): value is string => Boolean(value))),
     ...(after.changes ?? []).flatMap((change) => [change.path, change.originalPath].filter((value): value is string => Boolean(value))),
     ...await commitChangedPaths(cwd, before, after),
-  ]);
+  ].filter(isDevelopmentPath));
   if (!candidates.size) return { changedFiles: 0, additions: 0, deletions: 0, complete: true };
   const temporary = await mkdtemp(path.join(tmpdir(), 'palm-git-delta-'));
   const beforeDirectory = path.join(temporary, 'before');
@@ -325,8 +367,10 @@ export async function aggregateDevelopmentResult(
       before.commit?.sha !== after.commit?.sha
     ),
   );
-  const detected = gitChanged || ((!before?.available || !after.available) && fileChangeDetected);
-  const delta = detected && before ? await developmentDelta(cwd, before, after) : { changedFiles: 0, additions: 0, deletions: 0, complete: true };
+  const delta = gitChanged && before ? await developmentDelta(cwd, before, after) : { changedFiles: 0, additions: 0, deletions: 0, complete: true };
+  const detected = gitChanged
+    ? delta.complete ? (delta.changedFiles ?? 0) > 0 : true
+    : ((!before?.available || !after.available) && fileChangeDetected);
   const verificationStatus = commands.some((command) => command.status === 'failed')
     ? 'failed'
     : commands.length > 0 && commands.every((command) => command.status === 'passed')
