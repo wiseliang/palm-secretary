@@ -162,6 +162,13 @@
 .project-dialog footer { justify-content: flex-end; }
 .project-dialog footer button { min-width: 88px; min-height: 42px; border: 1px solid var(--line); border-radius: var(--radius-control); background: var(--surface); color: var(--ink); cursor: pointer; }
 .project-dialog footer button.primary { border-color: var(--accent); background: var(--accent); color: #fff; }
+.reset-credit-dialog { width: min(430px, calc(100vw - 28px)); }
+.reset-credit-summary { display: flex; align-items: center; gap: 12px; padding: 14px; border: 1px solid color-mix(in srgb, var(--accent) 20%, var(--line)); border-radius: var(--radius-card); background: color-mix(in srgb, var(--accent-soft) 50%, var(--surface)); }
+.reset-credit-summary > span { display: grid; place-items: center; width: 42px; height: 42px; flex: none; border-radius: 13px; background: var(--surface-strong); color: var(--accent); }
+.reset-credit-summary > div { display: grid; gap: 3px; min-width: 0; }
+.reset-credit-summary strong { font-size: 14px; }
+.reset-credit-summary p { margin: 0; }
+.project-dialog footer button.danger-confirm { border-color: var(--accent); background: var(--accent); }
 .project-dialog input:disabled,
 .project-dialog button:disabled { cursor: wait; opacity: .52; }
 .project-dialog footer button:first-child:disabled { min-width: 148px; }
@@ -169,6 +176,21 @@
 .shared-file-summary > div { display: grid; min-width: 0; gap: 3px; }
 .shared-file-summary strong { color: var(--ink); font-size: 13px; }
 .shared-file-summary span { overflow: hidden; color: var(--muted); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+
+.header-project-menu > div > button small { margin-left: auto; color: var(--accent); font-size: 10px; }
+.system-alert > div { display: grid; gap: 3px; min-width: 0; }
+.system-alert > button { display: inline-flex; align-items: center; justify-content: center; gap: 6px; min-height: 34px; flex: none; padding: 0 11px; border: 1px solid currentColor; border-radius: var(--radius-control); background: transparent; color: inherit; font-size: 11px; font-weight: 700; cursor: pointer; }
+.system-alert > button.active { background: currentColor; color: var(--surface-strong); }
+.maintenance-mode-banner { display: flex; align-items: center; gap: 9px; max-width: 800px; margin: 0 auto 8px; padding: 9px 11px; border: 1px solid color-mix(in srgb, var(--warning) 32%, var(--line)); border-radius: 12px; background: color-mix(in srgb, #fff3d8 74%, var(--surface)); color: var(--warning); }
+.maintenance-mode-banner > span { display: grid; flex: 1; gap: 1px; min-width: 0; font-size: 10px; }
+.maintenance-mode-banner strong { color: var(--ink); font-size: 11px; }
+.maintenance-mode-banner button { min-height: 32px; padding: 0 9px; border: 0; border-radius: 8px; background: transparent; color: inherit; font-weight: 700; cursor: pointer; }
+@media (max-width: 520px) {
+  .system-alert { align-items: stretch; }
+  .system-alert > button { width: 100%; min-height: 40px; }
+  .maintenance-mode-banner { margin-inline: 0; }
+  .reset-credit-dialog { top: auto; bottom: 0; left: 0; width: 100%; max-height: min(82dvh, 620px); transform: none; border-radius: 22px 22px 0 0; padding-bottom: calc(18px + env(safe-area-inset-bottom)); }
+}
 .share-thread-picker { display: grid; gap: 6px; max-height: min(310px, 38dvh); margin: 0; padding: 0 3px 3px 0; overflow-y: auto; border: 0; }
 .share-thread-picker legend { margin-bottom: 8px; color: var(--ink); font-size: 12px; font-weight: 700; }
 .share-thread-picker > label { display: grid; grid-template-columns: 18px minmax(0, 1fr); align-items: center; gap: 9px; min-height: 52px; padding: 8px 10px; border: 1px solid var(--line); border-radius: var(--radius-control); background: var(--surface); cursor: pointer; }

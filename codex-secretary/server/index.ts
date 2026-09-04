@@ -25,6 +25,7 @@ const sockets = new Set<SocketLike>();
 const threadSockets = new Map<string, Set<SocketLike>>();
 const socketThreads = new Map<SocketLike, string>();
 const loadedThreads = new Set<string>();
+const loadedThreadModes = new Map<string, 'normal' | 'storage'>();
 const startingProjects = new Set<string>();
 const loginAttempts = new Map<string, { count: number; resetAt: number }>();
 type TurnAcceptance = { threadId: string; payload: { turn?: { id?: string } }; replayed?: boolean; clientRequestId: string };
@@ -217,6 +218,7 @@ bridge.on('offline', (details) => {
   bridgeOnlinePending = false;
   const interruptedTaskIds = projects.runningTaskIds();
   loadedThreads.clear();
+  loadedThreadModes.clear();
   modelCache = undefined;
   pendingTurnRequests.clear();
   broadcast({ type: 'codex.offline', payload: { ...details, interrupted: interruptedTaskIds.length, reconciling: true } });
@@ -295,6 +297,26 @@ app.get('/api/usage', async (request, reply) => {
     rateLimits: rateLimits.status === 'fulfilled' ? rateLimits.value : null,
     usage: usage.status === 'fulfilled' ? usage.value : null,
   };
+});
+
+app.post('/api/usage/reset', async (request, reply) => {
+  if (!requireOwner(request, reply)) return;
+  const parsed = z.object({
+    idempotencyKey: z.string().uuid(),
+    creditId: z.string().min(1).max(256).nullable().optional(),
+  }).safeParse(request.body);
+  if (!parsed.success) return reply.code(400).send({ error: '重置请求无效' });
+  try {
+    await bridge.ready();
+    const result = await bridge.call('account/rateLimitResetCredit/consume', parsed.data) as {
+      outcome?: 'reset' | 'nothingToReset' | 'noCredit' | 'alreadyRedeemed';
+    };
+    if (!result.outcome) throw new Error('Codex 未返回重置结果');
+    return { outcome: result.outcome };
+  } catch (error) {
+    app.log.warn({ error: error instanceof Error ? error.message : String(error) }, 'Codex 用量重置失败');
+    return reply.code(503).send({ error: '暂时无法使用重置卡，请稍后再试' });
+  }
 });
 
 async function availableModels(force = false): Promise<CodexModel[]> {
@@ -775,7 +797,7 @@ app.delete<{ Querystring: { path?: string; projectId?: string } }>('/api/files',
 });
 
 const clientMessage = z.discriminatedUnion('type', [
-  z.object({ type: z.literal('turn.start'), clientRequestId: z.string().uuid().optional(), projectId: z.string().min(1).max(64), threadId: z.string().optional(), text: z.string().min(1).max(50_000), attachments: z.array(z.string()).max(10).optional() }),
+  z.object({ type: z.literal('turn.start'), clientRequestId: z.string().uuid().optional(), projectId: z.string().min(1).max(64), threadId: z.string().optional(), text: z.string().min(1).max(50_000), attachments: z.array(z.string()).max(10).optional(), maintenance: z.literal('storage').optional() }),
   z.object({ type: z.literal('turn.interrupt'), threadId: z.string(), turnId: z.string() }),
   z.object({ type: z.literal('thread.subscribe'), projectId: z.string().min(1).max(64), threadId: z.string() }),
 ]);
@@ -837,14 +859,18 @@ app.get('/api/ws', { websocket: true }, (socket, request) => {
       let projectReserved = false;
       try {
       const disk = await diskInfo();
-      if (disk.tasksPaused) throw new Error('磁盘可用空间低于安全线，已暂停新任务');
+      const storageMaintenance = message.maintenance === 'storage';
+      if (disk.tasksPaused && !storageMaintenance) throw new Error('磁盘可用空间低于安全线；请开启“存储维护模式”后再执行清理任务');
+      if (storageMaintenance && message.attachments?.length) throw new Error('存储维护模式不接收新附件，请直接说明要检查或清理的内容');
       if (startingProjects.has(message.projectId) || projects.hasRunningTask(message.projectId)) throw new Error('当前项目已有任务正在运行，请等待完成后再开始新任务');
       startingProjects.add(message.projectId);
       projectReserved = true;
       let threadId = message.threadId;
       const projectRoot = projects.projectWorkdir(message.projectId);
       const project = projects.getProject(message.projectId);
-      const developerInstructions = outputInstructions(message.projectId);
+      const developerInstructions = storageMaintenance
+        ? `${outputInstructions(message.projectId)}\n\n【存储维护模式】当前请求是服务器磁盘自救任务。只允许检查磁盘占用、识别可安全回收的缓存/临时文件/旧发布版本，并恢复因磁盘不足受影响的掌心助理服务；拒绝与存储维护无关的工作。涉及删除前必须先核对目标不是 current、不是运行中 release、不是用户项目或业务数据；只删除已精确确认的目标，不使用宽泛通配符。不要修改 SSH、防火墙、数据库、用户或权限。完成后复查根分区可用空间和掌心助理服务状态。`
+        : outputInstructions(message.projectId);
       if (project.archivedAt) throw new Error('项目已归档，请先恢复后再执行任务');
       if (!threadId) {
         const started = await bridge.call('thread/start', {
@@ -856,13 +882,15 @@ app.get('/api/ws', { websocket: true }, (socket, request) => {
         app.log.info({ event: 'thread.started', ok: Boolean(threadId) }, 'Codex 对话创建完成');
       } else {
         projects.assertThreadProject(threadId, message.projectId);
-        if (!loadedThreads.has(threadId)) {
+        const requestedMode = storageMaintenance ? 'storage' : 'normal';
+        if (!loadedThreads.has(threadId) || loadedThreadModes.get(threadId) !== requestedMode) {
           await bridge.call('thread/resume', { threadId, cwd: projectRoot, developerInstructions, approvalPolicy: 'never', sandbox: 'danger-full-access' });
         }
       }
       if (!threadId) throw new Error('无法创建 Codex 对话');
       setSocketThread(socket, threadId);
       loadedThreads.add(threadId);
+      loadedThreadModes.set(threadId, storageMaintenance ? 'storage' : 'normal');
       await projects.rememberThread(threadId, message.projectId, message.text);
       const attachmentPaths = (message.attachments ?? []).map((value) => projects.safeStoredPath(message.projectId, value));
       const attachmentDetails = await Promise.all(attachmentPaths.map(async (filePath) => ({ filePath, details: await stat(filePath) })));

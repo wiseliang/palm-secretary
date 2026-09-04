@@ -32,8 +32,10 @@ import {
   SlidersHorizontal,
   Star,
   Stop,
+  Ticket,
   Trash,
   UploadSimple,
+  Wrench,
   X,
 } from "@phosphor-icons/react";
 import {
@@ -189,6 +191,15 @@ type UsageWindow = {
   resetAt?: number;
   windowMinutes?: number;
 };
+type ResetCreditSummary = {
+  availableCount: number;
+  credits: Array<{
+    id: string;
+    title?: string;
+    description?: string;
+    expiresAt?: number;
+  }>;
+};
 type NativeSharedFile = {
   id: string;
   name: string;
@@ -206,6 +217,7 @@ type PendingTurn = {
   threadId?: string;
   text: string;
   attachments: UploadedFile[];
+  maintenance?: "storage";
 };
 type DeliveryState = "idle" | "sending" | "accepted";
 type SearchResult = {
@@ -395,6 +407,42 @@ function usageWindowsFrom(value: unknown): UsageWindow[] {
         (a.windowMinutes ?? Number.MAX_SAFE_INTEGER) -
         (b.windowMinutes ?? Number.MAX_SAFE_INTEGER),
     );
+}
+
+function resetCreditSummaryFrom(value: unknown): ResetCreditSummary | undefined {
+  const visited = new Set<object>();
+  const walk = (node: unknown): ResetCreditSummary | undefined => {
+    if (!node || typeof node !== "object" || visited.has(node as object))
+      return undefined;
+    visited.add(node as object);
+    const record = node as Record<string, unknown>;
+    const candidate = record.rateLimitResetCredits;
+    if (candidate && typeof candidate === "object") {
+      const summary = candidate as Record<string, unknown>;
+      if (typeof summary.availableCount === "number") {
+        const credits = Array.isArray(summary.credits)
+          ? summary.credits.flatMap((item) => {
+              if (!item || typeof item !== "object") return [];
+              const credit = item as Record<string, unknown>;
+              if (typeof credit.id !== "string") return [];
+              return [{
+                id: credit.id,
+                title: typeof credit.title === "string" ? credit.title : undefined,
+                description: typeof credit.description === "string" ? credit.description : undefined,
+                expiresAt: typeof credit.expiresAt === "number" ? credit.expiresAt * 1000 : undefined,
+              }];
+            })
+          : [];
+        return { availableCount: Math.max(0, summary.availableCount), credits };
+      }
+    }
+    for (const child of Object.values(record)) {
+      const found = walk(child);
+      if (found) return found;
+    }
+    return undefined;
+  };
+  return walk(value);
 }
 
 function resetLabel(resetAt?: number, now = Date.now()): string {
@@ -1260,7 +1308,11 @@ export default function Home() {
   const [attachments, setAttachments] = useState<UploadedFile[]>([]);
   const [status, setStatus] = useState<ServerStatus>({});
   const [usageWindows, setUsageWindows] = useState<UsageWindow[]>([]);
+  const [resetCredits, setResetCredits] = useState<ResetCreditSummary>();
   const [usageClock, setUsageClock] = useState(() => Date.now());
+  const [resetDialogOpen, setResetDialogOpen] = useState(false);
+  const [resetBusy, setResetBusy] = useState(false);
+  const [storageMaintenance, setStorageMaintenance] = useState(false);
   const [runtimeOpen, setRuntimeOpen] = useState(false);
   const [openMenu, setOpenMenu] = useState<OpenMenu>();
   const [projectDialog, setProjectDialog] = useState<ProjectDialog>();
@@ -1298,6 +1350,7 @@ export default function Home() {
   const reconnectRef = useRef<number>();
   const reconnectAttemptRef = useRef(0);
   const reconnectNowRef = useRef<() => void>(() => undefined);
+  const resetAttemptRef = useRef<string>();
   const fileRef = useRef<HTMLInputElement>(null);
   const imageFileRef = useRef<HTMLInputElement>(null);
   const composerRef = useRef<HTMLElement>(null);
@@ -1505,9 +1558,53 @@ export default function Home() {
         usage?: unknown;
       };
       setUsageWindows(usageWindowsFrom(value.rateLimits ?? value.usage));
+      setResetCredits(resetCreditSummaryFrom(value.rateLimits));
       setUsageClock(Date.now());
     }
   }, []);
+
+  async function consumeResetCredit() {
+    if (resetBusy) return;
+    setResetBusy(true);
+    try {
+      const creditId = resetCredits?.credits[0]?.id;
+      const response = await fetch("/api/usage/reset", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          idempotencyKey:
+            resetAttemptRef.current ??
+            (resetAttemptRef.current = crypto.randomUUID()),
+          creditId: creditId ?? null,
+        }),
+      });
+      const body = (await response.json().catch(() => ({}))) as {
+        outcome?: "reset" | "nothingToReset" | "noCredit" | "alreadyRedeemed";
+        error?: string;
+      };
+      if (!response.ok) throw new Error(body.error ?? "重置失败");
+      const labels = {
+        reset: "重置卡已使用，用量窗口正在刷新",
+        nothingToReset: "当前没有需要重置的用量窗口，重置卡未消耗",
+        noCredit: "当前账户没有可用重置卡",
+        alreadyRedeemed: "本次重置已完成，请刷新用量",
+      } as const;
+      setNotice(body.outcome ? labels[body.outcome] : "已提交重置请求");
+      resetAttemptRef.current = undefined;
+      setResetDialogOpen(false);
+      await loadDashboard();
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "暂时无法使用重置卡");
+    } finally {
+      setResetBusy(false);
+    }
+  }
+
+  function closeResetDialog() {
+    if (resetBusy) return;
+    resetAttemptRef.current = undefined;
+    setResetDialogOpen(false);
+  }
 
   useEffect(() => {
     if (!authenticated) return;
@@ -1964,6 +2061,7 @@ export default function Home() {
                   threadId: pending.threadId,
                   text: pending.text,
                   attachments: pending.attachments.map((file) => file.path),
+                  maintenance: pending.maintenance,
                 }),
               );
             }
@@ -2930,6 +3028,7 @@ export default function Home() {
     text: string,
     sentAttachments: UploadedFile[],
     targetThreadId = threadId,
+    maintenance = false,
   ) {
     if (activeProject?.archivedAt) {
       setNotice("项目已归档，请先恢复后再执行任务");
@@ -2945,6 +3044,10 @@ export default function Home() {
       socketRef.current?.readyState !== WebSocket.OPEN
     )
       return;
+    if (maintenance && sentAttachments.length) {
+      setNotice("存储维护模式不接收附件，请直接描述要检查或清理的内容");
+      return;
+    }
     const now = crypto.randomUUID();
     setMessages((items) => [
       ...items,
@@ -2957,6 +3060,7 @@ export default function Home() {
       threadId: targetThreadId,
       text,
       attachments: sentAttachments,
+      maintenance: maintenance ? "storage" : undefined,
     };
     pendingTurnRef.current = pending;
     window.localStorage.setItem(
@@ -2972,6 +3076,7 @@ export default function Home() {
         threadId: targetThreadId,
         text,
         attachments: sentAttachments.map((file) => file.path),
+        maintenance: maintenance ? "storage" : undefined,
       }),
     );
     runningRef.current = true;
@@ -2986,7 +3091,7 @@ export default function Home() {
     event.preventDefault();
     const text =
       draft.trim() || (attachments.length ? "请检查并处理我上传的附件。" : "");
-    startTurn(text, attachments);
+    startTurn(text, attachments, threadId, storageMaintenance);
   }
 
   async function retryTask(task: ProjectTask) {
@@ -3716,6 +3821,19 @@ export default function Home() {
                   <SlidersHorizontal size={17} />
                   运行设置
                 </button>
+                <button
+                  onClick={() => {
+                    setOpenMenu(undefined);
+                    resetAttemptRef.current = crypto.randomUUID();
+                    setResetDialogOpen(true);
+                  }}
+                >
+                  <Ticket size={17} weight="bold" />
+                  使用重置卡
+                  {resetCredits?.availableCount ? (
+                    <small>{resetCredits.availableCount} 张</small>
+                  ) : null}
+                </button>
               </div>}
             </div>
             <button
@@ -3850,6 +3968,74 @@ export default function Home() {
                 </button>
               </footer>
             </form>
+          </div>
+        )}
+        {resetDialogOpen && (
+          <div
+            className="dialog-backdrop"
+            role="presentation"
+            onPointerDown={(event) => {
+              if (event.target === event.currentTarget) closeResetDialog();
+            }}
+          >
+            <section
+              className="project-dialog reset-credit-dialog"
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="reset-credit-title"
+            >
+              <header>
+                <div>
+                  <small>Codex 用量</small>
+                  <h2 id="reset-credit-title">使用重置卡</h2>
+                </div>
+                <button
+                  type="button"
+                  aria-label="关闭"
+                  disabled={resetBusy}
+                  onClick={closeResetDialog}
+                >
+                  <X size={18} weight="bold" />
+                </button>
+              </header>
+              <div className="reset-credit-summary">
+                <span><Ticket size={22} weight="fill" /></span>
+                <div>
+                  <strong>
+                    {resetCredits
+                      ? `${resetCredits.availableCount} 张可用`
+                      : "可用数量尚未同步"}
+                  </strong>
+                  <p>
+                    {resetCredits?.credits[0]?.expiresAt
+                      ? `最近一张将于 ${new Date(resetCredits.credits[0].expiresAt).toLocaleString("zh-CN")} 到期`
+                      : "使用后会刷新符合条件的 5 小时和每周用量窗口。"}
+                  </p>
+                </div>
+              </div>
+              <p>
+                这是一次性账户权益。只有成功刷新至少一个符合条件的用量窗口时才会消耗；请确认现在确实需要重置。
+              </p>
+              <footer>
+                <button
+                  type="button"
+                  disabled={resetBusy}
+                  onClick={closeResetDialog}
+                >
+                  取消
+                </button>
+                <button
+                  type="button"
+                  className="primary danger-confirm"
+                  disabled={
+                    resetBusy || !resetCredits || resetCredits.availableCount === 0
+                  }
+                  onClick={() => void consumeResetCredit()}
+                >
+                  {resetBusy ? "正在重置…" : "确认使用 1 张"}
+                </button>
+              </footer>
+            </section>
           </div>
         )}
         {shareDialog && (
@@ -4083,18 +4269,38 @@ export default function Home() {
             className={`system-alert ${status.disk?.tasksPaused ? "critical" : ""}`}
             role="status"
           >
-            <strong>
-              {connection !== "已连接"
-                ? `Codex ${connection}`
-                : status.disk?.tasksPaused
-                  ? "服务器空间不足，已暂停新任务和上传"
-                  : "服务器磁盘空间偏低"}
-            </strong>
-            <span>
-              {connection !== "已连接"
-                ? "连接恢复后会自动同步当前任务"
-                : `${bytes(status.disk?.freeBytes)} 可用 · 建议尽快清理旧版本`}
-            </span>
+            <div>
+              <strong>
+                {connection !== "已连接"
+                  ? `Codex ${connection}`
+                  : status.disk?.tasksPaused
+                    ? "服务器空间不足，普通任务和上传已暂停"
+                    : "服务器磁盘空间偏低"}
+              </strong>
+              <span>
+                {connection !== "已连接"
+                  ? "连接恢复后会自动同步当前任务"
+                  : `${bytes(status.disk?.freeBytes)} 可用 · 可进入存储维护模式安全自救`}
+              </span>
+            </div>
+            {connection === "已连接" && status.disk?.warning && (
+              <button
+                type="button"
+                className={storageMaintenance ? "active" : ""}
+                onClick={() => {
+                  setStorageMaintenance((active) => !active);
+                  setView("chat");
+                  setNotice(
+                    storageMaintenance
+                      ? "已退出存储维护模式"
+                      : "已进入存储维护模式；请描述要检查或清理的磁盘问题",
+                  );
+                }}
+              >
+                <Wrench size={15} weight="bold" />
+                {storageMaintenance ? "退出维护" : "开始维护"}
+              </button>
+            )}
           </section>
         )}
         {notice && (
@@ -4792,6 +4998,18 @@ export default function Home() {
           ref={composerRef}
           className={`composer-wrap ${view !== "chat" ? "composer-hidden" : ""}`}
         >
+          {storageMaintenance && (
+            <div className="maintenance-mode-banner" role="status">
+              <Wrench size={16} weight="bold" />
+              <span>
+                <strong>存储维护模式</strong>
+                仅用于检查磁盘、清理安全目标并恢复掌心助理服务
+              </span>
+              <button type="button" onClick={() => setStorageMaintenance(false)}>
+                退出
+              </button>
+            </div>
+          )}
           {recentOutputs.length > 0 && (
             <div className="output-row">
               <span>最新成果</span>
@@ -4895,7 +5113,7 @@ export default function Home() {
               type="file"
               multiple
               hidden
-              disabled={uploading || projectReadOnly}
+              disabled={uploading || projectReadOnly || storageMaintenance}
               onChange={(event) => {
                 void uploadFiles(event.target.files);
                 event.target.value = "";
@@ -4907,7 +5125,7 @@ export default function Home() {
               accept="image/*"
               multiple
               hidden
-              disabled={uploading || projectReadOnly}
+              disabled={uploading || projectReadOnly || storageMaintenance}
               onChange={(event) => {
                 void uploadFiles(event.target.files);
                 event.target.value = "";
@@ -4925,7 +5143,7 @@ export default function Home() {
                     current === "attachments" ? undefined : "attachments",
                   )
                 }
-                disabled={uploading || Boolean(activeProject?.archivedAt)}
+                disabled={uploading || Boolean(activeProject?.archivedAt) || storageMaintenance}
               >
                 <Paperclip size={19} weight="bold" />
               </button>
@@ -4942,6 +5160,8 @@ export default function Home() {
               placeholder={
                 activeProject?.archivedAt
                   ? "项目已归档，仅可查看"
+                  : storageMaintenance
+                    ? "描述需要检查或清理的磁盘问题…"
                   : projectRunningTask &&
                       projectRunningTask.threadId !== threadId
                     ? "本项目另一任务正在执行…"
