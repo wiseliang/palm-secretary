@@ -178,6 +178,11 @@
 .shared-file-summary span { overflow: hidden; color: var(--muted); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
 
 .header-project-menu > div > button small { margin-left: auto; color: var(--accent); font-size: 10px; }
+.header-project-menu > div > button.cli-update-available {
+  background: color-mix(in srgb, var(--accent-soft) 72%, var(--surface));
+  color: var(--accent);
+}
+.header-project-menu > div > button.cli-update-available small { color: var(--warning); }
 .system-alert > div { display: grid; gap: 3px; min-width: 0; }
 .system-alert > button { display: inline-flex; align-items: center; justify-content: center; gap: 6px; min-height: 34px; flex: none; padding: 0 11px; border: 1px solid currentColor; border-radius: var(--radius-control); background: transparent; color: inherit; font-size: 11px; font-weight: 700; cursor: pointer; }
 .system-alert > button.active { background: currentColor; color: var(--surface-strong); }

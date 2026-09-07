@@ -18,6 +18,7 @@ import { ProjectStore } from './project-store.js';
 import { readGitSnapshot } from './development-status.js';
 import { enrichDevelopmentResultWithGithub } from './github-status.js';
 import { resolveModelSelection, type CodexModel } from './model-selection.js';
+import { CliVersionChecker } from './cli-version.js';
 
 const app = Fastify({ logger: { level: process.env.LOG_LEVEL ?? 'info' }, trustProxy: '127.0.0.1' });
 const bridge = new CodexBridge();
@@ -33,6 +34,13 @@ type TurnAcceptance = { threadId: string; payload: { turn?: { id?: string } }; r
 const pendingTurnRequests = new Map<string, Promise<TurnAcceptance | undefined>>();
 const projects = new ProjectStore(config.workspace);
 const execFileAsync = promisify(execFile);
+const cliVersionChecker = new CliVersionChecker({
+  codexBin: config.codexBin,
+  npmBin: config.npmBin,
+  proxyUrl: config.proxyUrl,
+  enabled: config.codexVersionCheckEnabled,
+  intervalMs: config.codexVersionCheckIntervalMs,
+});
 function outputInstructions(projectId: string): string {
   const inbox = projects.inbox(projectId);
   const outbox = projects.outbox(projectId);
@@ -297,6 +305,11 @@ app.get('/api/usage', async (request, reply) => {
     rateLimits: rateLimits.status === 'fulfilled' ? rateLimits.value : null,
     usage: usage.status === 'fulfilled' ? usage.value : null,
   };
+});
+
+app.get<{ Querystring: { refresh?: string } }>('/api/codex/version', async (request, reply) => {
+  if (!requireOwner(request, reply)) return;
+  return cliVersionChecker.get(request.query.refresh === '1');
 });
 
 app.post('/api/usage/reset', async (request, reply) => {
@@ -950,6 +963,7 @@ app.get('/api/ws', { websocket: true }, (socket, request) => {
 });
 
 const shutdown = async () => {
+  cliVersionChecker.stop();
   await bridge.close();
   await app.close();
 };
@@ -957,4 +971,5 @@ process.once('SIGTERM', shutdown);
 process.once('SIGINT', shutdown);
 
 await app.listen({ host: config.host, port: config.port });
+cliVersionChecker.start();
 app.log.info({ event: 'sudo.self-test', ...(await sudoInfo()) }, 'Codex sudo 权限自检');

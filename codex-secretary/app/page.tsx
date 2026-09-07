@@ -170,6 +170,14 @@ type ServerStatus = {
   };
   sudo?: { available: boolean };
 };
+type CliVersionStatus = {
+  state: "current" | "update_available" | "unavailable" | "disabled";
+  installedVersion?: string;
+  latestVersion?: string;
+  updateAvailable: boolean;
+  checkedAt?: string;
+  error?: string;
+};
 type View = "chat" | "history" | "files";
 type UploadResponse = {
   status: number;
@@ -454,6 +462,13 @@ function resetLabel(resetAt?: number, now = Date.now()): string {
   if (hours >= 24)
     return `${Math.floor(hours / 24)} 天 ${hours % 24} 小时后重置`;
   return `${hours ? `${hours} 小时 ` : ""}${minutes} 分钟后重置`;
+}
+
+function versionCheckLabel(checkedAt?: string): string {
+  if (!checkedAt) return "等待首次检查";
+  const date = new Date(checkedAt);
+  if (Number.isNaN(date.getTime())) return "检查时间未知";
+  return `${date.toLocaleDateString("zh-CN", { month: "numeric", day: "numeric" })} ${date.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false })} 检查`;
 }
 
 function uploadOnce(
@@ -1309,6 +1324,7 @@ export default function Home() {
   const [focusedMessageId, setFocusedMessageId] = useState<string>();
   const [attachments, setAttachments] = useState<UploadedFile[]>([]);
   const [status, setStatus] = useState<ServerStatus>({});
+  const [cliVersion, setCliVersion] = useState<CliVersionStatus>();
   const [usageWindows, setUsageWindows] = useState<UsageWindow[]>([]);
   const [resetCredits, setResetCredits] = useState<ResetCreditSummary>();
   const [usageClock, setUsageClock] = useState(() => Date.now());
@@ -1552,11 +1568,14 @@ export default function Home() {
   }, [focusedMessageId, messages, view]);
 
   const loadDashboard = useCallback(async () => {
-    const [statusResponse, usageResponse] = await Promise.allSettled([
+    const [statusResponse, usageResponse, versionResponse] = await Promise.allSettled([
       fetch("/api/status").then((response) =>
         response.ok ? response.json() : Promise.reject(),
       ),
       fetch("/api/usage").then((response) =>
+        response.ok ? response.json() : Promise.reject(),
+      ),
+      fetch("/api/codex/version").then((response) =>
         response.ok ? response.json() : Promise.reject(),
       ),
     ]);
@@ -1571,7 +1590,25 @@ export default function Home() {
       setResetCredits(resetCreditSummaryFrom(value.rateLimits));
       setUsageClock(Date.now());
     }
+    if (versionResponse.status === "fulfilled")
+      setCliVersion(versionResponse.value as CliVersionStatus);
   }, []);
+
+  async function refreshCliVersion() {
+    try {
+      const response = await fetch("/api/codex/version?refresh=1");
+      if (!response.ok) throw new Error("检查失败");
+      const value = (await response.json()) as CliVersionStatus;
+      setCliVersion(value);
+      setNotice(value.updateAvailable
+        ? `Codex CLI ${value.installedVersion ?? "当前版本"} → ${value.latestVersion ?? "新版本"} 可更新`
+        : value.state === "current"
+          ? "Codex CLI 已是稳定最新版"
+          : value.error ?? "暂时无法检查 Codex CLI 更新");
+    } catch {
+      setNotice("暂时无法检查 Codex CLI 更新");
+    }
+  }
 
   async function consumeResetCredit() {
     if (resetBusy) return;
@@ -3830,6 +3867,26 @@ export default function Home() {
                 >
                   <SlidersHorizontal size={17} />
                   运行设置
+                </button>
+                <button
+                  className={cliVersion?.updateAvailable ? "cli-update-available" : undefined}
+                  onClick={() => {
+                    setOpenMenu(undefined);
+                    void refreshCliVersion();
+                  }}
+                  title={versionCheckLabel(cliVersion?.checkedAt)}
+                >
+                  <ArrowClockwise size={17} weight={cliVersion?.updateAvailable ? "bold" : "regular"} />
+                  {cliVersion?.updateAvailable
+                    ? "Codex CLI 可更新"
+                    : cliVersion?.state === "current"
+                      ? "Codex CLI 已是最新版"
+                      : "检查 Codex CLI 更新"}
+                  <small>
+                    {cliVersion?.updateAvailable
+                      ? `${cliVersion.installedVersion} → ${cliVersion.latestVersion}`
+                      : cliVersion?.installedVersion ?? versionCheckLabel(cliVersion?.checkedAt)}
+                  </small>
                 </button>
                 <button
                   onClick={() => {

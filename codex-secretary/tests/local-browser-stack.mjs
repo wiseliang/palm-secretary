@@ -29,6 +29,7 @@ start(process.execPath, ['dist-server/index.js'], {
   TASK_STOP_FREE_BYTES: '1',
   DISK_WARNING_FREE_BYTES: '1',
   LOG_LEVEL: 'error',
+  CODEX_VERSION_CHECK_ENABLED: '0',
 });
 start(process.execPath, [path.join(root, 'node_modules', 'vinext', 'dist', 'cli.js'), 'start', '--host', '127.0.0.1', '--port', '3000']);
 start(process.execPath, [path.join(root, 'tests', 'local-preview-proxy.mjs')]);
