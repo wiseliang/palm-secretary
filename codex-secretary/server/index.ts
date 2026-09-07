@@ -17,6 +17,7 @@ import { CodexBridge } from './app-server.js';
 import { ProjectStore } from './project-store.js';
 import { readGitSnapshot } from './development-status.js';
 import { enrichDevelopmentResultWithGithub } from './github-status.js';
+import { resolveModelSelection, type CodexModel } from './model-selection.js';
 
 const app = Fastify({ logger: { level: process.env.LOG_LEVEL ?? 'info' }, trustProxy: '127.0.0.1' });
 const bridge = new CodexBridge();
@@ -37,7 +38,6 @@ function outputInstructions(projectId: string): string {
   const outbox = projects.outbox(projectId);
   return `你运行在掌心助理的独立项目工作区。用户不需要知道目录约定。代码与 Git 操作以当前工作目录为准，但 Palm 私有文件不在 Git 仓库内。用户上传的附件位于绝对目录 ${inbox}。只要任务产生可下载成果（文档、表格、演示文稿、PDF、图片、压缩包、代码包或其他文件），你必须主动把最终版本保存到绝对目录 ${outbox}，使用清晰中文文件名，并在最终回复中说明文件名。若成果是需要直接查看或扫码的图片，最终回复中还必须单独写一行 Markdown 图片语法：![图片说明](outbox/实际文件名.png)，路径必须与真实文件完全一致；掌心助理会在聊天中直接显示该图片。不要把 inbox 或 outbox 复制进当前 Git 仓库，不要要求用户说出 outbox，也不要只在聊天中声称已生成而不实际写入。纯问答无需强行创建文件。`;
 }
-type CodexModel = { id: string; model: string; displayName: string; description: string; isDefault: boolean; hidden?: boolean; supportedReasoningEfforts: Array<{ reasoningEffort: string; description: string }>; defaultReasoningEffort: string };
 let modelCache: { expiresAt: number; models: CodexModel[] } | undefined;
 
 function threadMarkdown(value: unknown, title: string): string {
@@ -326,6 +326,20 @@ async function availableModels(force = false): Promise<CodexModel[]> {
   const models = (response.data ?? []).filter((model) => model && typeof model.model === 'string' && !model.hidden);
   modelCache = { expiresAt: Date.now() + 5 * 60_000, models };
   return models;
+}
+
+async function executionModel(project: { id: string; model?: string; reasoningEffort?: string }) {
+  try {
+    const selection = resolveModelSelection(await availableModels(), project.model, project.reasoningEffort);
+    if (selection.migrated && selection.model) {
+      await projects.setProjectModel(project.id, selection.model.model, selection.reasoningEffort);
+      app.log.info({ projectId: project.id, model: selection.model.model, effort: selection.reasoningEffort }, '项目模型配置已兼容迁移');
+    }
+    return { model: selection.model?.model ?? project.model, effort: selection.reasoningEffort ?? project.reasoningEffort };
+  } catch (error) {
+    app.log.warn({ projectId: project.id, error: error instanceof Error ? error.message : String(error) }, '无法刷新模型能力，沿用项目现有配置');
+    return { model: project.model, effort: project.reasoningEffort };
+  }
 }
 
 app.get<{ Querystring: { refresh?: string } }>('/api/models', async (request, reply) => {
@@ -872,9 +886,10 @@ app.get('/api/ws', { websocket: true }, (socket, request) => {
         ? `${outputInstructions(message.projectId)}\n\n【存储维护模式】当前请求是服务器磁盘自救任务。只允许检查磁盘占用、识别可安全回收的缓存/临时文件/旧发布版本，并恢复因磁盘不足受影响的掌心助理服务；拒绝与存储维护无关的工作。涉及删除前必须先核对目标不是 current、不是运行中 release、不是用户项目或业务数据；只删除已精确确认的目标，不使用宽泛通配符。不要修改 SSH、防火墙、数据库、用户或权限。完成后复查根分区可用空间和掌心助理服务状态。`
         : outputInstructions(message.projectId);
       if (project.archivedAt) throw new Error('项目已归档，请先恢复后再执行任务');
+      const selectedModel = await executionModel(project);
       if (!threadId) {
         const started = await bridge.call('thread/start', {
-          cwd: projectRoot, model: project.model, config: project.reasoningEffort ? { model_reasoning_effort: project.reasoningEffort } : undefined,
+          cwd: projectRoot, model: selectedModel.model, config: selectedModel.effort ? { model_reasoning_effort: selectedModel.effort } : undefined,
           developerInstructions,
           approvalPolicy: 'never', sandbox: 'danger-full-access', serviceName: 'palm_secretary',
         }) as { thread?: { id?: string } };
@@ -908,8 +923,8 @@ app.get('/api/ws', { websocket: true }, (socket, request) => {
         threadId,
         input,
         cwd: projectRoot,
-        model: project.model,
-        effort: project.reasoningEffort,
+        model: selectedModel.model,
+        effort: selectedModel.effort,
         approvalPolicy: 'never',
         sandboxPolicy: { type: 'dangerFullAccess' },
       }) as { turn?: { id?: string } };

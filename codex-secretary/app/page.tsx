@@ -968,11 +968,13 @@ function effortLabel(value: string) {
     (
       {
         none: "极速",
+        minimal: "最小",
         low: "较低",
         medium: "标准",
         high: "深入",
         xhigh: "很深入",
         max: "最大",
+        ultra: "超强",
       } as Record<string, string>
     )[value] ?? value
   );
@@ -1378,7 +1380,15 @@ export default function Home() {
     models.find((model) => model.model === activeProject?.model) ??
     defaultModel;
   const activeEffort =
-    activeProject?.reasoningEffort ?? activeModel?.defaultReasoningEffort ?? "";
+    (activeProject?.reasoningEffort &&
+    activeModel?.supportedReasoningEfforts.some(
+      (item) => item.reasoningEffort === activeProject.reasoningEffort,
+    )
+      ? activeProject.reasoningEffort
+      : (activeProject?.reasoningEffort === "none" || activeProject?.reasoningEffort === "minimal") &&
+          activeModel?.supportedReasoningEfforts.some((item) => item.reasoningEffort === "low")
+        ? "low"
+        : activeModel?.defaultReasoningEffort) ?? "";
   const projectRunningTask = tasks.find((task) => task.status === "running");
   const projectBusy = running || Boolean(projectRunningTask);
   const developmentByTurn = new Map(
