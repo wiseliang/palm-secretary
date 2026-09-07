@@ -1,6 +1,6 @@
 {
   "name": "palm-secretary",
-  "version": "0.15.7",
+  "version": "0.15.8",
   "private": true,
   "engines": {
     "node": ">=22.13.0"
@@ -31,6 +31,8 @@
     "test:v021": "node tests/github-pr-ci-v021.mjs",
     "test:v022": "node tests/model-selection-v022.mjs",
     "test:v023": "node tests/cli-version-v023.mjs",
+    "test:v024": "node tests/reliability-v024.mjs",
+    "test:all": "node tests/run-all.mjs",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern dist-server --ignore-pattern .next"
   },
   "dependencies": {

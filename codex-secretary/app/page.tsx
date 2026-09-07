@@ -82,6 +82,7 @@ type ProjectThread = {
   favorite?: boolean;
 };
 type ProjectTask = {
+  submissionPending?: boolean;
   taskId: string;
   turnId: string;
   threadId: string;
@@ -1405,7 +1406,7 @@ export default function Home() {
           activeModel?.supportedReasoningEfforts.some((item) => item.reasoningEffort === "low")
         ? "low"
         : activeModel?.defaultReasoningEffort) ?? "";
-  const projectRunningTask = tasks.find((task) => task.status === "running");
+  const projectRunningTask = tasks.find((task) => task.status === "running" || task.submissionPending);
   const projectBusy = running || Boolean(projectRunningTask);
   const developmentByTurn = new Map(
     tasks
@@ -3142,6 +3143,10 @@ export default function Home() {
   }
 
   async function retryTask(task: ProjectTask) {
+    if (task.submissionPending) {
+      setNotice("执行结果尚待核对，请先打开对话检查，确认没有任务运行后解除阻塞");
+      return;
+    }
     if (projectBusy || socketRef.current?.readyState !== WebSocket.OPEN) {
       setNotice("请等待连接恢复或先停止当前任务");
       return;
@@ -3159,6 +3164,19 @@ export default function Home() {
         },
     );
     startTurn(task.title, retryAttachments, task.threadId);
+  }
+
+  async function resolveSubmission(task: ProjectTask) {
+    if (!window.confirm("请先查看对话和成果，确认服务器上该任务已经结束或未启动。确认后解除阻塞；这不会停止服务器任务，也不会自动重新执行。")) return;
+    try {
+      const response = await fetch(`/api/tasks/${encodeURIComponent(task.taskId)}/resolve-submission?projectId=${encodeURIComponent(task.projectId)}`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ confirmNotRunning: true }),
+      });
+      const body = await response.json();
+      if (!response.ok) throw new Error(body.error ?? "核对失败");
+      await loadProjectData(projectId);
+      setNotice("已记录核对结果；如需再次执行，请主动发起新任务");
+    } catch (error) { setNotice(error instanceof Error ? error.message : "核对失败，请稍后重试"); }
   }
 
   const mobileConnection =
@@ -4605,11 +4623,12 @@ export default function Home() {
                             {task.errorMessage ? ` · ${task.errorMessage}` : ""}
                           </small>
                         </span>
-                        <b>{taskStatusLabel(task.status)}</b>
+                        <b>{task.submissionPending ? "待核对" : taskStatusLabel(task.status)}</b>
                       </button>
-                      {((task.outputPaths?.length ?? 0) > 0 ||
+                      {(task.submissionPending || (task.outputPaths?.length ?? 0) > 0 ||
                         ["failed", "interrupted"].includes(task.status)) && (
                         <div className="task-actions">
+                          {task.submissionPending && <button onClick={() => void resolveSubmission(task)}>已核对，解除阻塞</button>}
                           {task.outputPaths?.map((outputPath) => {
                             const query = new URLSearchParams({
                               projectId,
@@ -4624,7 +4643,7 @@ export default function Home() {
                               </a>
                             );
                           })}
-                          {["failed", "interrupted"].includes(task.status) && (
+                          {!task.submissionPending && ["failed", "interrupted"].includes(task.status) && (
                             <button onClick={() => void retryTask(task)}>
                               重新执行
                             </button>

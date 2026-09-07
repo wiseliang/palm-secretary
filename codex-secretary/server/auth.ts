@@ -29,16 +29,21 @@ export function createSession(secret: string, hours: number): string {
 
 export function verifySession(token: string | undefined, secret: string): boolean {
   if (!token) return false;
-  const [payload, suppliedSignature] = token.split('.');
-  if (!payload || !suppliedSignature) return false;
+  const [payload, suppliedSignature, extra] = token.split('.');
+  if (!payload || !suppliedSignature || extra !== undefined) return false;
   const expectedSignature = createHmac('sha256', secret).update(payload).digest('base64url');
   const supplied = Buffer.from(suppliedSignature);
   const expected = Buffer.from(expectedSignature);
   if (supplied.length !== expected.length || !timingSafeEqual(supplied, expected)) return false;
   try {
     const parsed = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8')) as { sub?: string; exp?: number };
-    return parsed.sub === 'owner' && typeof parsed.exp === 'number' && parsed.exp > Date.now();
+    return parsed.sub === 'owner' && typeof parsed.exp === 'number' && Number.isFinite(parsed.exp) && parsed.exp > Date.now();
   } catch {
     return false;
   }
+}
+
+// Call only after signature verification when making authorization decisions.
+export function sessionExpiry(token: string): number {
+  return (JSON.parse(Buffer.from(token.split('.')[0], 'base64url').toString('utf8')) as { exp: number }).exp;
 }

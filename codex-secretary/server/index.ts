@@ -4,7 +4,7 @@ import multipart from '@fastify/multipart';
 import websocket from '@fastify/websocket';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { createReadStream, createWriteStream } from 'node:fs';
+import { createWriteStream } from 'node:fs';
 import { appendFile, mkdir, readFile, readdir, rename, rm, stat, statfs } from 'node:fs/promises';
 import path from 'node:path';
 import { pipeline } from 'node:stream/promises';
@@ -12,13 +12,14 @@ import { randomUUID } from 'node:crypto';
 import { isIP } from 'node:net';
 import { z } from 'zod';
 import { config } from './config.js';
-import { createSession, verifyPassword, verifySession } from './auth.js';
+import { createSession, verifyPassword } from './auth.js';
 import { CodexBridge } from './app-server.js';
 import { ProjectStore } from './project-store.js';
 import { readGitSnapshot } from './development-status.js';
 import { enrichDevelopmentResultWithGithub } from './github-status.js';
 import { resolveModelSelection, type CodexModel } from './model-selection.js';
 import { CliVersionChecker } from './cli-version.js';
+import { SessionStore } from './session-store.js';
 
 const app = Fastify({ logger: { level: process.env.LOG_LEVEL ?? 'info' }, trustProxy: '127.0.0.1' });
 const bridge = new CodexBridge();
@@ -33,6 +34,8 @@ const loginAttempts = new Map<string, { count: number; resetAt: number }>();
 type TurnAcceptance = { threadId: string; payload: { turn?: { id?: string } }; replayed?: boolean; clientRequestId: string };
 const pendingTurnRequests = new Map<string, Promise<TurnAcceptance | undefined>>();
 const projects = new ProjectStore(config.workspace);
+const sessions = new SessionStore(path.join(config.workspace, '.palm', 'revoked-sessions.json'), config.sessionSecret);
+const socketSessions = new Map<SocketLike, string>();
 const execFileAsync = promisify(execFile);
 const cliVersionChecker = new CliVersionChecker({
   codexBin: config.codexBin,
@@ -74,6 +77,7 @@ function threadMarkdown(value: unknown, title: string): string {
 
 await mkdir(config.workspace, { recursive: true });
 await projects.initialize();
+await sessions.initialize();
 
 await app.register(cookie);
 await app.register(multipart, {
@@ -84,7 +88,7 @@ await app.register(websocket);
 app.addContentTypeParser('application/octet-stream', { parseAs: 'buffer', bodyLimit: 9 * 1024 * 1024 }, (_request, body, done) => done(null, body));
 
 function authenticated(request: FastifyRequest): boolean {
-  return verifySession(request.cookies.palm_session, config.sessionSecret);
+  return sessions.valid(request.cookies.palm_session);
 }
 
 function originAllowed(request: FastifyRequest): boolean {
@@ -282,6 +286,14 @@ app.post('/api/auth/login', async (request, reply) => {
 
 app.post('/api/auth/logout', async (request, reply) => {
   if (!requireOwner(request, reply)) return;
+  const token = request.cookies.palm_session!;
+  try {
+    await sessions.revoke(token);
+  } finally {
+    for (const [socket, session] of socketSessions) {
+      if (session === token) socket.close(1008, 'session revoked');
+    }
+  }
   reply.clearCookie('palm_session', { path: '/' });
   return { ok: true };
 });
@@ -403,6 +415,18 @@ app.get<{ Querystring: { since?: string } }>('/api/tasks/completed', async (requ
 app.get<{ Querystring: { projectId?: string } }>('/api/tasks', async (request, reply) => {
   if (!requireOwner(request, reply)) return;
   return { tasks: projects.listTasks(request.query.projectId ?? 'default') };
+});
+
+app.post<{ Params: { id: string }; Querystring: { projectId?: string } }>('/api/tasks/:id/resolve-submission', async (request, reply) => {
+  if (!requireOwner(request, reply)) return;
+  const parsed = z.object({ confirmNotRunning: z.literal(true) }).safeParse(request.body);
+  if (!parsed.success) return reply.code(400).send({ error: '请先核对任务已停止或未启动' });
+  const projectId = request.query.projectId ?? 'default';
+  if (startingProjects.has(projectId)) return reply.code(409).send({ error: '提交请求仍在处理中，请稍后核对' });
+  try {
+    await projects.resolveSubmission(projectId, request.params.id);
+    return { ok: true };
+  } catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : '核对失败' }); }
 });
 
 function searchableText(value: unknown): string {
@@ -779,11 +803,10 @@ app.get<{ Querystring: { path?: string; projectId?: string } }>('/api/files/down
   if (!request.query.path) return reply.code(400).send({ error: '缺少文件路径' });
   try {
     const filePath = projects.safeStoredPath(request.query.projectId ?? 'default', request.query.path);
-    const details = await stat(filePath);
-    if (!details.isFile()) return reply.code(404).send({ error: '文件不存在' });
+    const handle = await projects.openStoredFile(request.query.projectId ?? 'default', request.query.path);
     reply.header('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(displayFileName(path.basename(filePath)))}`);
     reply.header('X-Content-Type-Options', 'nosniff');
-    return reply.send(createReadStream(filePath));
+    return reply.send(handle.createReadStream());
   } catch {
     return reply.code(404).send({ error: '文件不存在' });
   }
@@ -794,15 +817,15 @@ app.get<{ Querystring: { path?: string; projectId?: string } }>('/api/files/prev
   if (!request.query.path) return reply.code(400).send({ error: '缺少文件路径' });
   try {
     const filePath = projects.safeStoredPath(request.query.projectId ?? 'default', request.query.path);
-    const details = await stat(filePath);
     const contentType = previewContentType(filePath);
-    if (!details.isFile() || !contentType) return reply.code(415).send({ error: '该文件类型暂不支持在线预览' });
+    if (!contentType) return reply.code(415).send({ error: '该文件类型暂不支持在线预览' });
+    const handle = await projects.openStoredFile(request.query.projectId ?? 'default', request.query.path);
     reply.header('Content-Type', contentType);
     reply.header('Content-Disposition', `inline; filename*=UTF-8''${encodeURIComponent(displayFileName(path.basename(filePath)))}`);
     reply.header('X-Content-Type-Options', 'nosniff');
     reply.header('Cache-Control', 'private, no-store');
     reply.header('Content-Security-Policy', "default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'");
-    return reply.send(createReadStream(filePath));
+    return reply.send(handle.createReadStream());
   } catch {
     return reply.code(404).send({ error: '文件不存在' });
   }
@@ -813,10 +836,7 @@ app.delete<{ Querystring: { path?: string; projectId?: string } }>('/api/files',
   if (!request.query.path) return reply.code(400).send({ error: '缺少文件路径' });
   try {
     if (projects.getProject(request.query.projectId ?? 'default').archivedAt) return reply.code(409).send({ error: '项目已归档，请先恢复后再删除文件' });
-    const filePath = projects.safeStoredPath(request.query.projectId ?? 'default', request.query.path);
-    const details = await stat(filePath);
-    if (!details.isFile()) throw new Error('不是文件');
-    await rm(filePath);
+    await projects.deleteStoredFile(request.query.projectId ?? 'default', request.query.path);
     return { ok: true };
   } catch {
     return reply.code(404).send({ error: '文件不存在' });
@@ -835,12 +855,18 @@ app.get('/api/ws', { websocket: true }, (socket, request) => {
     return;
   }
   sockets.add(socket);
+  socketSessions.set(socket, request.cookies.palm_session!);
+  const sessionTimer = setInterval(() => {
+    if (!authenticated(request)) socket.close(1008, 'session expired');
+  }, 15_000);
+  sessionTimer.unref();
   socket.send(JSON.stringify({ type: 'ready' }));
 
   socket.on('message', async (raw) => {
     let clientRequestId: string | undefined;
     let operation: 'turn.start' | 'turn.interrupt' | 'thread.subscribe' | 'unknown' = 'unknown';
     try {
+      if (!authenticated(request)) { socket.close(1008, 'unauthorized'); return; }
       const parsed = clientMessage.safeParse(JSON.parse(raw.toString()));
       if (!parsed.success) throw new Error('消息格式无效');
       const message = parsed.data;
@@ -856,6 +882,7 @@ app.get('/api/ws', { websocket: true }, (socket, request) => {
         throw new Error('Codex 服务正在核对中断任务，请稍后重试');
       }
       await bridge.ready();
+      if (!authenticated(request)) { socket.close(1008, 'unauthorized'); return; }
       app.log.info({ event: message.type }, 'Codex App Server 已就绪');
       if (message.type === 'turn.interrupt') {
         await bridge.call('turn/interrupt', { threadId: message.threadId, turnId: message.turnId });
@@ -864,21 +891,22 @@ app.get('/api/ws', { websocket: true }, (socket, request) => {
       const requestId = message.clientRequestId ?? randomUUID();
       clientRequestId = requestId;
       const requestKey = `${message.projectId}:${requestId}`;
+      const pendingRequest = pendingTurnRequests.get(requestKey);
+      if (pendingRequest) {
+        const accepted = await pendingRequest;
+        if (!accepted) throw new Error('原请求执行结果待核对，请检查任务记录，不要重复提交');
+        setSocketThread(socket, accepted.threadId);
+        socket.send(JSON.stringify({ type: 'turn.accepted', ...accepted, replayed: true }));
+        return;
+      }
       const completedRequest = projects.findTaskByClientRequestId(message.projectId, requestId);
       if (completedRequest) {
+        if (completedRequest.turnId.startsWith('pending:')) throw new Error('该请求已登记但执行结果尚不确定，请核对任务记录，不要重复提交');
         setSocketThread(socket, completedRequest.threadId);
         socket.send(JSON.stringify({
           type: 'turn.accepted', clientRequestId: requestId, replayed: true,
           threadId: completedRequest.threadId, payload: { turn: { id: completedRequest.turnId } },
         }));
-        return;
-      }
-      const pendingRequest = pendingTurnRequests.get(requestKey);
-      if (pendingRequest) {
-        const accepted = await pendingRequest;
-        if (!accepted) throw new Error('原请求执行失败，请检查任务记录后再试');
-        setSocketThread(socket, accepted.threadId);
-        socket.send(JSON.stringify({ type: 'turn.accepted', ...accepted, replayed: true }));
         return;
       }
       let settlePending!: (value: TurnAcceptance | undefined) => void;
@@ -932,6 +960,10 @@ app.get('/api/ws', { websocket: true }, (socket, request) => {
       }
       const outputBaseline = await projects.outputBaseline(message.projectId);
       const gitBaseline = await readGitSnapshot(projectRoot, false, true);
+      if (!authenticated(request)) throw new Error('登录已失效，请重新登录');
+      // Write intent before invoking Codex: a timeout must never erase the dedupe key.
+      await projects.rememberTask(`pending:${requestId}`, threadId, message.projectId, message.text, message.attachments ?? [], outputBaseline, requestId, gitBaseline);
+      if (!authenticated(request)) throw new Error('登录已失效，请重新登录后核对待提交记录');
       const turn = await bridge.call('turn/start', {
         threadId,
         input,
@@ -941,7 +973,8 @@ app.get('/api/ws', { websocket: true }, (socket, request) => {
         approvalPolicy: 'never',
         sandboxPolicy: { type: 'dangerFullAccess' },
       }) as { turn?: { id?: string } };
-      if (turn.turn?.id) await projects.rememberTask(turn.turn.id, threadId, message.projectId, message.text, message.attachments ?? [], outputBaseline, requestId, gitBaseline);
+      if (!turn.turn?.id) throw new Error('请求已登记，但未取得执行编号，请核对任务记录');
+      await projects.bindTaskTurn(threadId, requestId, turn.turn.id);
       const accepted: TurnAcceptance = { threadId, payload: turn, clientRequestId: requestId };
       settlePending(accepted);
       socket.send(JSON.stringify({ type: 'turn.accepted', ...accepted }));
@@ -957,6 +990,8 @@ app.get('/api/ws', { websocket: true }, (socket, request) => {
     }
   });
   socket.on('close', () => {
+    clearInterval(sessionTimer);
+    socketSessions.delete(socket);
     sockets.delete(socket);
     detachSocketFromThread(socket);
   });

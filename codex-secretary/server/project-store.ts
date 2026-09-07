@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
-import { access, cp, mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { access, cp, mkdir, open, readFile, readdir, realpath, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { constants, lstatSync, realpathSync } from 'node:fs';
 import path from 'node:path';
 import {
   aggregateDevelopmentResult,
@@ -48,6 +49,7 @@ export type ProjectTask = {
   errorMessage?: string;
   outputBaseline?: Record<string, string>;
   clientRequestId?: string;
+  submissionPending?: boolean;
   gitBaseline?: GitSnapshot;
   verificationCommands?: VerificationCommand[];
   fileChangeDetected?: boolean;
@@ -64,6 +66,8 @@ export class ProjectStore {
   private readonly stateFile: string;
   private state: StoreState = { version: 8, projects: [], threads: [], tasks: [] };
   private writeQueue: Promise<void> = Promise.resolve();
+  private committedState = structuredClone(this.state);
+  private writeGeneration = 0;
 
   constructor(private readonly workspace: string) {
     this.stateDir = path.join(workspace, '.palm');
@@ -72,9 +76,22 @@ export class ProjectStore {
 
   async initialize(): Promise<void> {
     await mkdir(this.stateDir, { recursive: true, mode: 0o700 });
+    let stateRead = false;
     try {
-      const parsed = JSON.parse(await readFile(this.stateFile, 'utf8')) as StoreState | (Omit<StoreState, 'version'> & { version: 3 | 4 | 5 | 6 | 7 }) | (Omit<StoreState, 'version' | 'tasks'> & { version: 2 });
+      const source = await readFile(this.stateFile, 'utf8');
+      stateRead = true;
+      const parsed = JSON.parse(source) as StoreState | (Omit<StoreState, 'version'> & { version: 3 | 4 | 5 | 6 | 7 }) | (Omit<StoreState, 'version' | 'tasks'> & { version: 2 });
       if (![2, 3, 4, 5, 6, 7, 8].includes(parsed.version) || !Array.isArray(parsed.projects) || !Array.isArray(parsed.threads)) throw new Error('版本不兼容');
+      if (parsed.version !== 2 && !Array.isArray(parsed.tasks)) throw new Error('任务记录无效');
+      if (parsed.projects.some((project) => !project || !PROJECT_ID.test(project.id) ||
+          typeof project.name !== 'string' || typeof project.directory !== 'string' ||
+          typeof project.createdAt !== 'string' || typeof project.updatedAt !== 'string' ||
+          path.isAbsolute(project.directory) || project.directory.split(/[\\/]/).includes('..'))) throw new Error('项目记录无效');
+      if (parsed.threads.some((thread) => !thread || typeof thread.threadId !== 'string' ||
+          !parsed.projects.some((project) => project.id === thread.projectId))) throw new Error('对话记录无效');
+      if (parsed.version !== 2 && parsed.tasks.some((task) => !task || typeof task.turnId !== 'string' ||
+          typeof task.taskId !== 'string' || !['running', 'completed', 'failed', 'interrupted'].includes(task.status) ||
+          !parsed.projects.some((project) => project.id === task.projectId))) throw new Error('任务记录无效');
       const parsedTasks = parsed.version === 2 ? [] : parsed.tasks;
       const tasks: ProjectTask[] = Array.isArray(parsedTasks)
         ? parsedTasks.map((task: ProjectTask) => ({
@@ -85,10 +102,11 @@ export class ProjectStore {
           }))
         : [];
       this.state = { version: 8, projects: parsed.projects, threads: parsed.threads, tasks };
+      this.committedState = structuredClone(this.state);
       if (parsed.version !== 8) await this.persist();
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-        await writeFile(`${this.stateFile}.invalid-${Date.now()}`, await readFile(this.stateFile), { mode: 0o600 }).catch(() => undefined);
+      if (stateRead || (error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        throw new Error('项目状态无法读取或迁移，已停止启动并保留原文件。请恢复有效的 state.json 后重启。', { cause: error });
       }
       const now = new Date().toISOString();
       this.state = { version: 8, projects: [{ id: 'default', name: '默认项目', directory: 'default', createdAt: now, updatedAt: now }], threads: [], tasks: [] };
@@ -118,7 +136,7 @@ export class ProjectStore {
         .filter(([name, signature]) => task.outputBaseline?.[name] !== signature)
         .map(([name]) => `outbox/${name}`);
       task.status = 'interrupted'; task.updatedAt = interruptedAt; task.completedAt = interruptedAt;
-      task.errorMessage = '服务重启时任务仍在运行，请确认结果后再重新执行'; delete task.outputBaseline; recovered = true;
+      task.errorMessage = task.submissionPending ? '请求已登记，但执行结果待核对；确认没有任务运行后再解除阻塞' : '服务重启时任务仍在运行，请确认结果后再重新执行'; delete task.outputBaseline; recovered = true;
       const gitAfter = await readGitSnapshot(this.projectWorkdir(task.projectId));
       task.developmentResult = await aggregateDevelopmentResult(
         this.projectWorkdir(task.projectId), task.gitBaseline, gitAfter,
@@ -187,7 +205,7 @@ export class ProjectStore {
   }
 
   hasRunningTask(projectId: string): boolean {
-    return this.state.tasks.some((task) => task.projectId === projectId && task.status === 'running');
+    return this.state.tasks.some((task) => task.projectId === projectId && (task.status === 'running' || task.submissionPending));
   }
 
   runningTaskIds(): string[] {
@@ -298,7 +316,7 @@ export class ProjectStore {
 
   hasRunningTaskForThread(threadId: string, projectId: string): boolean {
     this.assertThreadProject(threadId, projectId);
-    return this.state.tasks.some((task) => task.projectId === projectId && task.threadId === threadId && task.status === 'running');
+    return this.state.tasks.some((task) => task.projectId === projectId && task.threadId === threadId && (task.status === 'running' || task.submissionPending));
   }
 
   findTaskByClientRequestId(projectId: string, clientRequestId: string): ProjectTask | undefined {
@@ -319,6 +337,8 @@ export class ProjectStore {
         taskId: turnId, turnId, threadId, projectId,
         title: title.trim().slice(0, 120) || '新任务', status: 'running', startedAt: now, updatedAt: now,
         attachments: [...attachments], outputPaths: [], outputBaseline: outputBaseline ?? await this.snapshotOutbox(projectId), clientRequestId,
+        submissionPending: turnId.startsWith('pending:') || undefined,
+        errorMessage: turnId.startsWith('pending:') ? '正在确认执行是否开始；若连接中断，请核对任务记录' : undefined,
         gitBaseline: gitBaseline ?? await readGitSnapshot(this.projectWorkdir(projectId), false, true), verificationCommands: [],
       };
       this.state.tasks.push(task);
@@ -331,9 +351,9 @@ export class ProjectStore {
     if (!itemValue || typeof itemValue !== 'object') return;
     const item = itemValue as Record<string, unknown>;
     const task = turnId
-      ? this.state.tasks.find((entry) => entry.threadId === threadId && entry.turnId === turnId && entry.status === 'running')
+      ? this.taskForTurn(threadId, turnId)
       : [...this.state.tasks].reverse().find((entry) => entry.threadId === threadId && entry.status === 'running');
-    if (!task) return;
+    if (!task || task.status !== 'running') return;
     let changed = false;
     if (item.type === 'fileChange') {
       const developmentFileChanged = Array.isArray(item.changes) && item.changes.some((changeValue) => {
@@ -365,7 +385,7 @@ export class ProjectStore {
 
   async finishTask(threadId: string, turnId: string | undefined, status: ProjectTask['status'], errorMessage?: string): Promise<ProjectTask | undefined> {
     const task = turnId
-      ? this.state.tasks.find((item) => item.threadId === threadId && item.turnId === turnId)
+      ? this.taskForTurn(threadId, turnId)
       : [...this.state.tasks].reverse().find((item) => item.threadId === threadId && item.status === 'running');
     if (!task) return undefined;
     if (task.status !== 'running') {
@@ -465,7 +485,93 @@ export class ProjectStore {
     if (resolved !== inbox && !resolved.startsWith(`${inbox}${path.sep}`) && resolved !== outbox && !resolved.startsWith(`${outbox}${path.sep}`)) {
       throw new Error('文件路径不在当前项目的允许范围内');
     }
+    // Reject links in every existing component, including project/inbox roots.
+    // Also supports a not-yet-created upload destination.
+    let current = this.workspace;
+    const workspaceReal = realpathSync(this.workspace);
+    for (const segment of path.relative(this.workspace, resolved).split(path.sep)) {
+      current = path.join(current, segment);
+      try {
+        if (lstatSync(current).isSymbolicLink()) throw new Error('不允许访问符号链接文件');
+        const real = realpathSync(current);
+        if (!real.startsWith(`${workspaceReal}${path.sep}`)) throw new Error('文件真实路径超出工作区');
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') break;
+        throw error;
+      }
+    }
     return resolved;
+  }
+
+  async openStoredFile(projectId: string, relativePath: string) {
+    const filePath = this.safeStoredPath(projectId, relativePath);
+    const handle = await open(filePath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    try {
+      if (!(await handle.stat()).isFile()) throw new Error('不是文件');
+      // Linux production: validate the opened descriptor, not a path that can be swapped.
+      if (process.platform === 'linux') {
+        const openedPath = await realpath(`/proc/self/fd/${handle.fd}`);
+        const expected = path.join(realpathSync(this.workspace), path.relative(this.workspace, filePath));
+        if (openedPath !== expected) throw new Error('文件路径在打开期间发生变化');
+        this.safeStoredPath(projectId, relativePath);
+      } else {
+        this.safeStoredPath(projectId, relativePath);
+        const current = await stat(filePath);
+        const opened = await handle.stat();
+        if (current.ino !== opened.ino || current.dev !== opened.dev) throw new Error('文件已更改');
+      }
+      return handle;
+    } catch (error) { await handle.close(); throw error; }
+  }
+
+  async deleteStoredFile(projectId: string, relativePath: string): Promise<void> {
+    const filePath = this.safeStoredPath(projectId, relativePath);
+    if (process.platform !== 'linux') {
+      if (!(await stat(filePath)).isFile()) throw new Error('不是文件');
+      await rm(filePath);
+      return;
+    }
+    const parent = await open(path.dirname(filePath), constants.O_RDONLY | (constants.O_DIRECTORY ?? 0) | (constants.O_NOFOLLOW ?? 0));
+    try {
+      const anchor = `/proc/self/fd/${parent.fd}`;
+      const expectedParent = path.join(realpathSync(this.workspace), path.relative(this.workspace, path.dirname(filePath)));
+      if (await realpath(anchor) !== expectedParent) throw new Error('文件目录已更改');
+      this.safeStoredPath(projectId, relativePath);
+      const anchoredFile = path.join(anchor, path.basename(filePath));
+      if (!(await stat(anchoredFile)).isFile()) throw new Error('不是文件');
+      await rm(anchoredFile);
+    } finally { await parent.close(); }
+  }
+
+  private taskForTurn(threadId: string, turnId: string): ProjectTask | undefined {
+    const existing = this.state.tasks.find((task) => task.threadId === threadId && task.turnId === turnId);
+    if (existing) return existing;
+    const pending = this.state.tasks.find((task) => task.threadId === threadId && task.status === 'running' && task.turnId.startsWith('pending:'));
+    if (pending) { pending.turnId = turnId; pending.taskId = turnId; delete pending.submissionPending; delete pending.errorMessage; }
+    return pending;
+  }
+
+  async bindTaskTurn(threadId: string, requestId: string, turnId: string): Promise<void> {
+    const task = this.state.tasks.find((entry) => entry.threadId === threadId && entry.clientRequestId === requestId);
+    if (!task) throw new Error('任务登记缺失，请核对执行记录');
+    if (!task.turnId.startsWith('pending:') && task.turnId !== turnId) throw new Error('任务编号冲突，请核对执行记录');
+    task.turnId = turnId;
+    task.taskId = turnId;
+    delete task.submissionPending;
+    if (task.status === 'running') delete task.errorMessage;
+    await this.persist();
+  }
+
+  async resolveSubmission(projectId: string, taskId: string): Promise<void> {
+    this.getProject(projectId);
+    const task = this.state.tasks.find((entry) => entry.projectId === projectId && entry.taskId === taskId);
+    if (!task?.submissionPending) throw new Error('该任务无需人工核对');
+    task.status = 'interrupted';
+    task.updatedAt = new Date().toISOString();
+    task.completedAt = task.updatedAt;
+    task.errorMessage = '用户已核对执行结果并解除阻塞；原请求编号保留，防止自动重发';
+    delete task.submissionPending;
+    await this.persist();
   }
 
   private async ensureProjectDirectories(project: Project): Promise<void> {
@@ -543,11 +649,26 @@ export class ProjectStore {
 
   private async persist(): Promise<void> {
     const data = `${JSON.stringify(this.state, null, 2)}\n`;
-    this.writeQueue = this.writeQueue.then(async () => {
+    const generation = this.writeGeneration;
+    const operation = this.writeQueue.then(async () => {
+      if (generation !== this.writeGeneration) throw new Error('前序保存失败，请重试当前操作');
       const temporary = `${this.stateFile}.${process.pid}.tmp`;
-      await writeFile(temporary, data, { mode: 0o600 });
-      await rename(temporary, this.stateFile);
+      try {
+        if (this.committedState.projects.length) {
+          const backup = `${this.stateFile}.backup`;
+          await writeFile(`${backup}.tmp`, `${JSON.stringify(this.committedState, null, 2)}\n`, { mode: 0o600 });
+          await rename(`${backup}.tmp`, backup);
+        }
+        await writeFile(temporary, data, { mode: 0o600 });
+        await rename(temporary, this.stateFile);
+        this.committedState = JSON.parse(data) as StoreState;
+      } catch (error) {
+        this.writeGeneration += 1;
+        this.state = structuredClone(this.committedState);
+        throw error;
+      }
     });
-    await this.writeQueue;
+    this.writeQueue = operation.catch(() => undefined);
+    await operation;
   }
 }

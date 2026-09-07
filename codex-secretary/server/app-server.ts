@@ -14,13 +14,23 @@ export class CodexBridge extends EventEmitter {
   private nextId = 1;
   private pending = new Map<number, Pending>();
   private readyPromise: Promise<void> | null = null;
+  private failures = 0;
+  private retryAfter = 0;
 
   async ready(): Promise<void> {
-    if (!this.readyPromise) this.readyPromise = this.start();
+    if (!this.readyPromise) {
+      const starting = this.start();
+      this.readyPromise = starting;
+      void starting.catch(() => {
+        if (this.readyPromise === starting) this.readyPromise = null;
+      });
+    }
     return this.readyPromise;
   }
 
   private async start(): Promise<void> {
+    const delay = this.retryAfter - Date.now();
+    if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
     const child = spawn(config.codexBin, [...config.codexArgsPrefix, 'app-server', '--listen', 'stdio://'], {
       cwd: config.workspace,
       env: {
@@ -36,6 +46,7 @@ export class CodexBridge extends EventEmitter {
     this.child = child;
 
     createInterface({ input: child.stdout }).on('line', (line) => {
+      if (this.child !== child) return;
       if (!line.trim()) return;
       try { this.receive(JSON.parse(line) as JsonRecord); }
       catch { this.emit('diagnostic', { level: 'warn', message: '收到无法解析的 App Server 输出' }); }
@@ -48,8 +59,8 @@ export class CodexBridge extends EventEmitter {
         this.emit('diagnostic', { level: 'info', message: 'Codex App Server 输出了一条内部诊断（内容已隐藏）' });
       }
     });
-    child.on('exit', (code, signal) => {
-      const error = new Error(`Codex App Server 已退出 (${code ?? signal ?? 'unknown'})`);
+    const fail = (error: Error) => {
+      if (this.child !== child) return;
       for (const pending of this.pending.values()) {
         clearTimeout(pending.timer);
         pending.reject(error);
@@ -57,15 +68,34 @@ export class CodexBridge extends EventEmitter {
       this.pending.clear();
       this.child = null;
       this.readyPromise = null;
-      this.emit('offline', { code, signal });
+      this.retryAfter = Date.now() + Math.min(5_000, 250 * 2 ** Math.min(this.failures++, 5));
+      child.kill('SIGTERM');
+      const forceStop = setTimeout(() => {
+        if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+      }, 2_000);
+      forceStop.unref();
+      child.once('close', () => clearTimeout(forceStop));
+      this.emit('offline', { reason: error.message });
+    };
+    child.on('error', fail);
+    child.stdin.on('error', fail);
+    child.on('exit', (code, signal) => {
+      fail(new Error(`Codex App Server 已退出 (${code ?? signal ?? 'unknown'})`));
     });
 
-    await this.call('initialize', {
-      clientInfo: { name: 'palm_secretary', title: '掌心助理', version: packageVersion },
-      capabilities: {},
-    });
-    this.notify('initialized', {});
-    this.emit('online');
+    try {
+      await this.call('initialize', {
+        clientInfo: { name: 'palm_secretary', title: '掌心助理', version: packageVersion },
+        capabilities: {},
+      });
+      this.notify('initialized', {});
+      this.failures = 0;
+      this.retryAfter = 0;
+      this.emit('online');
+    } catch (error) {
+      fail(error instanceof Error ? error : new Error(String(error)));
+      throw error;
+    }
   }
 
   private receive(message: JsonRecord): void {
@@ -82,7 +112,7 @@ export class CodexBridge extends EventEmitter {
   }
 
   async call(method: string, params?: JsonRecord, timeoutMs = 30_000): Promise<unknown> {
-    if (!this.child && method !== 'initialize') await this.ready();
+    if (method !== 'initialize') await this.ready();
     if (!this.child) throw new Error('Codex App Server 未运行');
     const id = this.nextId++;
     const result = new Promise<unknown>((resolve, reject) => {
