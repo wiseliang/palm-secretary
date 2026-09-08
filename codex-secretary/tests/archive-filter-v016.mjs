@@ -49,7 +49,7 @@ const projectResetEffect = effects.find((effect) =>
 assert.ok(projectResetEffect, "应存在项目切换时的 UI 重置 effect");
 assert.deepEqual(
   dependencies(projectResetEffect),
-  ["authenticated", "projectId", "loadProjectCore", "loadThreads"],
+  ["authenticated", "projectId", "loadProjectCore", "loadThreads", "updateRun"],
   "项目生命周期不能依赖归档筛选或会随筛选变化的聚合 callback",
 );
 

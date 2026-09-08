@@ -1,4 +1,4 @@
-const CACHE = 'palm-secretary-shell-v11';
+const CACHE = 'palm-secretary-shell-v12';
 const SHELL = ['/', '/manifest.webmanifest', '/icon-192.png', '/icon-512.png'];
 
 self.addEventListener('install', (event) => {
