@@ -20,6 +20,8 @@ import { enrichDevelopmentResultWithGithub } from './github-status.js';
 import { resolveModelSelection, type CodexModel } from './model-selection.js';
 import { CliVersionChecker } from './cli-version.js';
 import { SessionStore } from './session-store.js';
+import { submissionEvidence, turnStatus } from './task-reconciliation.js';
+import { TaskReconciler } from './task-reconciler.js';
 
 const app = Fastify({ logger: { level: process.env.LOG_LEVEL ?? 'info' }, trustProxy: '127.0.0.1' });
 const bridge = new CodexBridge();
@@ -190,8 +192,11 @@ bridge.on('message', async (message: Record<string, unknown>) => {
   }
   if (threadId && typeof message.method === 'string' && ['turn/completed', 'turn/failed', 'turn/interrupted'].includes(message.method)) {
     const turnId = eventTurnId;
-    const status = message.method === 'turn/completed' ? 'completed' : message.method === 'turn/interrupted' ? 'interrupted' : 'failed';
-    const failure = params && typeof (params as Record<string, unknown>).error === 'object'
+    const status = eventTurn?.status === undefined
+      ? (message.method === 'turn/completed' ? 'completed' : message.method === 'turn/interrupted' ? 'interrupted' : 'failed')
+      : turnStatus(eventTurn.status);
+    if (!status || status === 'running') return;
+    const failure = eventTurn?.error && typeof eventTurn.error === 'object' ? eventTurn.error as Record<string, unknown> : params && typeof (params as Record<string, unknown>).error === 'object'
       ? (params as Record<string, unknown>).error as Record<string, unknown> : undefined;
     const errorMessage = typeof failure?.message === 'string' ? failure.message : undefined;
     try {
@@ -217,6 +222,18 @@ let bridgeWasOffline = false;
 let bridgeRecoveryPending = false;
 let bridgeOnlinePending = false;
 let bridgeRecoveryGeneration = 0;
+const reconciler = new TaskReconciler(
+  projects,
+  (threadId) => bridge.call('thread/read', { threadId, includeTurns: true }),
+  (projectId) => bridgeRecoveryPending || startingProjects.has(projectId),
+  (task) => {
+    broadcast({ type: 'tasks.changed', payload: { projectId: task.projectId } });
+    if (task.status !== 'running') broadcast({ type: 'task.finished', payload: {
+      taskId: task.taskId, projectId: task.projectId, threadId: task.threadId,
+      turnId: task.turnId, status: task.status, completedAt: task.completedAt,
+    } });
+  },
+);
 const publishBridgeOnline = () => {
   if (!bridgeWasOffline || bridgeRecoveryPending) return;
   bridgeWasOffline = false;
@@ -414,7 +431,14 @@ app.get<{ Querystring: { since?: string } }>('/api/tasks/completed', async (requ
 
 app.get<{ Querystring: { projectId?: string } }>('/api/tasks', async (request, reply) => {
   if (!requireOwner(request, reply)) return;
+  void reconciler.run(request.query.projectId ?? 'default').catch(() => undefined);
   return { tasks: projects.listTasks(request.query.projectId ?? 'default') };
+});
+
+app.post<{ Querystring: { projectId?: string } }>('/api/tasks/reconcile', async (request, reply) => {
+  if (!requireOwner(request, reply)) return;
+  try { return await reconciler.run(request.query.projectId ?? 'default', true); }
+  catch { return reply.code(400).send({ error: '无法核对当前项目' }); }
 });
 
 app.post<{ Params: { id: string }; Querystring: { projectId?: string } }>('/api/tasks/:id/resolve-submission', async (request, reply) => {
@@ -901,11 +925,14 @@ app.get('/api/ws', { websocket: true }, (socket, request) => {
       }
       const completedRequest = projects.findTaskByClientRequestId(message.projectId, requestId);
       if (completedRequest) {
-        if (completedRequest.turnId.startsWith('pending:')) throw new Error('该请求已登记但执行结果尚不确定，请核对任务记录，不要重复提交');
-        setSocketThread(socket, completedRequest.threadId);
+        if (completedRequest.submissionPending) await reconciler.run(message.projectId, true);
+        const latestRequest = projects.findTaskByClientRequestId(message.projectId, requestId)!;
+        if (latestRequest.submissionPending) throw new Error('正在核对已提交请求，请稍后查看任务记录，不要重复提交');
+        if (latestRequest.turnId.startsWith('pending:')) throw new Error('该请求已经人工核对；如需再次执行，请主动发起新任务');
+        setSocketThread(socket, latestRequest.threadId);
         socket.send(JSON.stringify({
           type: 'turn.accepted', clientRequestId: requestId, replayed: true,
-          threadId: completedRequest.threadId, payload: { turn: { id: completedRequest.turnId } },
+          threadId: latestRequest.threadId, payload: { turn: { id: latestRequest.turnId } },
         }));
         return;
       }
@@ -960,9 +987,14 @@ app.get('/api/ws', { websocket: true }, (socket, request) => {
       }
       const outputBaseline = await projects.outputBaseline(message.projectId);
       const gitBaseline = await readGitSnapshot(projectRoot, false, true);
+      // New threads may not have materialized history yet. Missing evidence disables
+      // inference for a lost turn ID, but must not prevent ordinary submissions.
+      const evidence = await bridge.call('thread/read', { threadId, includeTurns: true })
+        .then((history) => submissionEvidence(history, threadId!, `${message.text}${attachmentNote}`))
+        .catch(() => undefined);
       if (!authenticated(request)) throw new Error('登录已失效，请重新登录');
       // Write intent before invoking Codex: a timeout must never erase the dedupe key.
-      await projects.rememberTask(`pending:${requestId}`, threadId, message.projectId, message.text, message.attachments ?? [], outputBaseline, requestId, gitBaseline);
+      await projects.rememberTask(`pending:${requestId}`, threadId, message.projectId, message.text, message.attachments ?? [], outputBaseline, requestId, gitBaseline, evidence);
       if (!authenticated(request)) throw new Error('登录已失效，请重新登录后核对待提交记录');
       const turn = await bridge.call('turn/start', {
         threadId,
@@ -997,7 +1029,10 @@ app.get('/api/ws', { websocket: true }, (socket, request) => {
   });
 });
 
+const reconciliationTimer = setInterval(() => { void reconciler.run().catch(() => undefined); }, 15_000);
 const shutdown = async () => {
+  clearInterval(reconciliationTimer);
+  reconciler.stop();
   cliVersionChecker.stop();
   await bridge.close();
   await app.close();
@@ -1006,5 +1041,7 @@ process.once('SIGTERM', shutdown);
 process.once('SIGINT', shutdown);
 
 await app.listen({ host: config.host, port: config.port });
+reconciliationTimer.unref();
+void reconciler.run().catch(() => undefined);
 cliVersionChecker.start();
 app.log.info({ event: 'sudo.self-test', ...(await sudoInfo()) }, 'Codex sudo 权限自检');

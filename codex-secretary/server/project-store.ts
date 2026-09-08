@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { access, cp, mkdir, open, readFile, readdir, realpath, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { constants, lstatSync, realpathSync } from 'node:fs';
 import path from 'node:path';
+import type { ReconciledTurn, SubmissionEvidence } from './task-reconciliation.js';
 import {
   aggregateDevelopmentResult,
   isDevelopmentPath,
@@ -50,6 +51,8 @@ export type ProjectTask = {
   outputBaseline?: Record<string, string>;
   clientRequestId?: string;
   submissionPending?: boolean;
+  submissionEvidence?: SubmissionEvidence;
+  reconciledAt?: string;
   gitBaseline?: GitSnapshot;
   verificationCommands?: VerificationCommand[];
   fileChangeDetected?: boolean;
@@ -131,6 +134,13 @@ export class ProjectStore {
     let recovered = false;
     for (const task of this.state.tasks) {
       if (task.status !== 'running') continue;
+      if (task.clientRequestId) {
+        task.status = 'interrupted'; task.submissionPending = true;
+        task.updatedAt = interruptedAt; delete task.completedAt;
+        task.errorMessage = '服务已重启，正在自动核对执行结果';
+        recovered = true;
+        continue;
+      }
       const currentOutputs = await this.snapshotOutbox(task.projectId);
       task.outputPaths = Object.entries(currentOutputs)
         .filter(([name, signature]) => task.outputBaseline?.[name] !== signature)
@@ -308,7 +318,7 @@ export class ProjectStore {
     const sinceTime = Date.parse(since);
     if (!Number.isFinite(sinceTime)) throw new Error('完成时间游标无效');
     return this.state.tasks
-      .filter((task) => task.status !== 'running' && task.completedAt && Date.parse(task.completedAt) > sinceTime)
+      .filter((task) => !task.submissionPending && task.status !== 'running' && task.completedAt && Date.parse(task.completedAt) > sinceTime)
       .sort((a, b) => (a.completedAt ?? '').localeCompare(b.completedAt ?? ''))
       .slice(0, 500)
       .map((task) => this.publicTask(task));
@@ -328,7 +338,7 @@ export class ProjectStore {
     return this.snapshotOutbox(projectId);
   }
 
-  async rememberTask(turnId: string, threadId: string, projectId: string, title: string, attachments: string[] = [], outputBaseline?: Record<string, string>, clientRequestId?: string, gitBaseline?: GitSnapshot): Promise<ProjectTask> {
+  async rememberTask(turnId: string, threadId: string, projectId: string, title: string, attachments: string[] = [], outputBaseline?: Record<string, string>, clientRequestId?: string, gitBaseline?: GitSnapshot, evidence?: SubmissionEvidence): Promise<ProjectTask> {
     this.assertThreadProject(threadId, projectId);
     const now = new Date().toISOString();
     let task = this.state.tasks.find((item) => item.turnId === turnId);
@@ -338,6 +348,7 @@ export class ProjectStore {
         title: title.trim().slice(0, 120) || '新任务', status: 'running', startedAt: now, updatedAt: now,
         attachments: [...attachments], outputPaths: [], outputBaseline: outputBaseline ?? await this.snapshotOutbox(projectId), clientRequestId,
         submissionPending: turnId.startsWith('pending:') || undefined,
+        submissionEvidence: evidence,
         errorMessage: turnId.startsWith('pending:') ? '正在确认执行是否开始；若连接中断，请核对任务记录' : undefined,
         gitBaseline: gitBaseline ?? await readGitSnapshot(this.projectWorkdir(projectId), false, true), verificationCommands: [],
       };
@@ -412,6 +423,7 @@ export class ProjectStore {
     delete task.gitBaseline;
     delete task.verificationCommands;
     delete task.fileChangeDetected;
+    delete task.submissionEvidence;
     await this.persist();
     return this.publicTask(task);
   }
@@ -423,8 +435,10 @@ export class ProjectStore {
     for (const task of tasks) {
       task.status = 'interrupted'; task.updatedAt = now; task.completedAt = now;
       task.errorMessage = reason.trim().slice(0, 500);
+      if (task.clientRequestId) { task.submissionPending = true; delete task.completedAt; }
     }
     for (const task of tasks) {
+      if (task.clientRequestId) continue;
       const currentOutputs = await this.snapshotOutbox(task.projectId);
       task.outputPaths = Object.entries(currentOutputs)
         .filter(([name, signature]) => task.outputBaseline?.[name] !== signature)
@@ -457,6 +471,7 @@ export class ProjectStore {
     delete visible.gitBaseline;
     delete visible.verificationCommands;
     delete visible.fileChangeDetected;
+    delete visible.submissionEvidence;
     return { ...visible, attachments: [...task.attachments], outputPaths: [...task.outputPaths] };
   }
 
@@ -545,8 +560,13 @@ export class ProjectStore {
 
   private taskForTurn(threadId: string, turnId: string): ProjectTask | undefined {
     const existing = this.state.tasks.find((task) => task.threadId === threadId && task.turnId === turnId);
-    if (existing) return existing;
-    const pending = this.state.tasks.find((task) => task.threadId === threadId && task.status === 'running' && task.turnId.startsWith('pending:'));
+    if (existing) {
+      if (existing.submissionPending) {
+        existing.status = 'running'; delete existing.completedAt; delete existing.submissionPending;
+      }
+      return existing;
+    }
+    const pending = this.state.tasks.find((task) => task.threadId === threadId && task.status === 'running' && task.turnId.startsWith('pending:') && !task.submissionEvidence?.knownTurnIds.includes(turnId));
     if (pending) { pending.turnId = turnId; pending.taskId = turnId; delete pending.submissionPending; delete pending.errorMessage; }
     return pending;
   }
@@ -571,7 +591,33 @@ export class ProjectStore {
     task.completedAt = task.updatedAt;
     task.errorMessage = '用户已核对执行结果并解除阻塞；原请求编号保留，防止自动重发';
     delete task.submissionPending;
+    delete task.submissionEvidence;
+    delete task.outputBaseline;
+    delete task.gitBaseline;
+    delete task.verificationCommands;
+    delete task.fileChangeDetected;
     await this.persist();
+  }
+
+  reconciliationCandidates(projectId?: string): ProjectTask[] {
+    if (projectId) this.getProject(projectId);
+    return this.state.tasks.filter((task) => (!projectId || task.projectId === projectId) &&
+      (task.submissionPending || task.status === 'running')).map((task) => structuredClone(task));
+  }
+
+  async applyReconciliation(projectId: string, taskId: string, turn: ReconciledTurn): Promise<ProjectTask | undefined> {
+    const task = this.state.tasks.find((entry) => entry.projectId === projectId && entry.taskId === taskId);
+    // A late poll must never overwrite a terminal event or an explicit manual resolution.
+    if (!task || (!task.submissionPending && task.status !== 'running')) return undefined;
+    if (!task.turnId.startsWith('pending:') && task.turnId !== turn.id) return undefined;
+    if (!task.submissionPending && task.status === 'running' && turn.status === 'running') return undefined;
+    task.turnId = turn.id; task.taskId = turn.id; task.status = 'running';
+    task.reconciledAt = new Date().toISOString(); task.updatedAt = task.reconciledAt;
+    delete task.submissionPending; delete task.completedAt; delete task.errorMessage;
+    await this.persist();
+    for (const item of turn.items) await this.recordTaskExecution(task.threadId, turn.id, item);
+    if (turn.status === 'running') return this.publicTask(task);
+    return this.finishTask(task.threadId, turn.id, turn.status, turn.errorMessage);
   }
 
   private async ensureProjectDirectories(project: Project): Promise<void> {

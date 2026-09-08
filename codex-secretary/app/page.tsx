@@ -1297,6 +1297,7 @@ function messagesFromThread(value: unknown): ChatMessage[] {
 export default function Home() {
   const [booting, setBooting] = useState(true);
   const [authenticated, setAuthenticated] = useState(false);
+  const [reconciling, setReconciling] = useState(false);
   const [password, setPassword] = useState("");
   const [loginError, setLoginError] = useState("");
   const [view, setView] = useState<View>("chat");
@@ -3166,6 +3167,18 @@ export default function Home() {
     startTurn(task.title, retryAttachments, task.threadId);
   }
 
+  async function reconcileTasks(task: ProjectTask) {
+    setReconciling(true);
+    try {
+      const response = await fetch(`/api/tasks/reconcile?projectId=${encodeURIComponent(task.projectId)}`, { method: "POST" });
+      const body = await response.json();
+      if (!response.ok) throw new Error(body.error ?? "核对失败");
+      await loadProjectData(projectId);
+      setNotice(body.recovered > 0 ? "已从执行历史恢复任务状态" : body.unavailable > 0 ? "暂时无法读取执行历史，将继续自动核对" : "暂未找到可确认的结果，将继续自动核对");
+    } catch (error) { setNotice(error instanceof Error ? error.message : "核对失败，请稍后重试"); }
+    finally { setReconciling(false); }
+  }
+
   async function resolveSubmission(task: ProjectTask) {
     if (!window.confirm("请先查看对话和成果，确认服务器上该任务已经结束或未启动。确认后解除阻塞；这不会停止服务器任务，也不会自动重新执行。")) return;
     try {
@@ -4628,7 +4641,8 @@ export default function Home() {
                       {(task.submissionPending || (task.outputPaths?.length ?? 0) > 0 ||
                         ["failed", "interrupted"].includes(task.status)) && (
                         <div className="task-actions">
-                          {task.submissionPending && <button onClick={() => void resolveSubmission(task)}>已核对，解除阻塞</button>}
+                          {task.submissionPending && <button disabled={reconciling} onClick={() => void reconcileTasks(task)}>{reconciling ? "正在核对…" : "重新核对执行历史"}</button>}
+                          {task.submissionPending && <button disabled={reconciling} onClick={() => void resolveSubmission(task)}>已核对，解除阻塞</button>}
                           {task.outputPaths?.map((outputPath) => {
                             const query = new URLSearchParams({
                               projectId,

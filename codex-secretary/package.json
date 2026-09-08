@@ -1,6 +1,6 @@
 {
   "name": "palm-secretary",
-  "version": "0.15.8",
+  "version": "0.16.0",
   "private": true,
   "engines": {
     "node": ">=22.13.0"
@@ -33,7 +33,8 @@
     "test:v023": "node tests/cli-version-v023.mjs",
     "test:v024": "node tests/reliability-v024.mjs",
     "test:all": "node tests/run-all.mjs",
-    "lint": "eslint . --ignore-pattern dist --ignore-pattern dist-server --ignore-pattern .next"
+    "lint": "eslint . --ignore-pattern dist --ignore-pattern dist-server --ignore-pattern .next",
+    "test:v025": "node tests/task-reconciliation-v025.mjs"
   },
   "dependencies": {
     "@fastify/cookie": "^11.0.2",
