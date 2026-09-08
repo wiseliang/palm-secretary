@@ -4,6 +4,7 @@ import {
   DragEvent,
   FormEvent,
   ReactNode,
+  memo,
   useCallback,
   useEffect,
   useRef,
@@ -44,6 +45,9 @@ import {
   websocketReconnectDelay,
 } from "./websocket-reconnect";
 
+import { RunCoordinator, SyncCoordinator } from "./chat-coordinator";
+import { mergeSnapshot, applyAgentText } from "./message-sync";
+
 type ExecutionStep = {
   id: string;
   label: string;
@@ -52,10 +56,12 @@ type ExecutionStep = {
 };
 type ChatMessage = {
   id: string;
+  itemId?: string;
   turnId?: string;
   role: "user" | "assistant";
   text: string;
   pending?: boolean;
+  sealed?: boolean;
   attachments?: UploadedFile[];
   steps?: ExecutionStep[];
 };
@@ -750,7 +756,7 @@ function ServerImage({
   );
 }
 
-function MessageContent({
+const MessageContent = memo(function MessageContent({
   text,
   projectId,
   files,
@@ -841,7 +847,97 @@ function MessageContent({
       ),
     );
   return <div className="rich-message">{nodes}</div>;
-}
+});
+
+const MessageRow = memo(function MessageRow({ message, projectId, files, focused, development, onNotice }: {
+  message: ChatMessage; projectId: string; files: UploadedFile[]; focused: boolean;
+  development?: ReactNode; onNotice: (text: string) => void;
+}) {
+  return (
+                  <article
+                    data-message-id={message.id}
+                    className={`chat-bubble ${message.role} ${focused ? "message-focus" : ""}`}
+                  >
+                    <span>{message.role === "assistant" ? "掌" : "我"}</span>
+                    <div>
+                      {message.steps?.length ? (
+                        <details className="execution-card">
+                          <summary>
+                            <span>执行过程</span>
+                            <small>
+                              {
+                                message.steps.filter(
+                                  (step) => step.status === "completed",
+                                ).length
+                              }
+                              /{message.steps.length} 步
+                            </small>
+                          </summary>
+                          <div>
+                            {message.steps.map((step) => (
+                              <article
+                                key={step.id}
+                                className={`execution-step ${step.status}`}
+                              >
+                                <b>
+                                  {step.status === "running"
+                                    ? "·"
+                                    : step.status === "failed"
+                                      ? "!"
+                                      : "✓"}
+                                </b>
+                                <span>
+                                  <strong>{step.label}</strong>
+                                  {step.detail && (
+                                    <small title={step.detail}>
+                                      {step.detail}
+                                    </small>
+                                  )}
+                                </span>
+                              </article>
+                            ))}
+                          </div>
+                        </details>
+                      ) : null}
+                      {message.text ? (
+                        <MessageContent
+                          text={message.text}
+                          projectId={projectId}
+                          files={files}
+                        />
+                      ) : message.pending && !message.steps?.length ? (
+                        "正在思考…"
+                      ) : (
+                        ""
+                      )}
+                      {message.attachments?.length ? (
+                        <div className="message-files">
+                          {message.attachments.map((file) => (
+                            <SentFileCard
+                              key={file.path}
+                              file={file}
+                              projectId={projectId}
+                            />
+                          ))}
+                        </div>
+                      ) : null}
+                      {development}
+                      {message.pending && <i className="typing-dot" />}
+                      {message.role === "assistant" &&
+                        message.text &&
+                        !message.pending && (
+                          <button
+                            type="button"
+                            className="copy-message"
+                            onClick={() => { void navigator.clipboard.writeText(message.text).then(() => onNotice("回复已复制"), () => onNotice("复制失败，请长按文字选择复制")); }}
+                          >
+                            复制
+                          </button>
+                        )}
+                    </div>
+                  </article>
+  );
+});
 
 function taskDuration(task: ProjectTask): string {
   const start = new Date(task.startedAt).getTime();
@@ -1245,10 +1341,13 @@ function messagesFromThread(value: unknown): ChatMessage[] {
   ) as Record<string, unknown>;
   const turns = Array.isArray(thread.turns) ? thread.turns : [];
   const result: ChatMessage[] = [];
-  for (const turn of turns) {
+  for (const [turnIndex, turn] of turns.entries()) {
     const turnId = turn && typeof turn === "object" && typeof (turn as Record<string, unknown>).id === "string"
       ? (turn as Record<string, unknown>).id as string
-      : undefined;
+      : `legacy-turn-${turnIndex}`;
+    const status = String((turn as Record<string, unknown>).status);
+    const sealed = ["completed", "failed", "interrupted"].includes(status);
+    const pending = ["running", "inProgress"].includes(status);
     const turnStart = result.length;
     let turnSteps: ExecutionStep[] = [];
     const items =
@@ -1257,10 +1356,12 @@ function messagesFromThread(value: unknown): ChatMessage[] {
       Array.isArray((turn as Record<string, unknown>).items)
         ? ((turn as Record<string, unknown>).items as unknown[])
         : [];
-    for (const item of items) {
+    for (const [itemIndex, item] of items.entries()) {
       if (!item || typeof item !== "object") continue;
       const record = item as Record<string, unknown>;
       const type = String(record.type ?? "");
+      const itemId = String(record.id ?? `legacy-item-${itemIndex}`);
+      const id = `${turnId}:${itemId}`;
       const text =
         String(record.text ?? record.message ?? "") ||
         textFromContent(record.content);
@@ -1270,7 +1371,7 @@ function messagesFromThread(value: unknown): ChatMessage[] {
       if (type === "userMessage") {
         const parsed = parseUserMessage(text);
         result.push({
-          id: crypto.randomUUID(),
+          id, itemId,
           turnId,
           role: "user",
           text: parsed.text,
@@ -1278,7 +1379,7 @@ function messagesFromThread(value: unknown): ChatMessage[] {
         });
       }
       if (type === "agentMessage")
-        result.push({ id: crypto.randomUUID(), turnId, role: "assistant", text });
+        result.push({ id, itemId, turnId, role: "assistant", text, sealed, pending });
     }
     if (turnSteps.length) {
       const assistantIndex = result.findLastIndex(
@@ -1354,6 +1455,10 @@ export default function Home() {
   const [uploading, setUploading] = useState(false);
   const [uploadFeedbacks, setUploadFeedbacks] = useState<UploadFeedback[]>([]);
   const socketRef = useRef<WebSocket | null>(null);
+  const focusedOnceRef = useRef<string | undefined>(undefined);
+  const navigationGenerationRef = useRef(0);
+  const snapshotGenerationRef = useRef(0);
+  const streamRevisionRef = useRef(0);
   const threadIdRef = useRef<string>();
   const projectIdRef = useRef(projectId);
   const attachmentsProjectRef = useRef(projectId);
@@ -1366,6 +1471,15 @@ export default function Home() {
   const [filesProjectId, setFilesProjectId] = useState(projectId);
   const projectsRef = useRef<Project[]>([]);
   const runningRef = useRef(false);
+  const runCoordinator = useRef(new RunCoordinator());
+  const snapshotCoordinator = useRef(new SyncCoordinator());
+  const updateRun = useCallback((value: boolean, targetTurn?: string, targetThread = threadIdRef.current) => {
+    if (!runCoordinator.current.update(targetThread, targetTurn, value)) return false;
+    runningRef.current = value;
+    setRunning(value);
+    setTurnId(value ? targetTurn : undefined);
+    return true;
+  }, []);
   const pendingTurnRef = useRef<PendingTurn>();
   const reconnectRef = useRef<number>();
   const reconnectAttemptRef = useRef(0);
@@ -1521,9 +1635,7 @@ export default function Home() {
       window.localStorage.removeItem(key);
     }
   }, [attachments, authenticated, projectId]);
-  useEffect(() => {
-    runningRef.current = running;
-  }, [running]);
+
   useEffect(() => {
     const query = recordSearch.trim();
     if (query.length < 2) return;
@@ -1550,7 +1662,8 @@ export default function Home() {
     };
   }, [projectId, recordSearch, searchAllProjects]);
   useEffect(() => {
-    if (view !== "chat" || !focusedMessageId) return;
+    if (view !== "chat" || !focusedMessageId || focusedOnceRef.current === focusedMessageId) return;
+    focusedOnceRef.current = focusedMessageId;
     let clearTimer: number | undefined;
     const frame = window.requestAnimationFrame(() => {
       const target = document.querySelector<HTMLElement>(
@@ -1704,6 +1817,7 @@ export default function Home() {
   const loadProjectCore = useCallback(
     async (id: string): Promise<ProjectTask[]> => {
       const generation = ++projectLoadGenerationRef.current;
+      const runRevision = runCoordinator.current.revision;
       const encoded = encodeURIComponent(id);
       const [taskResponse, fileResponse] = await Promise.all([
         fetch(`/api/tasks?projectId=${encoded}`),
@@ -1724,22 +1838,17 @@ export default function Home() {
         return [];
       if (taskResponse.ok) {
         setTasks(loadedTasks);
-        const activeTask = loadedTasks.find(
-          (task) =>
-            task.threadId === threadIdRef.current && task.status === "running",
-        );
-        if (activeTask) {
-          runningRef.current = true;
-          setRunning(true);
-          setTurnId(activeTask.turnId);
-        } else if (threadIdRef.current) {
-          runningRef.current = false;
-          setRunning(false);
-          setTurnId(undefined);
+        const activeTask = loadedTasks.find(task => task.threadId === threadIdRef.current &&
+          task.turnId === runCoordinator.current.turnId) ?? loadedTasks.find(task =>
+          task.threadId === threadIdRef.current && task.status === "running");
+        if (runCoordinator.current.reconcile(runRevision, threadIdRef.current, activeTask?.turnId, activeTask?.status === "running")) {
+          runningRef.current = runCoordinator.current.running;
+          setRunning(runCoordinator.current.running);
+          setTurnId(runCoordinator.current.running ? activeTask?.turnId : undefined);
         }
       }
       if (loadedFiles) {
-        setFiles(loadedFiles);
+        setFiles(current => JSON.stringify(current) === JSON.stringify(loadedFiles) ? current : loadedFiles);
         setFilesProjectId(id);
       }
       return loadedTasks;
@@ -1795,57 +1904,33 @@ export default function Home() {
       targetProjectId: string,
       force = false,
       taskRunning = runningRef.current,
-    ) => {
+    ) => snapshotCoordinator.current.run(`${targetProjectId}:${targetThreadId}`, async () => {
+      const generation = ++snapshotGenerationRef.current;
+      const revision = streamRevisionRef.current;
       const response = await fetch(
         `/api/threads/${encodeURIComponent(targetThreadId)}?projectId=${encodeURIComponent(targetProjectId)}`,
       ).catch(() => null);
       if (!response?.ok) return false;
       const restored = messagesFromThread(await response.json());
       if (
+        generation !== snapshotGenerationRef.current ||
+        revision !== streamRevisionRef.current ||
         !restored.length ||
         threadIdRef.current !== targetThreadId ||
         projectIdRef.current !== targetProjectId
       )
         return false;
-      const synced = taskRunning
-        ? restored.some((item) => item.role === "assistant")
-          ? restored.map((item, index) =>
-              index === restored.length - 1 && item.role === "assistant"
-                ? { ...item, pending: true }
-                : item,
-            )
-          : [
-              ...restored,
-              {
-                id: crypto.randomUUID(),
-                role: "assistant" as const,
-                text: "",
-                pending: true,
-              },
-            ]
-        : restored;
       setMessages((current) => {
-        if (
-          !force &&
-          (runningRef.current || current.some((item) => item.pending))
-        )
-          return current;
-        const liveAssistant =
-          current
-            .findLast((item) => item.role === "assistant" && item.text.trim())
-            ?.text.trim() ?? "";
-        const storedAssistant =
-          synced
-            .findLast((item) => item.role === "assistant" && item.text.trim())
-            ?.text.trim() ?? "";
-        const wouldDowngradeLongOutput =
-          liveAssistant.length >= 80 &&
-          storedAssistant.length < liveAssistant.length &&
-          !storedAssistant.includes(liveAssistant);
-        return wouldDowngradeLongOutput ? current : synced;
+        if (generation !== snapshotGenerationRef.current || revision !== streamRevisionRef.current ||
+          targetThreadId !== threadIdRef.current || targetProjectId !== projectIdRef.current) return current;
+        // Healthy streams own active text. Recovery snapshots only merge when idle.
+        if (runningRef.current && !force) return current;
+        const synced = restored.map(item => ({ ...item, pending: !item.sealed && taskRunning &&
+          item.role === "assistant" && item.turnId === restored.at(-1)?.turnId }));
+        return mergeSnapshot(current, synced);
       });
       return true;
-    },
+    }),
     [],
   );
 
@@ -1965,7 +2050,7 @@ export default function Home() {
       setFiles([]);
       setFilesProjectId(projectId);
       setDraft(window.localStorage.getItem(`palm:draft:${projectId}`) ?? "");
-      runningRef.current = false;
+      updateRun(false);
       setGitOpen(false);
       setGitStatus(undefined);
       setGitBusy(false);
@@ -1973,7 +2058,6 @@ export default function Home() {
       setMessages([]);
       setAttachments(restoredAttachments);
       setUploadFeedbacks([]);
-      setRunning(false);
       void loadProjectCore(projectId);
       void loadThreads(projectId, showArchivedRef.current);
       if (restoredAttachments.length) {
@@ -1981,7 +2065,7 @@ export default function Home() {
       }
     }, 0);
     return () => window.clearTimeout(timer);
-  }, [authenticated, projectId, loadProjectCore, loadThreads]);
+  }, [authenticated, projectId, loadProjectCore, loadThreads, updateRun]);
 
   useEffect(() => {
     if (!authenticated || !projectId) return;
@@ -2023,8 +2107,11 @@ export default function Home() {
     }
     if (!pendingNavigation.threadId) return;
     const target = pendingNavigation;
+    navigationGenerationRef.current++;
+    const controller = new AbortController();
     void fetch(
       `/api/threads/${encodeURIComponent(target.threadId)}?projectId=${encodeURIComponent(target.projectId)}`,
+      { signal: controller.signal },
     ).then(async (response) => {
       if (!response.ok) {
         setNotice("无法打开目标任务");
@@ -2032,22 +2119,33 @@ export default function Home() {
         return;
       }
       const restored = messagesFromThread(await response.json());
+      if (controller.signal.aborted) return;
       const hint = target.focusHint?.trim().toLowerCase();
       const focused = hint
         ? restored.find((message) => message.text.toLowerCase().includes(hint))
         : restored.at(-1);
       threadIdRef.current = target.threadId;
       setThreadId(target.threadId);
+      updateRun(restored.some(item => item.pending), restored.findLast(item => item.pending)?.turnId, target.threadId);
       setMessages(restored);
       setFocusedMessageId(focused?.id);
       setView("chat");
       setPendingNavigation(undefined);
-    });
-  }, [pendingNavigation, projectId, threads]);
+    }).catch(() => { if (!controller.signal.aborted) setNotice("无法打开目标任务"); });
+    return () => controller.abort();
+  }, [pendingNavigation, projectId, updateRun]);
 
   useEffect(() => {
     if (!authenticated) return;
     let disposed = false;
+    let deltaTimer: number | undefined;
+    const deltas: Array<{ threadId: string; turnId: string; itemId: string; text: string; completed?: boolean }> = [];
+    const flushDeltas = () => {
+      window.clearTimeout(deltaTimer);
+      deltaTimer = undefined;
+      const batch = deltas.splice(0).filter(event => event.threadId === threadIdRef.current);
+      if (batch.length) setMessages(items => batch.reduce((next, event) => applyAgentText(next, event), items));
+    };
     const clearReconnectTimer = () => {
       if (!reconnectRef.current) return;
       window.clearTimeout(reconnectRef.current);
@@ -2178,10 +2276,10 @@ export default function Home() {
           setThreadId(message.threadId);
           const turn = (message.payload?.turn ?? {}) as { id?: string };
           if (turn.id) {
-            setTurnId(turn.id);
+            updateRun(true, turn.id, message.threadId);
             setMessages((items) =>
               items.map((item) =>
-                item.role === "assistant" && item.pending && !item.turnId
+                !item.turnId
                   ? { ...item, turnId: turn.id }
                   : item,
               ),
@@ -2207,8 +2305,7 @@ export default function Home() {
             pendingTurnRef.current = undefined;
           }
           setDeliveryState("idle");
-          runningRef.current = false;
-          setRunning(false);
+          updateRun(false, runCoordinator.current.turnId);
           setNotice(message.message ?? "任务执行失败");
           setMessages((items) =>
             items.map((item) =>
@@ -2224,9 +2321,7 @@ export default function Home() {
           return;
         }
         if (message.type === "codex.offline") {
-          runningRef.current = false;
           setConnection("正在重连");
-          setRunning(false);
           setNotice("Codex 服务正在恢复连接");
           void loadProjectData(projectIdRef.current);
           return;
@@ -2256,6 +2351,7 @@ export default function Home() {
               projectId?: string;
               threadId?: string;
               taskId?: string;
+              turnId?: string;
               status?: "completed" | "failed" | "interrupted";
               completedAt?: string;
             }
@@ -2271,10 +2367,7 @@ export default function Home() {
             if (payload.projectId === projectIdRef.current)
               void loadProjectData(payload.projectId);
             if (payload.threadId === threadIdRef.current) {
-              setDeliveryState("idle");
-              runningRef.current = false;
-              setRunning(false);
-              setTurnId(undefined);
+              if (payload.turnId && updateRun(false, payload.turnId)) setDeliveryState("idle");
             }
           }
           return;
@@ -2316,39 +2409,36 @@ export default function Home() {
                   ];
             });
         }
-        if (rpc.method === "item/agentMessage/delta") {
-          const delta = String(rpc.params?.delta ?? "");
-          setMessages((items) => {
-            let updated = false;
-            const next = items.map((item) => {
-              if (!item.pending) return item;
-              updated = true;
-              return { ...item, text: item.text + delta };
-            });
-            return updated
-              ? next
-              : [
-                  ...items,
-                  {
-                    id: crypto.randomUUID(),
-                    role: "assistant",
-                    text: delta,
-                    pending: true,
-                  },
-                ];
-          });
+        if (rpc.method === "item/agentMessage/delta" || rpc.method === "item/completed") {
+          const item = rpc.params?.item as { id?: string; type?: string; text?: string } | undefined;
+          const completed = rpc.method === "item/completed";
+          if (!completed || item?.type === "agentMessage") {
+            const eventTurnId = String(rpc.params?.turnId ?? "");
+            const itemId = String(rpc.params?.itemId ?? item?.id ?? "");
+            if (eventThreadId && eventTurnId && itemId) {
+              streamRevisionRef.current++;
+              deltas.push({ threadId: eventThreadId, turnId: eventTurnId, itemId,
+                text: String(completed ? item?.text ?? "" : rpc.params?.delta ?? ""), completed });
+              if (completed) flushDeltas();
+              else deltaTimer ??= window.setTimeout(flushDeltas, 50);
+            }
+          }
         }
         if (
           ["turn/completed", "turn/failed", "turn/interrupted"].includes(
             String(rpc.method),
           )
         ) {
+          const finishedTurn = rpc.params?.turn as { id?: string } | undefined;
+          const finishedTurnId = String(rpc.params?.turnId ?? finishedTurn?.id ?? "");
+          if (finishedTurnId && ((runCoordinator.current.turnId && finishedTurnId !== runCoordinator.current.turnId) ||
+            (runningRef.current && !runCoordinator.current.turnId))) return;
+          flushDeltas();
+          streamRevisionRef.current++;
           const completedThreadId = eventThreadId ?? threadIdRef.current;
           const completedProjectId = projectIdRef.current;
           setDeliveryState("idle");
-          runningRef.current = false;
-          setRunning(false);
-          setTurnId(undefined);
+          updateRun(false, runCoordinator.current.turnId);
           const terminalText =
             rpc.method === "turn/interrupted"
               ? "任务已停止。"
@@ -2366,33 +2456,8 @@ export default function Home() {
           void loadDashboard();
           void loadProjectData(completedProjectId);
           if (completedThreadId) {
-            window.setTimeout(
-              () =>
-                void refreshThreadMessages(
-                  completedThreadId,
-                  completedProjectId,
-                  true,
-                ),
-              250,
-            );
-            window.setTimeout(
-              () =>
-                void refreshThreadMessages(
-                  completedThreadId,
-                  completedProjectId,
-                  true,
-                ),
-              1_500,
-            );
-            window.setTimeout(
-              () =>
-                void refreshThreadMessages(
-                  completedThreadId,
-                  completedProjectId,
-                  true,
-                ),
-              4_500,
-            );
+            // One coalesced completion sync; recovery polling retries failures.
+            void refreshThreadMessages(completedThreadId, completedProjectId, true, false);
           }
         }
       };
@@ -2400,6 +2465,8 @@ export default function Home() {
     connect();
     return () => {
       disposed = true;
+      window.clearTimeout(deltaTimer);
+      deltas.length = 0;
       clearReconnectTimer();
       reconnectAttemptRef.current = 0;
       const activeSocket = socketRef.current;
@@ -2411,6 +2478,7 @@ export default function Home() {
     loadDashboard,
     loadProjectData,
     handleFinishedTask,
+    updateRun,
     projectId,
     recoverFinishedTasks,
     refreshThreadMessages,
@@ -2437,10 +2505,13 @@ export default function Home() {
   useEffect(() => {
     if (!authenticated || !projectId) return;
     let syncing = false;
+    let lastSync = 0;
+    let resumeTimer: number | undefined;
     const syncVisibleView = async () => {
       if (document.visibilityState !== "visible") return;
-      if (syncing) return;
+      if (syncing || Date.now() - lastSync < 1000) return;
       syncing = true;
+      lastSync = Date.now();
       const socketState = socketRef.current?.readyState;
       if (socketNeedsResumeReconnect(socketState)) {
         reconnectNowRef.current();
@@ -2449,7 +2520,7 @@ export default function Home() {
       const activeThreadId = threadIdRef.current;
       try {
         const loadedTasks = await loadProjectData(projectId);
-        if (activeThreadId) {
+        if (activeThreadId && (socketState !== WebSocket.OPEN || !runningRef.current)) {
           const taskStillRunning = loadedTasks.some(
             (task) =>
               task.threadId === activeThreadId && task.status === "running",
@@ -2461,13 +2532,18 @@ export default function Home() {
             taskStillRunning,
           );
         }
+      } catch {
+        // Retain the visible transcript; the next recovery tick retries.
       } finally {
         syncing = false;
       }
     };
     const resumeVisibleView = () => {
-      void recoverFinishedTasks();
-      void syncVisibleView();
+      window.clearTimeout(resumeTimer);
+      resumeTimer = window.setTimeout(() => {
+        void recoverFinishedTasks();
+        void syncVisibleView();
+      }, 200);
     };
     const onVisibilityChange = () => {
       if (document.visibilityState === "visible") resumeVisibleView();
@@ -2477,7 +2553,7 @@ export default function Home() {
     window.addEventListener("online", resumeVisibleView);
     window.addEventListener("pageshow", resumeVisibleView);
     window.addEventListener("palm-resume", resumeVisibleView);
-    const timer = window.setInterval(syncVisibleView, 4_000);
+    const timer = window.setInterval(syncVisibleView, 15_000);
     const recoveryTimer = window.setInterval(recoverFinishedTasks, 60_000);
     return () => {
       document.removeEventListener("visibilitychange", onVisibilityChange);
@@ -2487,6 +2563,7 @@ export default function Home() {
       window.removeEventListener("palm-resume", resumeVisibleView);
       window.clearInterval(timer);
       window.clearInterval(recoveryTimer);
+      window.clearTimeout(resumeTimer);
     };
   }, [
     authenticated,
@@ -2547,7 +2624,9 @@ export default function Home() {
           return;
         }
         const restored = messagesFromThread(await response.json());
+        threadIdRef.current = thread.threadId;
         setThreadId(thread.threadId);
+        updateRun(restored.some(item => item.pending), restored.findLast(item => item.pending)?.turnId, thread.threadId);
         setMessages(restored);
         setFocusedMessageId(restored.at(-1)?.id);
         setView("chat");
@@ -2555,7 +2634,7 @@ export default function Home() {
     } catch {
       window.localStorage.removeItem("palm:open-task");
     }
-  }, [authenticated, projectId, showArchived, threads]);
+  }, [authenticated, projectId, showArchived, threads, updateRun]);
 
   function openTaskNotice(taskNotice: TaskNotice) {
     setPendingNavigation({
@@ -2983,6 +3062,8 @@ export default function Home() {
     targetThreadId: string,
     focusHint = "",
   ) {
+    const navigationGeneration = ++navigationGenerationRef.current;
+    snapshotGenerationRef.current++;
     if (targetProjectId !== projectId) {
       setPendingNavigation({
         projectId: targetProjectId,
@@ -3002,6 +3083,7 @@ export default function Home() {
       return;
     }
     const restored = messagesFromThread(await response.json());
+    if (navigationGeneration !== navigationGenerationRef.current || projectIdRef.current !== targetProjectId) return;
     const hint = focusHint.trim().toLowerCase();
     const focused =
       (hint
@@ -3016,7 +3098,10 @@ export default function Home() {
         : undefined) ??
       [...restored].reverse().find((message) => message.role === "user") ??
       restored.at(-1);
+    threadIdRef.current = targetThreadId;
+    snapshotGenerationRef.current++;
     setThreadId(targetThreadId);
+    updateRun(restored.some(item => item.pending), restored.findLast(item => item.pending)?.turnId, targetThreadId);
     setMessages(restored);
     setFocusedMessageId(focused?.id);
     setView("chat");
@@ -3044,6 +3129,7 @@ export default function Home() {
       return;
     }
     if (!result.threadId) return;
+    const navigationGeneration = ++navigationGenerationRef.current;
     if (result.projectId !== projectId) {
       setPendingNavigation({
         projectId: result.projectId,
@@ -3062,12 +3148,16 @@ export default function Home() {
       return;
     }
     const restored = messagesFromThread(await response.json());
+    if (navigationGeneration !== navigationGenerationRef.current || projectIdRef.current !== result.projectId) return;
     const hint = recordSearch.trim().toLowerCase();
     const focused =
       restored.find((message) => message.text.toLowerCase().includes(hint)) ??
       restored.at(-1);
     setProjectId(result.projectId);
+    threadIdRef.current = result.threadId;
+    snapshotGenerationRef.current++;
     setThreadId(result.threadId);
+    updateRun(restored.some(item => item.pending), restored.findLast(item => item.pending)?.turnId, result.threadId);
     setMessages(restored);
     setFocusedMessageId(focused?.id);
     setView("chat");
@@ -3097,6 +3187,7 @@ export default function Home() {
       setNotice("存储维护模式不接收附件，请直接描述要检查或清理的内容");
       return;
     }
+    streamRevisionRef.current++;
     const now = crypto.randomUUID();
     setMessages((items) => [
       ...items,
@@ -3128,11 +3219,10 @@ export default function Home() {
         maintenance: maintenance ? "storage" : undefined,
       }),
     );
-    runningRef.current = true;
+    updateRun(true, undefined, targetThreadId);
     setDraft("");
     window.localStorage.removeItem(`palm:draft:${projectId}`);
     setAttachments([]);
-    setRunning(true);
     setNotice("");
   }
 
@@ -3592,14 +3682,7 @@ export default function Home() {
     )[status];
   }
 
-  async function copyMessage(text: string) {
-    try {
-      await navigator.clipboard.writeText(text);
-      setNotice("回复已复制");
-    } catch {
-      setNotice("复制失败，请长按文字选择复制");
-    }
-  }
+
 
   async function deleteFile(file: UploadedFile) {
     if (projectReadOnly) {
@@ -4955,75 +5038,10 @@ export default function Home() {
             ) : (
               <section className="chat-list" aria-live="polite">
                 {messages.map((message) => (
-                  <article
-                    key={message.id}
-                    data-message-id={message.id}
-                    className={`chat-bubble ${message.role} ${focusedMessageId === message.id ? "message-focus" : ""}`}
-                  >
-                    <span>{message.role === "assistant" ? "掌" : "我"}</span>
-                    <div>
-                      {message.steps?.length ? (
-                        <details className="execution-card">
-                          <summary>
-                            <span>执行过程</span>
-                            <small>
-                              {
-                                message.steps.filter(
-                                  (step) => step.status === "completed",
-                                ).length
-                              }
-                              /{message.steps.length} 步
-                            </small>
-                          </summary>
-                          <div>
-                            {message.steps.map((step) => (
-                              <article
-                                key={step.id}
-                                className={`execution-step ${step.status}`}
-                              >
-                                <b>
-                                  {step.status === "running"
-                                    ? "·"
-                                    : step.status === "failed"
-                                      ? "!"
-                                      : "✓"}
-                                </b>
-                                <span>
-                                  <strong>{step.label}</strong>
-                                  {step.detail && (
-                                    <small title={step.detail}>
-                                      {step.detail}
-                                    </small>
-                                  )}
-                                </span>
-                              </article>
-                            ))}
-                          </div>
-                        </details>
-                      ) : null}
-                      {message.text ? (
-                        <MessageContent
-                          text={message.text}
-                          projectId={projectId}
-                          files={files}
-                        />
-                      ) : message.pending && !message.steps?.length ? (
-                        "正在思考…"
-                      ) : (
-                        ""
-                      )}
-                      {message.attachments?.length ? (
-                        <div className="message-files">
-                          {message.attachments.map((file) => (
-                            <SentFileCard
-                              key={file.path}
-                              file={file}
-                              projectId={projectId}
-                            />
-                          ))}
-                        </div>
-                      ) : null}
-                      {message.role === "assistant" &&
+                  <MessageRow key={message.id} message={message} projectId={projectId}
+                    files={files} focused={focusedMessageId === message.id} onNotice={setNotice}
+                    development={
+message.role === "assistant" &&
                         message.turnId &&
                         developmentByTurn.get(message.turnId) && (
                           <DevelopmentResultCard
@@ -5037,21 +5055,8 @@ export default function Home() {
                               if (task) void loadDevelopmentStatus(task, true);
                             }}
                           />
-                        )}
-                      {message.pending && <i className="typing-dot" />}
-                      {message.role === "assistant" &&
-                        message.text &&
-                        !message.pending && (
-                          <button
-                            type="button"
-                            className="copy-message"
-                            onClick={() => void copyMessage(message.text)}
-                          >
-                            复制
-                          </button>
-                        )}
-                    </div>
-                  </article>
+                        )
+                    } />
                 ))}
               </section>
             )}

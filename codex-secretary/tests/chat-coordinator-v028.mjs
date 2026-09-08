@@ -1,0 +1,45 @@
+import assert from 'node:assert/strict';
+import { RunCoordinator, SyncCoordinator } from '../app/chat-coordinator.ts';
+import { mergeSnapshot, applyAgentText } from '../app/message-sync.ts';
+
+const run = new RunCoordinator();
+const stale = run.revision;
+run.update('chat', 'turn-1', true);
+assert.equal(run.reconcile(stale, 'chat', undefined, false), false, 'late REST cannot stop a new turn');
+assert.equal(run.reconcile(run.revision, 'chat', undefined, false), false, 'missing task is not completion evidence');
+run.update('chat', 'turn-1', false);
+assert.equal(run.reconcile(run.revision, 'chat', 'turn-1', true), false, 'stale REST cannot revive a completed turn');
+run.update('chat', 'turn-2', true);
+assert.equal(run.update('chat', 'turn-1', false), false, 'previous turn cannot stop the next');
+assert.equal(run.running, true);
+assert.equal(run.reconcile(run.revision, 'chat', 'turn-2', false), true, 'REST restores a missed terminal event');
+
+const sync = new SyncCoordinator();
+let resolve;
+let calls = 0;
+const work = () => { calls++; return new Promise(done => { resolve = done; }); };
+const first = sync.run('chat', work);
+const second = sync.run('chat', work);
+await Promise.resolve();
+assert.equal(calls, 1);
+assert.equal(first, second, 'concurrent resume / completion requests share one promise');
+resolve(true);
+await first;
+assert.equal(sync.run('chat', work), first, 'recent bursts share completed result');
+let failures = 0;
+await sync.run('failure', async () => { failures++; throw new Error('offline'); });
+await sync.run('failure', async () => { failures++; return true; });
+assert.equal(failures, 2, 'failed reads remain retryable');
+
+const live = { id: 'a', itemId: 'a', turnId: 't', role: 'assistant', text: 'new text', pending: true };
+assert.equal(mergeSnapshot([live], [{ ...live, text: 'unrelated old text' }])[0].text, live.text);
+const final = applyAgentText([live], { itemId: 'a', turnId: 't', text: 'corrected', completed: true });
+assert.equal(mergeSnapshot(final, [{ ...live, text: 'obsolete completion', sealed: true }])[0], final[0]);
+assert.equal(mergeSnapshot([live], [{ ...live, text: 'corrected', sealed: true }])[0].text, 'corrected');
+const before = [{ ...live, id: 'older', itemId: 'older', text: 'history', sealed: true }, live];
+const after = applyAgentText(before, { itemId: 'a', turnId: 't', text: ' plus' });
+assert.equal(before[0], after[0], 'unchanged rows retain references for React.memo');
+assert.deepEqual(mergeSnapshot([live], before).map(item => item.id), ['older', 'a'], 'recovered older history precedes active text');
+run.update('chat', undefined, true);
+assert.equal(run.update('chat', 'turn-2', false), false, 'late completion cannot stop a pending new submission');
+console.log('PALM_V028_CHAT_COORDINATOR_OK');

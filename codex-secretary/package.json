@@ -1,6 +1,6 @@
 {
   "name": "palm-secretary",
-  "version": "0.16.0",
+  "version": "0.16.1",
   "private": true,
   "engines": {
     "node": ">=22.13.0"
@@ -35,7 +35,9 @@
     "test:all": "node tests/run-all.mjs",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern dist-server --ignore-pattern .next",
     "test:v025": "node tests/task-reconciliation-v025.mjs",
-    "test:v026": "node tests/workspace-backup-v026.mjs"
+    "test:v026": "node tests/workspace-backup-v026.mjs",
+    "test:v027": "node --experimental-strip-types tests/message-sync-v027.mjs",
+    "test:v028": "node --experimental-strip-types tests/chat-coordinator-v028.mjs"
   },
   "dependencies": {
     "@fastify/cookie": "^11.0.2",
