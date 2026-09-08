@@ -34,7 +34,8 @@
     "test:v024": "node tests/reliability-v024.mjs",
     "test:all": "node tests/run-all.mjs",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern dist-server --ignore-pattern .next",
-    "test:v025": "node tests/task-reconciliation-v025.mjs"
+    "test:v025": "node tests/task-reconciliation-v025.mjs",
+    "test:v026": "node tests/workspace-backup-v026.mjs"
   },
   "dependencies": {
     "@fastify/cookie": "^11.0.2",
