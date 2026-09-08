@@ -33,6 +33,7 @@ const child = spawn(process.execPath, ['dist-server/index.js'], {
     WORKSPACE_ROOT: workspace, CODEX_BIN: process.execPath,
     CODEX_ARGS_PREFIX_JSON: JSON.stringify([path.join(root, 'tests', 'mock-app-server.mjs')]), MOCK_LOG: logFile,
     TASK_STOP_FREE_BYTES: '1', DISK_WARNING_FREE_BYTES: '1', MAX_UPLOAD_BYTES: '32', LOG_LEVEL: 'error',
+    CODEX_VERSION_CHECK_ENABLED: '0',
   },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
@@ -75,6 +76,8 @@ try {
   if (models.length !== 2 || !models.some((model) => model.model === 'mock-deep')) throw new Error('模型列表错误');
   const status = await (await api('/api/status')).json();
   if (typeof status.sudo?.available !== 'boolean') throw new Error('sudo 运行态自检状态缺失');
+  const cliVersion = await (await api('/api/codex/version')).json();
+  if (cliVersion.state !== 'disabled' || cliVersion.updateAvailable !== false) throw new Error('CLI 版本检查禁用状态错误');
   const modelResponse = await api(`/api/projects/${encodeURIComponent(project.id)}/model`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ model: 'mock-deep', reasoningEffort: 'high' }) });
   if (!modelResponse.ok) throw new Error('模型切换失败');
 

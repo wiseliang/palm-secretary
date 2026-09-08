@@ -32,8 +32,10 @@ import {
   SlidersHorizontal,
   Star,
   Stop,
+  Ticket,
   Trash,
   UploadSimple,
+  Wrench,
   X,
 } from "@phosphor-icons/react";
 import {
@@ -80,6 +82,7 @@ type ProjectThread = {
   favorite?: boolean;
 };
 type ProjectTask = {
+  submissionPending?: boolean;
   taskId: string;
   turnId: string;
   threadId: string;
@@ -168,6 +171,14 @@ type ServerStatus = {
   };
   sudo?: { available: boolean };
 };
+type CliVersionStatus = {
+  state: "current" | "update_available" | "unavailable" | "disabled";
+  installedVersion?: string;
+  latestVersion?: string;
+  updateAvailable: boolean;
+  checkedAt?: string;
+  error?: string;
+};
 type View = "chat" | "history" | "files";
 type UploadResponse = {
   status: number;
@@ -189,11 +200,25 @@ type UsageWindow = {
   resetAt?: number;
   windowMinutes?: number;
 };
+type ResetCreditSummary = {
+  availableCount: number;
+  credits: Array<{
+    id: string;
+    title?: string;
+    description?: string;
+    expiresAt?: number;
+  }>;
+};
 type NativeSharedFile = {
   id: string;
   name: string;
   mimeType?: string;
   size?: number;
+};
+type ShareTargetDialog = {
+  files: NativeSharedFile[];
+  projectId: string;
+  threadId: string;
 };
 type PendingTurn = {
   clientRequestId: string;
@@ -201,6 +226,7 @@ type PendingTurn = {
   threadId?: string;
   text: string;
   attachments: UploadedFile[];
+  maintenance?: "storage";
 };
 type DeliveryState = "idle" | "sending" | "accepted";
 type SearchResult = {
@@ -264,6 +290,7 @@ declare global {
         threadId: string,
       ) => void;
       ackTaskTarget?: () => void;
+      discardSharedFiles?: (idsJson: string) => void;
     };
   }
 }
@@ -391,6 +418,42 @@ function usageWindowsFrom(value: unknown): UsageWindow[] {
     );
 }
 
+function resetCreditSummaryFrom(value: unknown): ResetCreditSummary | undefined {
+  const visited = new Set<object>();
+  const walk = (node: unknown): ResetCreditSummary | undefined => {
+    if (!node || typeof node !== "object" || visited.has(node as object))
+      return undefined;
+    visited.add(node as object);
+    const record = node as Record<string, unknown>;
+    const candidate = record.rateLimitResetCredits;
+    if (candidate && typeof candidate === "object") {
+      const summary = candidate as Record<string, unknown>;
+      if (typeof summary.availableCount === "number") {
+        const credits = Array.isArray(summary.credits)
+          ? summary.credits.flatMap((item) => {
+              if (!item || typeof item !== "object") return [];
+              const credit = item as Record<string, unknown>;
+              if (typeof credit.id !== "string") return [];
+              return [{
+                id: credit.id,
+                title: typeof credit.title === "string" ? credit.title : undefined,
+                description: typeof credit.description === "string" ? credit.description : undefined,
+                expiresAt: typeof credit.expiresAt === "number" ? credit.expiresAt * 1000 : undefined,
+              }];
+            })
+          : [];
+        return { availableCount: Math.max(0, summary.availableCount), credits };
+      }
+    }
+    for (const child of Object.values(record)) {
+      const found = walk(child);
+      if (found) return found;
+    }
+    return undefined;
+  };
+  return walk(value);
+}
+
 function resetLabel(resetAt?: number, now = Date.now()): string {
   if (!resetAt) return "重置时间待同步";
   const remainingMs = resetAt - now;
@@ -400,6 +463,13 @@ function resetLabel(resetAt?: number, now = Date.now()): string {
   if (hours >= 24)
     return `${Math.floor(hours / 24)} 天 ${hours % 24} 小时后重置`;
   return `${hours ? `${hours} 小时 ` : ""}${minutes} 分钟后重置`;
+}
+
+function versionCheckLabel(checkedAt?: string): string {
+  if (!checkedAt) return "等待首次检查";
+  const date = new Date(checkedAt);
+  if (Number.isNaN(date.getTime())) return "检查时间未知";
+  return `${date.toLocaleDateString("zh-CN", { month: "numeric", day: "numeric" })} ${date.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false })} 检查`;
 }
 
 function uploadOnce(
@@ -914,11 +984,13 @@ function effortLabel(value: string) {
     (
       {
         none: "极速",
+        minimal: "最小",
         low: "较低",
         medium: "标准",
         high: "深入",
         xhigh: "很深入",
         max: "最大",
+        ultra: "超强",
       } as Record<string, string>
     )[value] ?? value
   );
@@ -1225,6 +1297,7 @@ function messagesFromThread(value: unknown): ChatMessage[] {
 export default function Home() {
   const [booting, setBooting] = useState(true);
   const [authenticated, setAuthenticated] = useState(false);
+  const [reconciling, setReconciling] = useState(false);
   const [password, setPassword] = useState("");
   const [loginError, setLoginError] = useState("");
   const [view, setView] = useState<View>("chat");
@@ -1253,12 +1326,21 @@ export default function Home() {
   const [focusedMessageId, setFocusedMessageId] = useState<string>();
   const [attachments, setAttachments] = useState<UploadedFile[]>([]);
   const [status, setStatus] = useState<ServerStatus>({});
+  const [cliVersion, setCliVersion] = useState<CliVersionStatus>();
   const [usageWindows, setUsageWindows] = useState<UsageWindow[]>([]);
+  const [resetCredits, setResetCredits] = useState<ResetCreditSummary>();
   const [usageClock, setUsageClock] = useState(() => Date.now());
+  const [resetDialogOpen, setResetDialogOpen] = useState(false);
+  const [resetBusy, setResetBusy] = useState(false);
+  const [storageMaintenance, setStorageMaintenance] = useState(false);
   const [runtimeOpen, setRuntimeOpen] = useState(false);
   const [openMenu, setOpenMenu] = useState<OpenMenu>();
   const [projectDialog, setProjectDialog] = useState<ProjectDialog>();
   const [projectDialogBusy, setProjectDialogBusy] = useState(false);
+  const [shareDialog, setShareDialog] = useState<ShareTargetDialog>();
+  const [shareThreads, setShareThreads] = useState<ProjectThread[]>([]);
+  const [shareThreadsLoading, setShareThreadsLoading] = useState(false);
+  const [shareDialogBusy, setShareDialogBusy] = useState(false);
   const [draggingFiles, setDraggingFiles] = useState(false);
   const [threadId, setThreadId] = useState<string>();
   const [turnId, setTurnId] = useState<string>();
@@ -1276,6 +1358,7 @@ export default function Home() {
   const projectIdRef = useRef(projectId);
   const attachmentsProjectRef = useRef(projectId);
   const projectDialogBusyRef = useRef(false);
+  const shareDialogBusyRef = useRef(false);
   const projectLoadGenerationRef = useRef(0);
   const developmentRequestedRef = useRef(new Set<string>());
   const threadLoadGenerationRef = useRef(0);
@@ -1287,12 +1370,25 @@ export default function Home() {
   const reconnectRef = useRef<number>();
   const reconnectAttemptRef = useRef(0);
   const reconnectNowRef = useRef<() => void>(() => undefined);
+  const resetAttemptRef = useRef<string>();
   const fileRef = useRef<HTMLInputElement>(null);
   const imageFileRef = useRef<HTMLInputElement>(null);
   const composerRef = useRef<HTMLElement>(null);
   const closeProjectDialog = useCallback(() => {
     if (projectDialogBusyRef.current) return;
     setProjectDialog(undefined);
+  }, []);
+  const closeShareDialog = useCallback((discard = true) => {
+    if (shareDialogBusyRef.current) return;
+    setShareDialog((current) => {
+      if (discard && current?.files.length) {
+        window.PalmNative?.discardSharedFiles?.(
+          JSON.stringify(current.files.map((file) => file.id)),
+        );
+      }
+      return undefined;
+    });
+    setShareThreads([]);
   }, []);
 
   const activeProject = projects.find((project) => project.id === projectId);
@@ -1302,8 +1398,16 @@ export default function Home() {
     models.find((model) => model.model === activeProject?.model) ??
     defaultModel;
   const activeEffort =
-    activeProject?.reasoningEffort ?? activeModel?.defaultReasoningEffort ?? "";
-  const projectRunningTask = tasks.find((task) => task.status === "running");
+    (activeProject?.reasoningEffort &&
+    activeModel?.supportedReasoningEfforts.some(
+      (item) => item.reasoningEffort === activeProject.reasoningEffort,
+    )
+      ? activeProject.reasoningEffort
+      : (activeProject?.reasoningEffort === "none" || activeProject?.reasoningEffort === "minimal") &&
+          activeModel?.supportedReasoningEfforts.some((item) => item.reasoningEffort === "low")
+        ? "low"
+        : activeModel?.defaultReasoningEffort) ?? "";
+  const projectRunningTask = tasks.find((task) => task.status === "running" || task.submissionPending);
   const projectBusy = running || Boolean(projectRunningTask);
   const developmentByTurn = new Map(
     tasks
@@ -1387,6 +1491,7 @@ export default function Home() {
       closeMenus();
       setRuntimeOpen(false);
       closeProjectDialog();
+      closeShareDialog();
     };
     document.addEventListener("pointerdown", closeMenus);
     document.addEventListener("keydown", closeOnEscape);
@@ -1394,7 +1499,7 @@ export default function Home() {
       document.removeEventListener("pointerdown", closeMenus);
       document.removeEventListener("keydown", closeOnEscape);
     };
-  }, [closeProjectDialog]);
+  }, [closeProjectDialog, closeShareDialog]);
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -1465,11 +1570,14 @@ export default function Home() {
   }, [focusedMessageId, messages, view]);
 
   const loadDashboard = useCallback(async () => {
-    const [statusResponse, usageResponse] = await Promise.allSettled([
+    const [statusResponse, usageResponse, versionResponse] = await Promise.allSettled([
       fetch("/api/status").then((response) =>
         response.ok ? response.json() : Promise.reject(),
       ),
       fetch("/api/usage").then((response) =>
+        response.ok ? response.json() : Promise.reject(),
+      ),
+      fetch("/api/codex/version").then((response) =>
         response.ok ? response.json() : Promise.reject(),
       ),
     ]);
@@ -1481,9 +1589,71 @@ export default function Home() {
         usage?: unknown;
       };
       setUsageWindows(usageWindowsFrom(value.rateLimits ?? value.usage));
+      setResetCredits(resetCreditSummaryFrom(value.rateLimits));
       setUsageClock(Date.now());
     }
+    if (versionResponse.status === "fulfilled")
+      setCliVersion(versionResponse.value as CliVersionStatus);
   }, []);
+
+  async function refreshCliVersion() {
+    try {
+      const response = await fetch("/api/codex/version?refresh=1");
+      if (!response.ok) throw new Error("检查失败");
+      const value = (await response.json()) as CliVersionStatus;
+      setCliVersion(value);
+      setNotice(value.updateAvailable
+        ? `Codex CLI ${value.installedVersion ?? "当前版本"} → ${value.latestVersion ?? "新版本"} 可更新`
+        : value.state === "current"
+          ? "Codex CLI 已是稳定最新版"
+          : value.error ?? "暂时无法检查 Codex CLI 更新");
+    } catch {
+      setNotice("暂时无法检查 Codex CLI 更新");
+    }
+  }
+
+  async function consumeResetCredit() {
+    if (resetBusy) return;
+    setResetBusy(true);
+    try {
+      const creditId = resetCredits?.credits[0]?.id;
+      const response = await fetch("/api/usage/reset", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          idempotencyKey:
+            resetAttemptRef.current ??
+            (resetAttemptRef.current = crypto.randomUUID()),
+          creditId: creditId ?? null,
+        }),
+      });
+      const body = (await response.json().catch(() => ({}))) as {
+        outcome?: "reset" | "nothingToReset" | "noCredit" | "alreadyRedeemed";
+        error?: string;
+      };
+      if (!response.ok) throw new Error(body.error ?? "重置失败");
+      const labels = {
+        reset: "重置卡已使用，用量窗口正在刷新",
+        nothingToReset: "当前没有需要重置的用量窗口，重置卡未消耗",
+        noCredit: "当前账户没有可用重置卡",
+        alreadyRedeemed: "本次重置已完成，请刷新用量",
+      } as const;
+      setNotice(body.outcome ? labels[body.outcome] : "已提交重置请求");
+      resetAttemptRef.current = undefined;
+      setResetDialogOpen(false);
+      await loadDashboard();
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "暂时无法使用重置卡");
+    } finally {
+      setResetBusy(false);
+    }
+  }
+
+  function closeResetDialog() {
+    if (resetBusy) return;
+    resetAttemptRef.current = undefined;
+    setResetDialogOpen(false);
+  }
 
   useEffect(() => {
     if (!authenticated) return;
@@ -1940,6 +2110,7 @@ export default function Home() {
                   threadId: pending.threadId,
                   text: pending.text,
                   attachments: pending.attachments.map((file) => file.path),
+                  maintenance: pending.maintenance,
                 }),
               );
             }
@@ -2906,6 +3077,7 @@ export default function Home() {
     text: string,
     sentAttachments: UploadedFile[],
     targetThreadId = threadId,
+    maintenance = false,
   ) {
     if (activeProject?.archivedAt) {
       setNotice("项目已归档，请先恢复后再执行任务");
@@ -2921,6 +3093,10 @@ export default function Home() {
       socketRef.current?.readyState !== WebSocket.OPEN
     )
       return;
+    if (maintenance && sentAttachments.length) {
+      setNotice("存储维护模式不接收附件，请直接描述要检查或清理的内容");
+      return;
+    }
     const now = crypto.randomUUID();
     setMessages((items) => [
       ...items,
@@ -2933,6 +3109,7 @@ export default function Home() {
       threadId: targetThreadId,
       text,
       attachments: sentAttachments,
+      maintenance: maintenance ? "storage" : undefined,
     };
     pendingTurnRef.current = pending;
     window.localStorage.setItem(
@@ -2948,6 +3125,7 @@ export default function Home() {
         threadId: targetThreadId,
         text,
         attachments: sentAttachments.map((file) => file.path),
+        maintenance: maintenance ? "storage" : undefined,
       }),
     );
     runningRef.current = true;
@@ -2962,10 +3140,14 @@ export default function Home() {
     event.preventDefault();
     const text =
       draft.trim() || (attachments.length ? "请检查并处理我上传的附件。" : "");
-    startTurn(text, attachments);
+    startTurn(text, attachments, threadId, storageMaintenance);
   }
 
   async function retryTask(task: ProjectTask) {
+    if (task.submissionPending) {
+      setNotice("执行结果尚待核对，请先打开对话检查，确认没有任务运行后解除阻塞");
+      return;
+    }
     if (projectBusy || socketRef.current?.readyState !== WebSocket.OPEN) {
       setNotice("请等待连接恢复或先停止当前任务");
       return;
@@ -2985,6 +3167,31 @@ export default function Home() {
     startTurn(task.title, retryAttachments, task.threadId);
   }
 
+  async function reconcileTasks(task: ProjectTask) {
+    setReconciling(true);
+    try {
+      const response = await fetch(`/api/tasks/reconcile?projectId=${encodeURIComponent(task.projectId)}`, { method: "POST" });
+      const body = await response.json();
+      if (!response.ok) throw new Error(body.error ?? "核对失败");
+      await loadProjectData(projectId);
+      setNotice(body.recovered > 0 ? "已从执行历史恢复任务状态" : body.unavailable > 0 ? "暂时无法读取执行历史，将继续自动核对" : "暂未找到可确认的结果，将继续自动核对");
+    } catch (error) { setNotice(error instanceof Error ? error.message : "核对失败，请稍后重试"); }
+    finally { setReconciling(false); }
+  }
+
+  async function resolveSubmission(task: ProjectTask) {
+    if (!window.confirm("请先查看对话和成果，确认服务器上该任务已经结束或未启动。确认后解除阻塞；这不会停止服务器任务，也不会自动重新执行。")) return;
+    try {
+      const response = await fetch(`/api/tasks/${encodeURIComponent(task.taskId)}/resolve-submission?projectId=${encodeURIComponent(task.projectId)}`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ confirmNotRunning: true }),
+      });
+      const body = await response.json();
+      if (!response.ok) throw new Error(body.error ?? "核对失败");
+      await loadProjectData(projectId);
+      setNotice("已记录核对结果；如需再次执行，请主动发起新任务");
+    } catch (error) { setNotice(error instanceof Error ? error.message : "核对失败，请稍后重试"); }
+  }
+
   const mobileConnection =
     connection === "已连接"
       ? "在线"
@@ -2995,10 +3202,20 @@ export default function Home() {
   const upload = useCallback(
     async (
       file?: File,
-      existingUploadId?: string,
-      manageBusy = true,
-    ): Promise<boolean> => {
-      if (!file || (uploading && manageBusy)) return false;
+      options: {
+        existingUploadId?: string;
+        manageBusy?: boolean;
+        targetProjectId?: string;
+        attachOnSuccess?: boolean;
+      } = {},
+    ): Promise<UploadedFile | undefined> => {
+      const {
+        existingUploadId,
+        manageBusy = true,
+        targetProjectId = projectId,
+        attachOnSuccess = true,
+      } = options;
+      if (!file || (uploading && manageBusy)) return undefined;
       const uploadId = existingUploadId ?? crypto.randomUUID();
       const updateFeedback = (
         next: UploadFeedback | ((current: UploadFeedback) => UploadFeedback),
@@ -3030,9 +3247,9 @@ export default function Home() {
           message: "文件超过公网安全上限 95MB",
           retryable: false,
         });
-        return false;
+        return undefined;
       }
-      const url = `/api/files/upload?projectId=${encodeURIComponent(projectId)}`;
+      const url = `/api/files/upload?projectId=${encodeURIComponent(targetProjectId)}`;
       setNotice("");
       if (manageBusy) setUploading(true);
       updateFeedback({
@@ -3051,7 +3268,7 @@ export default function Home() {
           }));
           result =
             file.size > 8 * 1024 * 1024
-              ? await uploadChunked(file, projectId, uploadId, (progress) =>
+              ? await uploadChunked(file, targetProjectId, uploadId, (progress) =>
                   updateFeedback((current) => ({
                     ...current,
                     progress,
@@ -3071,13 +3288,15 @@ export default function Home() {
             result.body?.file
           ) {
             const saved = result.body.file;
-            setAttachments((items) =>
-              items.some((item) => item.path === saved.path)
-                ? items
-                : [...items, saved],
-            );
-            if (projectIdRef.current === projectId) {
-              setFilesProjectId(projectId);
+            if (attachOnSuccess && projectIdRef.current === targetProjectId) {
+              setAttachments((items) =>
+                items.some((item) => item.path === saved.path)
+                  ? items
+                  : [...items, saved],
+              );
+            }
+            if (projectIdRef.current === targetProjectId) {
+              setFilesProjectId(targetProjectId);
               setFiles((items) =>
                 items.some((item) => item.path === saved.path)
                   ? items
@@ -3097,8 +3316,8 @@ export default function Home() {
                 ),
               4500,
             );
-            setNotice("附件已添加到当前任务");
-            return true;
+            if (attachOnSuccess) setNotice("附件已添加到当前任务");
+            return saved;
           }
           const retryable =
             result.status === 0 ||
@@ -3128,8 +3347,8 @@ export default function Home() {
           result.status > 0 &&
           ![408, 409, 429, 500, 502, 503, 504, 507].includes(result.status)
         )
-          await abortChunkUpload(file, projectId, uploadId);
-        return false;
+          await abortChunkUpload(file, targetProjectId, uploadId);
+        return undefined;
       } finally {
         if (manageBusy) setUploading(false);
       }
@@ -3151,7 +3370,7 @@ export default function Home() {
       let completed = 0;
       try {
         for (const file of selected)
-          if (await upload(file, undefined, false)) completed += 1;
+          if (await upload(file, { manageBusy: false })) completed += 1;
       } finally {
         setUploading(false);
       }
@@ -3165,47 +3384,160 @@ export default function Home() {
   );
 
   useEffect(() => {
-    if (!authenticated) return;
-    let consuming = false;
-    const consumeSharedFiles = async (event?: Event) => {
-      if (consuming) return;
-      const detail = event instanceof CustomEvent ? event.detail : undefined;
-      const shared = (
-        Array.isArray(detail) ? detail : window.__PALM_SHARED_FILES__
-      ) as NativeSharedFile[] | undefined;
-      if (!shared?.length) return;
-      consuming = true;
-      window.__PALM_SHARED_FILES__ = [];
-      setView("chat");
-      setNotice(`正在接收外部分享的 ${shared.length} 个文件…`);
-      try {
-        const imported: File[] = [];
-        for (const item of shared.slice(0, 10)) {
-          const response = await fetch(
-            `/__native_share/${encodeURIComponent(item.id)}`,
-          );
-          if (!response.ok) throw new Error(`无法读取 ${item.name}`);
+    if (!shareDialog?.projectId) return;
+    const controller = new AbortController();
+    void fetch(
+      `/api/threads?projectId=${encodeURIComponent(shareDialog.projectId)}&archived=0`,
+      { signal: controller.signal },
+    )
+      .then(async (response) => {
+        if (!response.ok) throw new Error();
+        const body = (await response.json()) as { threads?: ProjectThread[] };
+        const loaded = body.threads ?? [];
+        setShareThreads(loaded);
+        setShareDialog((current) => {
+          if (!current || current.projectId !== shareDialog.projectId) return current;
+          if (current.threadId === "__new__" || loaded.some((thread) => thread.threadId === current.threadId)) return current;
+          return { ...current, threadId: "__new__" };
+        });
+      })
+      .catch(() => {
+        if (!controller.signal.aborted) setShareThreads([]);
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setShareThreadsLoading(false);
+      });
+    return () => controller.abort();
+  }, [shareDialog?.projectId]);
+
+  async function submitSharedFiles(event: FormEvent) {
+    event.preventDefault();
+    if (!shareDialog || shareDialogBusyRef.current) return;
+    const targetProject = projectsRef.current.find((project) => project.id === shareDialog.projectId);
+    if (!targetProject || targetProject.archivedAt) {
+      setNotice("目标项目不可写，请选择其他项目");
+      return;
+    }
+    if (shareDialog.projectId === projectIdRef.current && shareDialog.threadId === "__new__" && projectBusy) {
+      setNotice("当前项目仍有任务执行，请选择已有对话或稍后新建");
+      return;
+    }
+    shareDialogBusyRef.current = true;
+    setShareDialogBusy(true);
+    setUploading(true);
+    setNotice(`正在导入 ${shareDialog.files.length} 个分享文件…`);
+    const savedFiles: UploadedFile[] = [];
+    const failedFiles: NativeSharedFile[] = [];
+    try {
+      for (const item of shareDialog.files.slice(0, 10)) {
+        try {
+          const response = await fetch(`/__native_share/${encodeURIComponent(item.id)}`);
+          if (!response.ok) throw new Error();
           const blob = await response.blob();
-          imported.push(
+          const saved = await upload(
             new File([blob], item.name, {
               type: item.mimeType || blob.type || "application/octet-stream",
             }),
+            {
+              manageBusy: false,
+              targetProjectId: shareDialog.projectId,
+              attachOnSuccess: false,
+            },
           );
+          if (!saved) {
+            failedFiles.push(item);
+            continue;
+          }
+          savedFiles.push(saved);
+          window.PalmNative?.discardSharedFiles?.(JSON.stringify([item.id]));
+        } catch {
+          failedFiles.push(item);
         }
-        await uploadFiles(imported);
-      } catch (error) {
-        setNotice(
-          error instanceof Error
-            ? error.message
-            : "接收外部分享文件失败，请重试",
-        );
-      } finally {
-        consuming = false;
       }
+      const existing = readPendingAttachments(shareDialog.projectId);
+      const pending = [...existing];
+      for (const file of savedFiles) {
+        if (!pending.some((item) => item.path === file.path)) pending.push(file);
+      }
+      if (savedFiles.length) {
+        window.localStorage.setItem(
+          pendingAttachmentKey(shareDialog.projectId),
+          JSON.stringify(pending),
+        );
+      }
+      if (failedFiles.length) {
+        setShareDialog((current) => current ? { ...current, files: failedFiles } : current);
+        setNotice(
+          savedFiles.length
+            ? `已添加 ${savedFiles.length} 个文件，另有 ${failedFiles.length} 个失败项可直接重试`
+            : `${failedFiles.length} 个分享文件上传失败，可直接重试`,
+        );
+        return;
+      }
+      if (!savedFiles.length) throw new Error("没有可导入的分享文件");
+      if (shareDialog.projectId === projectIdRef.current) {
+        if (shareDialog.threadId === "__new__") {
+          threadIdRef.current = undefined;
+          setThreadId(undefined);
+          setMessages([]);
+        } else {
+          await openThreadById(shareDialog.projectId, shareDialog.threadId);
+        }
+        attachmentsProjectRef.current = shareDialog.projectId;
+        setAttachments(pending);
+        setView("chat");
+      } else {
+        if (shareDialog.threadId !== "__new__") {
+          setPendingNavigation({
+            projectId: shareDialog.projectId,
+            threadId: shareDialog.threadId,
+            view: "chat",
+          });
+        }
+        setProjectId(shareDialog.projectId);
+        setView("chat");
+      }
+      setNotice(`已将 ${savedFiles.length} 个文件添加到所选对话`);
+      setShareDialog(undefined);
+      setShareThreads([]);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "接收外部分享文件失败，请重试");
+    } finally {
+      shareDialogBusyRef.current = false;
+      setShareDialogBusy(false);
+      setUploading(false);
+    }
+  }
+
+  useEffect(() => {
+    if (!authenticated) return;
+    const queueSharedFiles = (event?: Event) => {
+      const detail = event instanceof CustomEvent ? event.detail : undefined;
+      const shared = (Array.isArray(detail) ? detail : window.__PALM_SHARED_FILES__) as NativeSharedFile[] | undefined;
+      if (!shared?.length) return;
+      window.__PALM_SHARED_FILES__ = [];
+      setShareThreadsLoading(true);
+      setShareDialog((current) => {
+        const files = [...(current?.files ?? [])];
+        for (const item of shared.slice(0, 10)) {
+          if (!files.some((file) => file.id === item.id)) files.push(item);
+        }
+        const currentProjectId = projectIdRef.current;
+        const targetProjectId = projectsRef.current.find(
+          (project) => project.id === currentProjectId && !project.archivedAt,
+        )?.id ?? projectsRef.current.find((project) => !project.archivedAt)?.id ?? currentProjectId;
+        return current
+          ? { ...current, files: files.slice(0, 10) }
+          : {
+              files: files.slice(0, 10),
+              projectId: targetProjectId,
+              threadId: targetProjectId === currentProjectId
+                ? threadIdRef.current ?? "__new__"
+                : "__new__",
+            };
+      });
     };
-    const listener = (event: Event) => {
-      void consumeSharedFiles(event);
-    };
+    const listener = (event: Event) => queueSharedFiles(event);
     const errorListener = (event: Event) => {
       const detail = event instanceof CustomEvent ? event.detail : undefined;
       window.__PALM_SHARE_ERROR__ = undefined;
@@ -3223,12 +3555,12 @@ export default function Home() {
           detail: window.__PALM_SHARE_ERROR__,
         }),
       );
-    void consumeSharedFiles();
+    queueSharedFiles();
     return () => {
       window.removeEventListener("palm-share", listener);
       window.removeEventListener("palm-share-error", errorListener);
     };
-  }, [authenticated, projectId, uploadFiles]);
+  }, [authenticated]);
 
   function dragEnter(event: DragEvent<HTMLElement>) {
     if (!event.dataTransfer.types.includes("Files")) return;
@@ -3567,6 +3899,39 @@ export default function Home() {
                   <SlidersHorizontal size={17} />
                   运行设置
                 </button>
+                <button
+                  className={cliVersion?.updateAvailable ? "cli-update-available" : undefined}
+                  onClick={() => {
+                    setOpenMenu(undefined);
+                    void refreshCliVersion();
+                  }}
+                  title={versionCheckLabel(cliVersion?.checkedAt)}
+                >
+                  <ArrowClockwise size={17} weight={cliVersion?.updateAvailable ? "bold" : "regular"} />
+                  {cliVersion?.updateAvailable
+                    ? "Codex CLI 可更新"
+                    : cliVersion?.state === "current"
+                      ? "Codex CLI 已是最新版"
+                      : "检查 Codex CLI 更新"}
+                  <small>
+                    {cliVersion?.updateAvailable
+                      ? `${cliVersion.installedVersion} → ${cliVersion.latestVersion}`
+                      : cliVersion?.installedVersion ?? versionCheckLabel(cliVersion?.checkedAt)}
+                  </small>
+                </button>
+                <button
+                  onClick={() => {
+                    setOpenMenu(undefined);
+                    resetAttemptRef.current = crypto.randomUUID();
+                    setResetDialogOpen(true);
+                  }}
+                >
+                  <Ticket size={17} weight="bold" />
+                  使用重置卡
+                  {resetCredits?.availableCount ? (
+                    <small>{resetCredits.availableCount} 张</small>
+                  ) : null}
+                </button>
               </div>}
             </div>
             <button
@@ -3703,6 +4068,208 @@ export default function Home() {
             </form>
           </div>
         )}
+        {resetDialogOpen && (
+          <div
+            className="dialog-backdrop"
+            role="presentation"
+            onPointerDown={(event) => {
+              if (event.target === event.currentTarget) closeResetDialog();
+            }}
+          >
+            <section
+              className="project-dialog reset-credit-dialog"
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="reset-credit-title"
+            >
+              <header>
+                <div>
+                  <small>Codex 用量</small>
+                  <h2 id="reset-credit-title">使用重置卡</h2>
+                </div>
+                <button
+                  type="button"
+                  aria-label="关闭"
+                  disabled={resetBusy}
+                  onClick={closeResetDialog}
+                >
+                  <X size={18} weight="bold" />
+                </button>
+              </header>
+              <div className="reset-credit-summary">
+                <span><Ticket size={22} weight="fill" /></span>
+                <div>
+                  <strong>
+                    {resetCredits
+                      ? `${resetCredits.availableCount} 张可用`
+                      : "可用数量尚未同步"}
+                  </strong>
+                  <p>
+                    {resetCredits?.credits[0]?.expiresAt
+                      ? `最近一张将于 ${new Date(resetCredits.credits[0].expiresAt).toLocaleString("zh-CN")} 到期`
+                      : "使用后会刷新符合条件的 5 小时和每周用量窗口。"}
+                  </p>
+                </div>
+              </div>
+              <p>
+                这是一次性账户权益。只有成功刷新至少一个符合条件的用量窗口时才会消耗；请确认现在确实需要重置。
+              </p>
+              <footer>
+                <button
+                  type="button"
+                  disabled={resetBusy}
+                  onClick={closeResetDialog}
+                >
+                  取消
+                </button>
+                <button
+                  type="button"
+                  className="primary danger-confirm"
+                  disabled={
+                    resetBusy || !resetCredits || resetCredits.availableCount === 0
+                  }
+                  onClick={() => void consumeResetCredit()}
+                >
+                  {resetBusy ? "正在重置…" : "确认使用 1 张"}
+                </button>
+              </footer>
+            </section>
+          </div>
+        )}
+        {shareDialog && (
+          <div
+            className="dialog-backdrop"
+            role="presentation"
+            onPointerDown={(event) => {
+              if (event.target === event.currentTarget) closeShareDialog();
+            }}
+          >
+            <form
+              className="project-dialog share-target-dialog"
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="share-target-title"
+              onSubmit={submitSharedFiles}
+            >
+              <header>
+                <div>
+                  <small>外部分享</small>
+                  <h2 id="share-target-title">发送到掌心助理</h2>
+                </div>
+                <button
+                  type="button"
+                  aria-label="关闭"
+                  disabled={shareDialogBusy}
+                  onClick={() => closeShareDialog()}
+                >
+                  <X size={18} weight="bold" />
+                </button>
+              </header>
+              <div className="shared-file-summary">
+                <Paperclip size={18} />
+                <div>
+                  <strong>{shareDialog.files.length} 个文件</strong>
+                  <span>
+                    {shareDialog.files.map((file) => file.name).join("、")}
+                  </span>
+                </div>
+              </div>
+              <label>
+                <span>目标项目</span>
+                <select
+                  value={shareDialog.projectId}
+                  disabled={shareDialogBusy}
+                  onChange={(event) =>
+                    {
+                      setShareThreadsLoading(true);
+                      setShareThreads([]);
+                      setShareDialog((current) =>
+                        current
+                          ? {
+                              ...current,
+                              projectId: event.target.value,
+                              threadId: "__new__",
+                            }
+                          : current,
+                      );
+                    }
+                  }
+                >
+                  {projects
+                    .filter((project) => !project.archivedAt)
+                    .map((project) => (
+                      <option key={project.id} value={project.id}>
+                        {project.name}
+                      </option>
+                    ))}
+                </select>
+              </label>
+              <fieldset className="share-thread-picker" disabled={shareDialogBusy}>
+                <legend>目标对话</legend>
+                <label className={shareDialog.threadId === "__new__" ? "selected" : ""}>
+                  <input
+                    type="radio"
+                    name="share-thread"
+                    value="__new__"
+                    checked={shareDialog.threadId === "__new__"}
+                    onChange={() =>
+                      setShareDialog((current) =>
+                        current ? { ...current, threadId: "__new__" } : current,
+                      )
+                    }
+                  />
+                  <span>
+                    <strong>新建任务</strong>
+                    <small>从一个新的对话开始处理这些文件</small>
+                  </span>
+                </label>
+                {shareThreadsLoading ? (
+                  <p>正在读取对话…</p>
+                ) : (
+                  shareThreads.slice(0, 12).map((thread) => (
+                    <label
+                      key={thread.threadId}
+                      className={shareDialog.threadId === thread.threadId ? "selected" : ""}
+                    >
+                      <input
+                        type="radio"
+                        name="share-thread"
+                        value={thread.threadId}
+                        checked={shareDialog.threadId === thread.threadId}
+                        onChange={() =>
+                          setShareDialog((current) =>
+                            current ? { ...current, threadId: thread.threadId } : current,
+                          )
+                        }
+                      />
+                      <span>
+                        <strong>{thread.title}</strong>
+                        <small>{new Date(thread.updatedAt).toLocaleString("zh-CN")}</small>
+                      </span>
+                    </label>
+                  ))
+                )}
+              </fieldset>
+              <p>文件会上传到所选项目，并作为待发送附件放入目标对话；确认发送前不会执行任务。</p>
+              <footer>
+                <button
+                  type="button"
+                  disabled={shareDialogBusy}
+                  onClick={() => closeShareDialog()}
+                >
+                  {shareDialogBusy ? "正在导入，请稍候" : "取消"}
+                </button>
+                <button
+                  type="submit"
+                  className="primary"
+                  disabled={shareDialogBusy || shareThreadsLoading}
+                >
+                  {shareDialogBusy ? "导入中…" : "添加到对话"}
+                </button>
+              </footer>
+            </form>
+          </div>
+        )}
         <section
           className={`model-bar ${runtimeOpen ? "open" : ""}`}
           aria-label="Codex 模型设置"
@@ -3800,18 +4367,38 @@ export default function Home() {
             className={`system-alert ${status.disk?.tasksPaused ? "critical" : ""}`}
             role="status"
           >
-            <strong>
-              {connection !== "已连接"
-                ? `Codex ${connection}`
-                : status.disk?.tasksPaused
-                  ? "服务器空间不足，已暂停新任务和上传"
-                  : "服务器磁盘空间偏低"}
-            </strong>
-            <span>
-              {connection !== "已连接"
-                ? "连接恢复后会自动同步当前任务"
-                : `${bytes(status.disk?.freeBytes)} 可用 · 建议尽快清理旧版本`}
-            </span>
+            <div>
+              <strong>
+                {connection !== "已连接"
+                  ? `Codex ${connection}`
+                  : status.disk?.tasksPaused
+                    ? "服务器空间不足，普通任务和上传已暂停"
+                    : "服务器磁盘空间偏低"}
+              </strong>
+              <span>
+                {connection !== "已连接"
+                  ? "连接恢复后会自动同步当前任务"
+                  : `${bytes(status.disk?.freeBytes)} 可用 · 可进入存储维护模式安全自救`}
+              </span>
+            </div>
+            {connection === "已连接" && status.disk?.warning && (
+              <button
+                type="button"
+                className={storageMaintenance ? "active" : ""}
+                onClick={() => {
+                  setStorageMaintenance((active) => !active);
+                  setView("chat");
+                  setNotice(
+                    storageMaintenance
+                      ? "已退出存储维护模式"
+                      : "已进入存储维护模式；请描述要检查或清理的磁盘问题",
+                  );
+                }}
+              >
+                <Wrench size={15} weight="bold" />
+                {storageMaintenance ? "退出维护" : "开始维护"}
+              </button>
+            )}
           </section>
         )}
         {notice && (
@@ -4049,11 +4636,13 @@ export default function Home() {
                             {task.errorMessage ? ` · ${task.errorMessage}` : ""}
                           </small>
                         </span>
-                        <b>{taskStatusLabel(task.status)}</b>
+                        <b>{task.submissionPending ? "待核对" : taskStatusLabel(task.status)}</b>
                       </button>
-                      {((task.outputPaths?.length ?? 0) > 0 ||
+                      {(task.submissionPending || (task.outputPaths?.length ?? 0) > 0 ||
                         ["failed", "interrupted"].includes(task.status)) && (
                         <div className="task-actions">
+                          {task.submissionPending && <button disabled={reconciling} onClick={() => void reconcileTasks(task)}>{reconciling ? "正在核对…" : "重新核对执行历史"}</button>}
+                          {task.submissionPending && <button disabled={reconciling} onClick={() => void resolveSubmission(task)}>已核对，解除阻塞</button>}
                           {task.outputPaths?.map((outputPath) => {
                             const query = new URLSearchParams({
                               projectId,
@@ -4068,7 +4657,7 @@ export default function Home() {
                               </a>
                             );
                           })}
-                          {["failed", "interrupted"].includes(task.status) && (
+                          {!task.submissionPending && ["failed", "interrupted"].includes(task.status) && (
                             <button onClick={() => void retryTask(task)}>
                               重新执行
                             </button>
@@ -4235,7 +4824,9 @@ export default function Home() {
                   <UploadCard
                     key={item.uploadId}
                     item={item}
-                    onRetry={() => void upload(item.file, item.uploadId)}
+                    onRetry={() =>
+                      void upload(item.file, { existingUploadId: item.uploadId })
+                    }
                     onDismiss={() =>
                       setUploadFeedbacks((items) =>
                         items.filter(
@@ -4507,6 +5098,18 @@ export default function Home() {
           ref={composerRef}
           className={`composer-wrap ${view !== "chat" ? "composer-hidden" : ""}`}
         >
+          {storageMaintenance && (
+            <div className="maintenance-mode-banner" role="status">
+              <Wrench size={16} weight="bold" />
+              <span>
+                <strong>存储维护模式</strong>
+                仅用于检查磁盘、清理安全目标并恢复掌心助理服务
+              </span>
+              <button type="button" onClick={() => setStorageMaintenance(false)}>
+                退出
+              </button>
+            </div>
+          )}
           {recentOutputs.length > 0 && (
             <div className="output-row">
               <span>最新成果</span>
@@ -4529,7 +5132,9 @@ export default function Home() {
                 <UploadCard
                   key={item.uploadId}
                   item={item}
-                  onRetry={() => void upload(item.file, item.uploadId)}
+                  onRetry={() =>
+                    void upload(item.file, { existingUploadId: item.uploadId })
+                  }
                   onDismiss={() =>
                     setUploadFeedbacks((items) =>
                       items.filter((entry) => entry.uploadId !== item.uploadId),
@@ -4608,7 +5213,7 @@ export default function Home() {
               type="file"
               multiple
               hidden
-              disabled={uploading || projectReadOnly}
+              disabled={uploading || projectReadOnly || storageMaintenance}
               onChange={(event) => {
                 void uploadFiles(event.target.files);
                 event.target.value = "";
@@ -4620,7 +5225,7 @@ export default function Home() {
               accept="image/*"
               multiple
               hidden
-              disabled={uploading || projectReadOnly}
+              disabled={uploading || projectReadOnly || storageMaintenance}
               onChange={(event) => {
                 void uploadFiles(event.target.files);
                 event.target.value = "";
@@ -4638,7 +5243,7 @@ export default function Home() {
                     current === "attachments" ? undefined : "attachments",
                   )
                 }
-                disabled={uploading || Boolean(activeProject?.archivedAt)}
+                disabled={uploading || Boolean(activeProject?.archivedAt) || storageMaintenance}
               >
                 <Paperclip size={19} weight="bold" />
               </button>
@@ -4655,6 +5260,8 @@ export default function Home() {
               placeholder={
                 activeProject?.archivedAt
                   ? "项目已归档，仅可查看"
+                  : storageMaintenance
+                    ? "描述需要检查或清理的磁盘问题…"
                   : projectRunningTask &&
                       projectRunningTask.threadId !== threadId
                     ? "本项目另一任务正在执行…"

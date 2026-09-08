@@ -42,17 +42,4 @@ jobs:
       - run: npm ci --no-audit --no-fund
       - run: npm run check
       - run: npm run build
-      - run: npm run test:integration
-      - run: npm run test:v08
-      - run: npm run test:v09
-      - run: npm run test:v010
-      - run: npm run test:v012
-      - run: npm run test:v013
-      - run: npm run test:v014
-      - run: npm run test:v015
-      - run: npm run test:v016
-      - run: npm run test:v017
-      - run: npm run test:v018
-      - run: npm run test:v019
-      - run: npm run test:v020
-      - run: npm run test:v021
+      - run: npm run test:all

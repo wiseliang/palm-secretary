@@ -21,9 +21,9 @@ try {
   await runGit(repository, "init");
   await runGit(repository, "config", "user.email", "palm-test@example.invalid");
   await runGit(repository, "config", "user.name", "Palm Test");
-  await writeFile(path.join(repository, "tracked.txt"), "one\n");
-  await writeFile(path.join(repository, "delete.txt"), "remove me\n");
-  await writeFile(path.join(repository, "rename-old.txt"), "same\n");
+  await writeFile(path.join(repository, "tracked.ts"), "one\n");
+  await writeFile(path.join(repository, "delete.ts"), "remove me\n");
+  await writeFile(path.join(repository, "rename-old.ts"), "same\n");
   await runGit(repository, "add", ".");
   await runGit(repository, "commit", "-m", "initial");
 
@@ -35,19 +35,32 @@ try {
   assert.equal(clean.summary.status, "clean");
   assert.equal((await aggregateDevelopmentResult(repository, before, before, [], true)).summary.status, "clean", "已撤销的文件事件不能误报开发变化");
 
-  await writeFile(path.join(repository, "tracked.txt"), "one\ntwo\nthree\n");
-  await runGit(repository, "add", "tracked.txt");
-  await appendFile(path.join(repository, "tracked.txt"), "four\n");
-  await unlink(path.join(repository, "delete.txt"));
-  await runGit(repository, "mv", "rename-old.txt", "rename-new.txt");
-  await writeFile(path.join(repository, "untracked.txt"), "new one\nnew two\n");
+  await writeFile(path.join(repository, "meeting-notes.md"), "ordinary writing work\n");
+  const documentOnly = await aggregateDevelopmentResult(repository, before, await readGitSnapshot(repository), [], false);
+  assert.equal(documentOnly.detected, false, "普通文档产物不得触发开发结果卡");
+  assert.equal(documentOnly.summary.status, "clean");
+  await unlink(path.join(repository, "meeting-notes.md"));
+
+  const nestedDocumentBefore = await readGitSnapshot(repository);
+  await mkdir(path.join(repository, "app"), { recursive: true });
+  await writeFile(path.join(repository, "app", "customer-report.pdf"), "ordinary report\n");
+  const nestedDocumentOnly = await aggregateDevelopmentResult(repository, nestedDocumentBefore, await readGitSnapshot(repository), [], false);
+  assert.equal(nestedDocumentOnly.detected, false, "源码目录中的普通文档也不得触发开发结果卡");
+  await rm(path.join(repository, "app"), { recursive: true, force: true });
+
+  await writeFile(path.join(repository, "tracked.ts"), "one\ntwo\nthree\n");
+  await runGit(repository, "add", "tracked.ts");
+  await appendFile(path.join(repository, "tracked.ts"), "four\n");
+  await unlink(path.join(repository, "delete.ts"));
+  await runGit(repository, "mv", "rename-old.ts", "rename-new.ts");
+  await writeFile(path.join(repository, "untracked.ts"), "new one\nnew two\n");
 
   const after = await readGitSnapshot(repository, true);
   assert.equal(after.available, true);
   assert.equal(after.dirty, true);
   assert.equal(after.changes?.length, 4, "tracked、deleted、rename、untracked 应分别计数");
-  assert.ok(after.changes?.some((item) => item.status === "MM" && item.path === "tracked.txt"), "必须识别 staged + unstaged");
-  assert.ok(after.changes?.some((item) => item.status === "??" && item.path === "untracked.txt"), "必须识别 untracked");
+  assert.ok(after.changes?.some((item) => item.status === "MM" && item.path === "tracked.ts"), "必须识别 staged + unstaged");
+  assert.ok(after.changes?.some((item) => item.status === "??" && item.path === "untracked.ts"), "必须识别 untracked");
   assert.ok((after.additions ?? 0) >= 5, "新增行数必须包含 tracked 与 untracked 文本");
   assert.ok((after.deletions ?? 0) >= 1, "删除行数必须来自真实 Git numstat");
 
@@ -71,12 +84,12 @@ try {
   assert.equal(interrupted.summary.status, "unknown", "任务中断时必须要求人工确认");
 
   const dirtyBefore = await readGitSnapshot(repository, false, true);
-  await appendFile(path.join(repository, "tracked.txt"), "task-only\n");
+  await appendFile(path.join(repository, "tracked.ts"), "task-only\n");
   const dirtyAfter = await readGitSnapshot(repository);
   const taskOnly = await aggregateDevelopmentResult(repository, dirtyBefore, dirtyAfter, [], false);
   assert.equal(taskOnly.git.changedFiles, 1, "任务前已有脏文件不得计入本次执行文件数");
   assert.equal(taskOnly.git.additions, 1, "本次执行增量必须排除任务前已有行数");
-  await writeFile(path.join(repository, "tracked.txt"), "one\ntwo\nthree\nfour\n");
+  await writeFile(path.join(repository, "tracked.ts"), "one\ntwo\nthree\nfour\n");
 
   const unavailable = await readGitSnapshot(path.join(root, "missing"));
   assert.equal(unavailable.available, false);

@@ -39,3 +39,7 @@ next-env.d.ts
 /work/
 /.test-tools/
 /.local-*
+
+# Python operational tooling
+__pycache__/
+*.pyc

@@ -12,7 +12,9 @@ createInterface({ input: process.stdin }).on('line', async (line) => {
   const message = JSON.parse(line);
   if (logFile && message.id) await appendFile(logFile, `${JSON.stringify(message)}\n`);
   if (!message.id) return;
-  if (message.method === 'initialize') return send({ id: message.id, result: { userAgent: 'mock' } });
+  if (message.method === 'initialize') return send(process.env.MOCK_INITIALIZE_ERROR
+    ? { id: message.id, error: { message: 'injected initialize failure' } }
+    : { id: message.id, result: { userAgent: 'mock' } });
   if (message.method === 'account/rateLimits/read') return send({ id: message.id, result: { rateLimits: { planType: 'plus', primary: { usedPercent: 12, windowDurationMins: 300, resetsAt: Math.floor(Date.now() / 1000) + 3600 }, secondary: { usedPercent: 37, windowDurationMins: 10080, resetsAt: Math.floor(Date.now() / 1000) + 3 * 86400 } } } });
   if (message.method === 'account/usage/read') return send({ id: message.id, result: {} });
   if (message.method === 'model/list') return send({ id: message.id, result: { data: [
@@ -28,7 +30,7 @@ createInterface({ input: process.stdin }).on('line', async (line) => {
   if (message.method === 'turn/interrupt') return send({ id: message.id, result: {} });
   if (message.method === 'turn/start') {
     const turnId = `turn-${Date.now()}`;
-    send({ id: message.id, result: { turn: { id: turnId, status: 'inProgress' } } });
+    if (!process.env.MOCK_EARLY_COMPLETION) send({ id: message.id, result: process.env.MOCK_LOST_START_RESPONSE ? {} : { turn: { id: turnId, status: 'inProgress' } } });
     setTimeout(async () => {
       const outbox = path.join(message.params.cwd, 'outbox');
       await mkdir(outbox, { recursive: true });
@@ -36,7 +38,7 @@ createInterface({ input: process.stdin }).on('line', async (line) => {
       await writeFile(path.join(outbox, `${turnId}-二维码.png`), Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64'));
       const answer = `## 处理完成\n- 已读取当前任务\n- 已生成测试成果\n\n![测试二维码](outbox/${turnId}-二维码.png)\n\n\`\`\`txt\nMOCK_OK\n\`\`\``;
       const turns = threadTurns.get(message.params.threadId) ?? [];
-      turns.push({ id: turnId, items: [
+      turns.push({ id: turnId, status: 'completed', items: [
         { type: 'userMessage', text: message.params.input?.[0]?.text ?? '' },
         { type: 'agentMessage', text: answer },
       ] });
@@ -44,7 +46,8 @@ createInterface({ input: process.stdin }).on('line', async (line) => {
       // Intentionally emit only a partial delta. The UI must reconcile from
       // thread/read after the terminal event instead of trusting every delta.
       send({ method: 'item/agentMessage/delta', params: { threadId: message.params.threadId, turnId, delta: '正在处理…' } });
-      send({ method: 'turn/completed', params: { threadId: message.params.threadId, turn: { id: turnId, status: 'completed' } } });
+      if (!process.env.MOCK_SKIP_TERMINAL) send({ method: 'turn/completed', params: { threadId: message.params.threadId, turn: { id: turnId, status: 'completed' } } });
+      if (process.env.MOCK_EARLY_COMPLETION) setTimeout(() => send({ id: message.id, result: { turn: { id: turnId, status: 'completed' } } }), 150);
     }, 20);
     return;
   }

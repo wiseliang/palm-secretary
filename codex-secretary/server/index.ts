@@ -4,7 +4,7 @@ import multipart from '@fastify/multipart';
 import websocket from '@fastify/websocket';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { createReadStream, createWriteStream } from 'node:fs';
+import { createWriteStream } from 'node:fs';
 import { appendFile, mkdir, readFile, readdir, rename, rm, stat, statfs } from 'node:fs/promises';
 import path from 'node:path';
 import { pipeline } from 'node:stream/promises';
@@ -12,11 +12,16 @@ import { randomUUID } from 'node:crypto';
 import { isIP } from 'node:net';
 import { z } from 'zod';
 import { config } from './config.js';
-import { createSession, verifyPassword, verifySession } from './auth.js';
+import { createSession, verifyPassword } from './auth.js';
 import { CodexBridge } from './app-server.js';
 import { ProjectStore } from './project-store.js';
 import { readGitSnapshot } from './development-status.js';
 import { enrichDevelopmentResultWithGithub } from './github-status.js';
+import { resolveModelSelection, type CodexModel } from './model-selection.js';
+import { CliVersionChecker } from './cli-version.js';
+import { SessionStore } from './session-store.js';
+import { submissionEvidence, turnStatus } from './task-reconciliation.js';
+import { TaskReconciler } from './task-reconciler.js';
 
 const app = Fastify({ logger: { level: process.env.LOG_LEVEL ?? 'info' }, trustProxy: '127.0.0.1' });
 const bridge = new CodexBridge();
@@ -25,18 +30,27 @@ const sockets = new Set<SocketLike>();
 const threadSockets = new Map<string, Set<SocketLike>>();
 const socketThreads = new Map<SocketLike, string>();
 const loadedThreads = new Set<string>();
+const loadedThreadModes = new Map<string, 'normal' | 'storage'>();
 const startingProjects = new Set<string>();
 const loginAttempts = new Map<string, { count: number; resetAt: number }>();
 type TurnAcceptance = { threadId: string; payload: { turn?: { id?: string } }; replayed?: boolean; clientRequestId: string };
 const pendingTurnRequests = new Map<string, Promise<TurnAcceptance | undefined>>();
 const projects = new ProjectStore(config.workspace);
+const sessions = new SessionStore(path.join(config.workspace, '.palm', 'revoked-sessions.json'), config.sessionSecret);
+const socketSessions = new Map<SocketLike, string>();
 const execFileAsync = promisify(execFile);
+const cliVersionChecker = new CliVersionChecker({
+  codexBin: config.codexBin,
+  npmBin: config.npmBin,
+  proxyUrl: config.proxyUrl,
+  enabled: config.codexVersionCheckEnabled,
+  intervalMs: config.codexVersionCheckIntervalMs,
+});
 function outputInstructions(projectId: string): string {
   const inbox = projects.inbox(projectId);
   const outbox = projects.outbox(projectId);
   return `你运行在掌心助理的独立项目工作区。用户不需要知道目录约定。代码与 Git 操作以当前工作目录为准，但 Palm 私有文件不在 Git 仓库内。用户上传的附件位于绝对目录 ${inbox}。只要任务产生可下载成果（文档、表格、演示文稿、PDF、图片、压缩包、代码包或其他文件），你必须主动把最终版本保存到绝对目录 ${outbox}，使用清晰中文文件名，并在最终回复中说明文件名。若成果是需要直接查看或扫码的图片，最终回复中还必须单独写一行 Markdown 图片语法：![图片说明](outbox/实际文件名.png)，路径必须与真实文件完全一致；掌心助理会在聊天中直接显示该图片。不要把 inbox 或 outbox 复制进当前 Git 仓库，不要要求用户说出 outbox，也不要只在聊天中声称已生成而不实际写入。纯问答无需强行创建文件。`;
 }
-type CodexModel = { id: string; model: string; displayName: string; description: string; isDefault: boolean; hidden?: boolean; supportedReasoningEfforts: Array<{ reasoningEffort: string; description: string }>; defaultReasoningEffort: string };
 let modelCache: { expiresAt: number; models: CodexModel[] } | undefined;
 
 function threadMarkdown(value: unknown, title: string): string {
@@ -65,6 +79,7 @@ function threadMarkdown(value: unknown, title: string): string {
 
 await mkdir(config.workspace, { recursive: true });
 await projects.initialize();
+await sessions.initialize();
 
 await app.register(cookie);
 await app.register(multipart, {
@@ -75,7 +90,7 @@ await app.register(websocket);
 app.addContentTypeParser('application/octet-stream', { parseAs: 'buffer', bodyLimit: 9 * 1024 * 1024 }, (_request, body, done) => done(null, body));
 
 function authenticated(request: FastifyRequest): boolean {
-  return verifySession(request.cookies.palm_session, config.sessionSecret);
+  return sessions.valid(request.cookies.palm_session);
 }
 
 function originAllowed(request: FastifyRequest): boolean {
@@ -177,8 +192,11 @@ bridge.on('message', async (message: Record<string, unknown>) => {
   }
   if (threadId && typeof message.method === 'string' && ['turn/completed', 'turn/failed', 'turn/interrupted'].includes(message.method)) {
     const turnId = eventTurnId;
-    const status = message.method === 'turn/completed' ? 'completed' : message.method === 'turn/interrupted' ? 'interrupted' : 'failed';
-    const failure = params && typeof (params as Record<string, unknown>).error === 'object'
+    const status = eventTurn?.status === undefined
+      ? (message.method === 'turn/completed' ? 'completed' : message.method === 'turn/interrupted' ? 'interrupted' : 'failed')
+      : turnStatus(eventTurn.status);
+    if (!status || status === 'running') return;
+    const failure = eventTurn?.error && typeof eventTurn.error === 'object' ? eventTurn.error as Record<string, unknown> : params && typeof (params as Record<string, unknown>).error === 'object'
       ? (params as Record<string, unknown>).error as Record<string, unknown> : undefined;
     const errorMessage = typeof failure?.message === 'string' ? failure.message : undefined;
     try {
@@ -204,6 +222,18 @@ let bridgeWasOffline = false;
 let bridgeRecoveryPending = false;
 let bridgeOnlinePending = false;
 let bridgeRecoveryGeneration = 0;
+const reconciler = new TaskReconciler(
+  projects,
+  (threadId) => bridge.call('thread/read', { threadId, includeTurns: true }),
+  (projectId) => bridgeRecoveryPending || startingProjects.has(projectId),
+  (task) => {
+    broadcast({ type: 'tasks.changed', payload: { projectId: task.projectId } });
+    if (task.status !== 'running') broadcast({ type: 'task.finished', payload: {
+      taskId: task.taskId, projectId: task.projectId, threadId: task.threadId,
+      turnId: task.turnId, status: task.status, completedAt: task.completedAt,
+    } });
+  },
+);
 const publishBridgeOnline = () => {
   if (!bridgeWasOffline || bridgeRecoveryPending) return;
   bridgeWasOffline = false;
@@ -217,6 +247,7 @@ bridge.on('offline', (details) => {
   bridgeOnlinePending = false;
   const interruptedTaskIds = projects.runningTaskIds();
   loadedThreads.clear();
+  loadedThreadModes.clear();
   modelCache = undefined;
   pendingTurnRequests.clear();
   broadcast({ type: 'codex.offline', payload: { ...details, interrupted: interruptedTaskIds.length, reconciling: true } });
@@ -272,6 +303,14 @@ app.post('/api/auth/login', async (request, reply) => {
 
 app.post('/api/auth/logout', async (request, reply) => {
   if (!requireOwner(request, reply)) return;
+  const token = request.cookies.palm_session!;
+  try {
+    await sessions.revoke(token);
+  } finally {
+    for (const [socket, session] of socketSessions) {
+      if (session === token) socket.close(1008, 'session revoked');
+    }
+  }
   reply.clearCookie('palm_session', { path: '/' });
   return { ok: true };
 });
@@ -297,6 +336,31 @@ app.get('/api/usage', async (request, reply) => {
   };
 });
 
+app.get<{ Querystring: { refresh?: string } }>('/api/codex/version', async (request, reply) => {
+  if (!requireOwner(request, reply)) return;
+  return cliVersionChecker.get(request.query.refresh === '1');
+});
+
+app.post('/api/usage/reset', async (request, reply) => {
+  if (!requireOwner(request, reply)) return;
+  const parsed = z.object({
+    idempotencyKey: z.string().uuid(),
+    creditId: z.string().min(1).max(256).nullable().optional(),
+  }).safeParse(request.body);
+  if (!parsed.success) return reply.code(400).send({ error: '重置请求无效' });
+  try {
+    await bridge.ready();
+    const result = await bridge.call('account/rateLimitResetCredit/consume', parsed.data) as {
+      outcome?: 'reset' | 'nothingToReset' | 'noCredit' | 'alreadyRedeemed';
+    };
+    if (!result.outcome) throw new Error('Codex 未返回重置结果');
+    return { outcome: result.outcome };
+  } catch (error) {
+    app.log.warn({ error: error instanceof Error ? error.message : String(error) }, 'Codex 用量重置失败');
+    return reply.code(503).send({ error: '暂时无法使用重置卡，请稍后再试' });
+  }
+});
+
 async function availableModels(force = false): Promise<CodexModel[]> {
   if (!force && modelCache && modelCache.expiresAt > Date.now()) return modelCache.models;
   await bridge.ready();
@@ -304,6 +368,20 @@ async function availableModels(force = false): Promise<CodexModel[]> {
   const models = (response.data ?? []).filter((model) => model && typeof model.model === 'string' && !model.hidden);
   modelCache = { expiresAt: Date.now() + 5 * 60_000, models };
   return models;
+}
+
+async function executionModel(project: { id: string; model?: string; reasoningEffort?: string }) {
+  try {
+    const selection = resolveModelSelection(await availableModels(), project.model, project.reasoningEffort);
+    if (selection.migrated && selection.model) {
+      await projects.setProjectModel(project.id, selection.model.model, selection.reasoningEffort);
+      app.log.info({ projectId: project.id, model: selection.model.model, effort: selection.reasoningEffort }, '项目模型配置已兼容迁移');
+    }
+    return { model: selection.model?.model ?? project.model, effort: selection.reasoningEffort ?? project.reasoningEffort };
+  } catch (error) {
+    app.log.warn({ projectId: project.id, error: error instanceof Error ? error.message : String(error) }, '无法刷新模型能力，沿用项目现有配置');
+    return { model: project.model, effort: project.reasoningEffort };
+  }
 }
 
 app.get<{ Querystring: { refresh?: string } }>('/api/models', async (request, reply) => {
@@ -353,7 +431,26 @@ app.get<{ Querystring: { since?: string } }>('/api/tasks/completed', async (requ
 
 app.get<{ Querystring: { projectId?: string } }>('/api/tasks', async (request, reply) => {
   if (!requireOwner(request, reply)) return;
+  void reconciler.run(request.query.projectId ?? 'default').catch(() => undefined);
   return { tasks: projects.listTasks(request.query.projectId ?? 'default') };
+});
+
+app.post<{ Querystring: { projectId?: string } }>('/api/tasks/reconcile', async (request, reply) => {
+  if (!requireOwner(request, reply)) return;
+  try { return await reconciler.run(request.query.projectId ?? 'default', true); }
+  catch { return reply.code(400).send({ error: '无法核对当前项目' }); }
+});
+
+app.post<{ Params: { id: string }; Querystring: { projectId?: string } }>('/api/tasks/:id/resolve-submission', async (request, reply) => {
+  if (!requireOwner(request, reply)) return;
+  const parsed = z.object({ confirmNotRunning: z.literal(true) }).safeParse(request.body);
+  if (!parsed.success) return reply.code(400).send({ error: '请先核对任务已停止或未启动' });
+  const projectId = request.query.projectId ?? 'default';
+  if (startingProjects.has(projectId)) return reply.code(409).send({ error: '提交请求仍在处理中，请稍后核对' });
+  try {
+    await projects.resolveSubmission(projectId, request.params.id);
+    return { ok: true };
+  } catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : '核对失败' }); }
 });
 
 function searchableText(value: unknown): string {
@@ -730,11 +827,10 @@ app.get<{ Querystring: { path?: string; projectId?: string } }>('/api/files/down
   if (!request.query.path) return reply.code(400).send({ error: '缺少文件路径' });
   try {
     const filePath = projects.safeStoredPath(request.query.projectId ?? 'default', request.query.path);
-    const details = await stat(filePath);
-    if (!details.isFile()) return reply.code(404).send({ error: '文件不存在' });
+    const handle = await projects.openStoredFile(request.query.projectId ?? 'default', request.query.path);
     reply.header('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(displayFileName(path.basename(filePath)))}`);
     reply.header('X-Content-Type-Options', 'nosniff');
-    return reply.send(createReadStream(filePath));
+    return reply.send(handle.createReadStream());
   } catch {
     return reply.code(404).send({ error: '文件不存在' });
   }
@@ -745,15 +841,15 @@ app.get<{ Querystring: { path?: string; projectId?: string } }>('/api/files/prev
   if (!request.query.path) return reply.code(400).send({ error: '缺少文件路径' });
   try {
     const filePath = projects.safeStoredPath(request.query.projectId ?? 'default', request.query.path);
-    const details = await stat(filePath);
     const contentType = previewContentType(filePath);
-    if (!details.isFile() || !contentType) return reply.code(415).send({ error: '该文件类型暂不支持在线预览' });
+    if (!contentType) return reply.code(415).send({ error: '该文件类型暂不支持在线预览' });
+    const handle = await projects.openStoredFile(request.query.projectId ?? 'default', request.query.path);
     reply.header('Content-Type', contentType);
     reply.header('Content-Disposition', `inline; filename*=UTF-8''${encodeURIComponent(displayFileName(path.basename(filePath)))}`);
     reply.header('X-Content-Type-Options', 'nosniff');
     reply.header('Cache-Control', 'private, no-store');
     reply.header('Content-Security-Policy', "default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'");
-    return reply.send(createReadStream(filePath));
+    return reply.send(handle.createReadStream());
   } catch {
     return reply.code(404).send({ error: '文件不存在' });
   }
@@ -764,10 +860,7 @@ app.delete<{ Querystring: { path?: string; projectId?: string } }>('/api/files',
   if (!request.query.path) return reply.code(400).send({ error: '缺少文件路径' });
   try {
     if (projects.getProject(request.query.projectId ?? 'default').archivedAt) return reply.code(409).send({ error: '项目已归档，请先恢复后再删除文件' });
-    const filePath = projects.safeStoredPath(request.query.projectId ?? 'default', request.query.path);
-    const details = await stat(filePath);
-    if (!details.isFile()) throw new Error('不是文件');
-    await rm(filePath);
+    await projects.deleteStoredFile(request.query.projectId ?? 'default', request.query.path);
     return { ok: true };
   } catch {
     return reply.code(404).send({ error: '文件不存在' });
@@ -775,7 +868,7 @@ app.delete<{ Querystring: { path?: string; projectId?: string } }>('/api/files',
 });
 
 const clientMessage = z.discriminatedUnion('type', [
-  z.object({ type: z.literal('turn.start'), clientRequestId: z.string().uuid().optional(), projectId: z.string().min(1).max(64), threadId: z.string().optional(), text: z.string().min(1).max(50_000), attachments: z.array(z.string()).max(10).optional() }),
+  z.object({ type: z.literal('turn.start'), clientRequestId: z.string().uuid().optional(), projectId: z.string().min(1).max(64), threadId: z.string().optional(), text: z.string().min(1).max(50_000), attachments: z.array(z.string()).max(10).optional(), maintenance: z.literal('storage').optional() }),
   z.object({ type: z.literal('turn.interrupt'), threadId: z.string(), turnId: z.string() }),
   z.object({ type: z.literal('thread.subscribe'), projectId: z.string().min(1).max(64), threadId: z.string() }),
 ]);
@@ -786,12 +879,18 @@ app.get('/api/ws', { websocket: true }, (socket, request) => {
     return;
   }
   sockets.add(socket);
+  socketSessions.set(socket, request.cookies.palm_session!);
+  const sessionTimer = setInterval(() => {
+    if (!authenticated(request)) socket.close(1008, 'session expired');
+  }, 15_000);
+  sessionTimer.unref();
   socket.send(JSON.stringify({ type: 'ready' }));
 
   socket.on('message', async (raw) => {
     let clientRequestId: string | undefined;
     let operation: 'turn.start' | 'turn.interrupt' | 'thread.subscribe' | 'unknown' = 'unknown';
     try {
+      if (!authenticated(request)) { socket.close(1008, 'unauthorized'); return; }
       const parsed = clientMessage.safeParse(JSON.parse(raw.toString()));
       if (!parsed.success) throw new Error('消息格式无效');
       const message = parsed.data;
@@ -807,6 +906,7 @@ app.get('/api/ws', { websocket: true }, (socket, request) => {
         throw new Error('Codex 服务正在核对中断任务，请稍后重试');
       }
       await bridge.ready();
+      if (!authenticated(request)) { socket.close(1008, 'unauthorized'); return; }
       app.log.info({ event: message.type }, 'Codex App Server 已就绪');
       if (message.type === 'turn.interrupt') {
         await bridge.call('turn/interrupt', { threadId: message.threadId, turnId: message.turnId });
@@ -815,21 +915,25 @@ app.get('/api/ws', { websocket: true }, (socket, request) => {
       const requestId = message.clientRequestId ?? randomUUID();
       clientRequestId = requestId;
       const requestKey = `${message.projectId}:${requestId}`;
-      const completedRequest = projects.findTaskByClientRequestId(message.projectId, requestId);
-      if (completedRequest) {
-        setSocketThread(socket, completedRequest.threadId);
-        socket.send(JSON.stringify({
-          type: 'turn.accepted', clientRequestId: requestId, replayed: true,
-          threadId: completedRequest.threadId, payload: { turn: { id: completedRequest.turnId } },
-        }));
-        return;
-      }
       const pendingRequest = pendingTurnRequests.get(requestKey);
       if (pendingRequest) {
         const accepted = await pendingRequest;
-        if (!accepted) throw new Error('原请求执行失败，请检查任务记录后再试');
+        if (!accepted) throw new Error('原请求执行结果待核对，请检查任务记录，不要重复提交');
         setSocketThread(socket, accepted.threadId);
         socket.send(JSON.stringify({ type: 'turn.accepted', ...accepted, replayed: true }));
+        return;
+      }
+      const completedRequest = projects.findTaskByClientRequestId(message.projectId, requestId);
+      if (completedRequest) {
+        if (completedRequest.submissionPending) await reconciler.run(message.projectId, true);
+        const latestRequest = projects.findTaskByClientRequestId(message.projectId, requestId)!;
+        if (latestRequest.submissionPending) throw new Error('正在核对已提交请求，请稍后查看任务记录，不要重复提交');
+        if (latestRequest.turnId.startsWith('pending:')) throw new Error('该请求已经人工核对；如需再次执行，请主动发起新任务');
+        setSocketThread(socket, latestRequest.threadId);
+        socket.send(JSON.stringify({
+          type: 'turn.accepted', clientRequestId: requestId, replayed: true,
+          threadId: latestRequest.threadId, payload: { turn: { id: latestRequest.turnId } },
+        }));
         return;
       }
       let settlePending!: (value: TurnAcceptance | undefined) => void;
@@ -837,18 +941,23 @@ app.get('/api/ws', { websocket: true }, (socket, request) => {
       let projectReserved = false;
       try {
       const disk = await diskInfo();
-      if (disk.tasksPaused) throw new Error('磁盘可用空间低于安全线，已暂停新任务');
+      const storageMaintenance = message.maintenance === 'storage';
+      if (disk.tasksPaused && !storageMaintenance) throw new Error('磁盘可用空间低于安全线；请开启“存储维护模式”后再执行清理任务');
+      if (storageMaintenance && message.attachments?.length) throw new Error('存储维护模式不接收新附件，请直接说明要检查或清理的内容');
       if (startingProjects.has(message.projectId) || projects.hasRunningTask(message.projectId)) throw new Error('当前项目已有任务正在运行，请等待完成后再开始新任务');
       startingProjects.add(message.projectId);
       projectReserved = true;
       let threadId = message.threadId;
       const projectRoot = projects.projectWorkdir(message.projectId);
       const project = projects.getProject(message.projectId);
-      const developerInstructions = outputInstructions(message.projectId);
+      const developerInstructions = storageMaintenance
+        ? `${outputInstructions(message.projectId)}\n\n【存储维护模式】当前请求是服务器磁盘自救任务。只允许检查磁盘占用、识别可安全回收的缓存/临时文件/旧发布版本，并恢复因磁盘不足受影响的掌心助理服务；拒绝与存储维护无关的工作。涉及删除前必须先核对目标不是 current、不是运行中 release、不是用户项目或业务数据；只删除已精确确认的目标，不使用宽泛通配符。不要修改 SSH、防火墙、数据库、用户或权限。完成后复查根分区可用空间和掌心助理服务状态。`
+        : outputInstructions(message.projectId);
       if (project.archivedAt) throw new Error('项目已归档，请先恢复后再执行任务');
+      const selectedModel = await executionModel(project);
       if (!threadId) {
         const started = await bridge.call('thread/start', {
-          cwd: projectRoot, model: project.model, config: project.reasoningEffort ? { model_reasoning_effort: project.reasoningEffort } : undefined,
+          cwd: projectRoot, model: selectedModel.model, config: selectedModel.effort ? { model_reasoning_effort: selectedModel.effort } : undefined,
           developerInstructions,
           approvalPolicy: 'never', sandbox: 'danger-full-access', serviceName: 'palm_secretary',
         }) as { thread?: { id?: string } };
@@ -856,13 +965,15 @@ app.get('/api/ws', { websocket: true }, (socket, request) => {
         app.log.info({ event: 'thread.started', ok: Boolean(threadId) }, 'Codex 对话创建完成');
       } else {
         projects.assertThreadProject(threadId, message.projectId);
-        if (!loadedThreads.has(threadId)) {
+        const requestedMode = storageMaintenance ? 'storage' : 'normal';
+        if (!loadedThreads.has(threadId) || loadedThreadModes.get(threadId) !== requestedMode) {
           await bridge.call('thread/resume', { threadId, cwd: projectRoot, developerInstructions, approvalPolicy: 'never', sandbox: 'danger-full-access' });
         }
       }
       if (!threadId) throw new Error('无法创建 Codex 对话');
       setSocketThread(socket, threadId);
       loadedThreads.add(threadId);
+      loadedThreadModes.set(threadId, storageMaintenance ? 'storage' : 'normal');
       await projects.rememberThread(threadId, message.projectId, message.text);
       const attachmentPaths = (message.attachments ?? []).map((value) => projects.safeStoredPath(message.projectId, value));
       const attachmentDetails = await Promise.all(attachmentPaths.map(async (filePath) => ({ filePath, details: await stat(filePath) })));
@@ -876,16 +987,26 @@ app.get('/api/ws', { websocket: true }, (socket, request) => {
       }
       const outputBaseline = await projects.outputBaseline(message.projectId);
       const gitBaseline = await readGitSnapshot(projectRoot, false, true);
+      // New threads may not have materialized history yet. Missing evidence disables
+      // inference for a lost turn ID, but must not prevent ordinary submissions.
+      const evidence = await bridge.call('thread/read', { threadId, includeTurns: true })
+        .then((history) => submissionEvidence(history, threadId!, `${message.text}${attachmentNote}`))
+        .catch(() => undefined);
+      if (!authenticated(request)) throw new Error('登录已失效，请重新登录');
+      // Write intent before invoking Codex: a timeout must never erase the dedupe key.
+      await projects.rememberTask(`pending:${requestId}`, threadId, message.projectId, message.text, message.attachments ?? [], outputBaseline, requestId, gitBaseline, evidence);
+      if (!authenticated(request)) throw new Error('登录已失效，请重新登录后核对待提交记录');
       const turn = await bridge.call('turn/start', {
         threadId,
         input,
         cwd: projectRoot,
-        model: project.model,
-        effort: project.reasoningEffort,
+        model: selectedModel.model,
+        effort: selectedModel.effort,
         approvalPolicy: 'never',
         sandboxPolicy: { type: 'dangerFullAccess' },
       }) as { turn?: { id?: string } };
-      if (turn.turn?.id) await projects.rememberTask(turn.turn.id, threadId, message.projectId, message.text, message.attachments ?? [], outputBaseline, requestId, gitBaseline);
+      if (!turn.turn?.id) throw new Error('请求已登记，但未取得执行编号，请核对任务记录');
+      await projects.bindTaskTurn(threadId, requestId, turn.turn.id);
       const accepted: TurnAcceptance = { threadId, payload: turn, clientRequestId: requestId };
       settlePending(accepted);
       socket.send(JSON.stringify({ type: 'turn.accepted', ...accepted }));
@@ -901,12 +1022,18 @@ app.get('/api/ws', { websocket: true }, (socket, request) => {
     }
   });
   socket.on('close', () => {
+    clearInterval(sessionTimer);
+    socketSessions.delete(socket);
     sockets.delete(socket);
     detachSocketFromThread(socket);
   });
 });
 
+const reconciliationTimer = setInterval(() => { void reconciler.run().catch(() => undefined); }, 15_000);
 const shutdown = async () => {
+  clearInterval(reconciliationTimer);
+  reconciler.stop();
+  cliVersionChecker.stop();
   await bridge.close();
   await app.close();
 };
@@ -914,4 +1041,7 @@ process.once('SIGTERM', shutdown);
 process.once('SIGINT', shutdown);
 
 await app.listen({ host: config.host, port: config.port });
+reconciliationTimer.unref();
+void reconciler.run().catch(() => undefined);
+cliVersionChecker.start();
 app.log.info({ event: 'sudo.self-test', ...(await sudoInfo()) }, 'Codex sudo 权限自检');

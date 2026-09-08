@@ -48,7 +48,6 @@ import java.util.UUID;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
-import java.io.FilterInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.ByteArrayInputStream;
@@ -108,24 +107,6 @@ public final class MainActivity extends Activity {
             this.name = name;
             this.mimeType = mimeType;
             this.size = size;
-        }
-    }
-
-    private static final class DeletingInputStream extends FilterInputStream {
-        private final File file;
-
-        DeletingInputStream(InputStream input, File file) {
-            super(input);
-            this.file = file;
-        }
-
-        @Override
-        public void close() throws IOException {
-            try {
-                super.close();
-            } finally {
-                if (file.exists()) file.delete();
-            }
         }
     }
 
@@ -271,10 +252,9 @@ public final class MainActivity extends Activity {
         }
         if (shared == null) return new WebResourceResponse("text/plain", "UTF-8", 404, "Not Found", new LinkedHashMap<>(), new ByteArrayInputStream(new byte[0]));
         try {
-            InputStream input = new DeletingInputStream(new FileInputStream(shared.cacheFile), shared.cacheFile);
-            synchronized (sharedFiles) {
-                sharedFiles.remove(id);
-            }
+            // Retain the private cache until the web client acknowledges a successful upload so
+            // temporary network failures can be retried without sharing the source file again.
+            InputStream input = new FileInputStream(shared.cacheFile);
             Map<String, String> headers = new LinkedHashMap<>();
             headers.put("Cache-Control", "no-store");
             headers.put("Content-Length", Long.toString(shared.size));
@@ -335,6 +315,21 @@ public final class MainActivity extends Activity {
                 pendingProjectId = null;
                 pendingThreadId = null;
             });
+        }
+
+        @JavascriptInterface
+        public void discardSharedFiles(String idsJson) {
+            try {
+                JSONArray ids = new JSONArray(idsJson == null ? "[]" : idsJson);
+                synchronized (sharedFiles) {
+                    for (int index = 0; index < ids.length(); index++) {
+                        SharedFile shared = sharedFiles.remove(ids.optString(index));
+                        if (shared != null) shared.cacheFile.delete();
+                    }
+                }
+            } catch (Exception ignored) {
+                // Invalid web input must not affect the remaining share cache.
+            }
         }
     }
 
