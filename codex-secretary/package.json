@@ -1,6 +1,6 @@
 {
   "name": "palm-secretary",
-  "version": "0.16.1",
+  "version": "0.17.0",
   "private": true,
   "engines": {
     "node": ">=22.13.0"
@@ -37,7 +37,10 @@
     "test:v025": "node tests/task-reconciliation-v025.mjs",
     "test:v026": "node tests/workspace-backup-v026.mjs",
     "test:v027": "node --experimental-strip-types tests/message-sync-v027.mjs",
-    "test:v028": "node --experimental-strip-types tests/chat-coordinator-v028.mjs"
+    "test:v028": "node --experimental-strip-types tests/chat-coordinator-v028.mjs",
+    "test:v029": "node tests/knowledge-v029.mjs",
+    "test:v030": "node --experimental-strip-types tests/knowledge-reference-v030.mjs",
+    "test:v031": "node tests/quiz-v031.mjs"
   },
   "dependencies": {
     "@fastify/cookie": "^11.0.2",
@@ -45,9 +48,14 @@
     "@fastify/websocket": "^11.2.0",
     "@phosphor-icons/react": "^2.1.10",
     "fastify": "^5.12.1",
+    "github-slugger": "^2.0.0",
     "next": "^16.3.2",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1",
+    "unist-util-visit": "^5.1.0",
+    "yaml": "^2.9.0",
     "zod": "^4.1.11"
   },
   "devDependencies": {

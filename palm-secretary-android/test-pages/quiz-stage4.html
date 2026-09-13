@@ -1,0 +1,10 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Quiz Vision Fixture</title><style>body{font:18px/1.5 sans-serif;margin:24px;color:#172033}.option{display:block;margin:12px 0;padding:12px;border:1px solid #ccd3df;border-radius:10px}canvas{width:100%;max-width:680px;border:1px solid #ccd3df}</style>
+<main id="content"></main><script>
+const mode=new URLSearchParams(location.search).get('mode')||'hybrid',root=document.querySelector('#content');
+const options='<label class="option">A. 2 A</label><label class="option">B. 3 A</label><label class="option">C. 4 A</label><label class="option">D. 6 A</label>';
+const draw=c=>{const x=c.getContext('2d');x.fillStyle='#fff';x.fillRect(0,0,c.width,c.height);x.fillStyle='#172033';x.font='24px sans-serif';x.fillText('6Ω',150,95);x.fillText('3Ω',150,205);x.lineWidth=4;x.beginPath();x.moveTo(40,60);x.lineTo(120,60);x.lineTo(120,220);x.lineTo(40,220);x.moveTo(120,60);x.lineTo(310,60);x.lineTo(310,220);x.lineTo(120,220);x.stroke();x.fillText('并联电路示意图',65,285)};
+if(mode==='hybrid'){root.innerHTML='<h2>如图所示，6Ω 与 3Ω 电阻并联后的等效电阻是？</h2><canvas width="360" height="320"></canvas>'+options;draw(root.querySelector('canvas'))}
+if(mode==='canvas'){root.innerHTML='<canvas width="680" height="760"></canvas>';const c=root.querySelector('canvas'),x=c.getContext('2d');x.fillStyle='#fff';x.fillRect(0,0,c.width,c.height);x.fillStyle='#172033';x.font='28px sans-serif';x.fillText('判断题：地球绕太阳公转。',45,130);x.fillText('A. 正确',70,240);x.fillText('B. 错误',70,330)}
+if(mode==='text'){root.innerHTML='<h2>2 的 5 次方等于多少？</h2><label class="option">A. 10</label><label class="option">B. 16</label><label class="option">C. 25</label><label class="option">D. 32</label>'}
+</script></html>

@@ -1,0 +1,10 @@
+<?xml version='1.0' encoding='utf-8' standalone='yes' ?>
+<map>
+    <float name="floating_y_ratio" value="0.35" />
+    <string name="floating_edge">right</string>
+    <boolean name="privacy_confirmed" value="true" />
+    <boolean name="enabled" value="true" />
+    <boolean name="vision_enabled" value="true" />
+    <int name="vision_consent_version" value="1" />
+    <set name="allowed_packages"><string>com.android.chrome</string></set>
+</map>

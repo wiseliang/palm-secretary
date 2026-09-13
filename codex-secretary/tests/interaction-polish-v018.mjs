@@ -15,7 +15,8 @@ assert.doesNotMatch(page, /<details className="project-menu header-project-menu"
 assert.doesNotMatch(page, /<details className="record-actions-menu"/);
 
 assert.match(page, /className="project-picker-trigger"/);
-assert.match(page, /role="listbox"/);
+assert.match(page, /role="menu"/);
+assert.match(page, /role="menuitemradio"/);
 assert.match(page, /className="project-dialog"/);
 assert.doesNotMatch(page, /window\.prompt\("新项目名称"/);
 assert.doesNotMatch(css, /\.topbar \.project-add::before \{ content: ['"]\+['"]/);

@@ -164,10 +164,12 @@ const androidGradle = await readFile(
 assert.match(androidGradle, /buildConfig\s+true/);
 const projectSelector =
   page.match(
-    /<div className="project-picker"[\s\S]{0,1800}role="listbox"[\s\S]{0,1800}<\/div>/,
+    /<div className="project-picker"[\s\S]{0,5000}role="menu"[\s\S]{0,5000}<\/div>/,
   )?.[0] ?? "";
 assert.ok(projectSelector);
-assert.match(projectSelector, /project\.archivedAt/);
+assert.match(projectSelector, /archivedProjects/);
+assert.match(projectSelector, /project-picker-archived-toggle/);
+assert.match(projectSelector, /role="menuitemradio"/);
 assert.doesNotMatch(projectSelector, /disabled=\{Boolean\(project\.archivedAt\)\}/);
 assert.match(bridge, /version: packageVersion/);
 

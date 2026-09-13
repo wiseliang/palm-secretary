@@ -1,6 +1,7 @@
 import type { Metadata, Viewport } from 'next';
 import './globals.css';
 import './interaction-polish.css';
+import './knowledge.css';
 
 export const metadata: Metadata = {
   title: '掌心助理',

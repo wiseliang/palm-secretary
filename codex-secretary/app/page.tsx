@@ -7,6 +7,7 @@ import {
   memo,
   useCallback,
   useEffect,
+  useMemo,
   useRef,
   useState,
 } from "react";
@@ -14,6 +15,7 @@ import {
   Archive,
   ArrowClockwise,
   ArrowUp,
+  BookOpen,
   CaretDown,
   ChatCircleDots,
   ClockCounterClockwise,
@@ -47,6 +49,10 @@ import {
 
 import { RunCoordinator, SyncCoordinator } from "./chat-coordinator";
 import { mergeSnapshot, applyAgentText } from "./message-sync";
+import dynamic from "next/dynamic";
+import { splitKnowledgeReference, withKnowledgeReference, replaceReferenceQuestion, type KnowledgeReference } from './knowledge-reference';
+import KnowledgeReferenceCard from './knowledge-reference-card';
+const Knowledge = dynamic(() => import("./knowledge"), { loading: () => <p role="status" style={{ padding: 24 }}>正在打开知识库…</p> });
 
 type ExecutionStep = {
   id: string;
@@ -185,7 +191,7 @@ type CliVersionStatus = {
   checkedAt?: string;
   error?: string;
 };
-type View = "chat" | "history" | "files";
+type View = "chat" | "history" | "files" | "knowledge";
 type UploadResponse = {
   status: number;
   body?: { file?: UploadedFile; error?: string };
@@ -214,6 +220,12 @@ type ResetCreditSummary = {
     description?: string;
     expiresAt?: number;
   }>;
+};
+type LunaReserveOffer = {
+  active: boolean;
+  title?: string;
+  description?: string;
+  resetAt?: number;
 };
 type NativeSharedFile = {
   id: string;
@@ -297,6 +309,7 @@ declare global {
       ) => void;
       ackTaskTarget?: () => void;
       discardSharedFiles?: (idsJson: string) => void;
+      openQuizAssistantSettings?: () => void;
     };
   }
 }
@@ -449,6 +462,35 @@ function resetCreditSummaryFrom(value: unknown): ResetCreditSummary | undefined 
             })
           : [];
         return { availableCount: Math.max(0, summary.availableCount), credits };
+      }
+    }
+    for (const child of Object.values(record)) {
+      const found = walk(child);
+      if (found) return found;
+    }
+    return undefined;
+  };
+  return walk(value);
+}
+
+function lunaReserveOfferFrom(value: unknown): LunaReserveOffer | undefined {
+  const visited = new Set<object>();
+  const walk = (node: unknown): LunaReserveOffer | undefined => {
+    if (!node || typeof node !== "object" || visited.has(node as object))
+      return undefined;
+    visited.add(node as object);
+    const record = node as Record<string, unknown>;
+    const candidate = record.rateLimitUpsell;
+    if (candidate && typeof candidate === "object") {
+      const offer = candidate as Record<string, unknown>;
+      if (offer.banner_type === "luna_reserve") {
+        const resetAt = typeof offer.reset_at === "number" ? offer.reset_at : undefined;
+        return {
+          active: true,
+          title: typeof offer.title === "string" ? offer.title : undefined,
+          description: typeof offer.description === "string" ? offer.description : undefined,
+          resetAt: resetAt ? (resetAt < 10_000_000_000 ? resetAt * 1000 : resetAt) : undefined,
+        };
       }
     }
     for (const child of Object.values(record)) {
@@ -713,9 +755,11 @@ function parseUserMessage(text: string): {
 
 function inlineContent(text: string): ReactNode[] {
   return text
-    .split(/(`[^`\n]+`|https?:\/\/[^\s]+)/g)
+    .split(/(\[[^\]\n]+\]\((?:https?:\/\/|\/\?knowledge=)[^\s)]+\)|`[^`\n]+`|https?:\/\/[^\s]+)/g)
     .filter(Boolean)
     .map((part, index) => {
+      const link = /^\[([^\]]+)\]\(((?:https?:\/\/|\/\?knowledge=)[^\s)]+)\)$/.exec(part);
+      if (link) return <a key={index} href={link[2]} target="_blank" rel="noreferrer">{link[1]}</a>;
       if (part.startsWith("`") && part.endsWith("`"))
         return <code key={index}>{part.slice(1, -1)}</code>;
       if (/^https?:\/\//.test(part))
@@ -853,6 +897,7 @@ const MessageRow = memo(function MessageRow({ message, projectId, files, focused
   message: ChatMessage; projectId: string; files: UploadedFile[]; focused: boolean;
   development?: ReactNode; onNotice: (text: string) => void;
 }) {
+  const display = message.role === 'user' ? splitKnowledgeReference(message.text) : { question: message.text };
   return (
                   <article
                     data-message-id={message.id}
@@ -901,7 +946,7 @@ const MessageRow = memo(function MessageRow({ message, projectId, files, focused
                       ) : null}
                       {message.text ? (
                         <MessageContent
-                          text={message.text}
+                          text={display.question}
                           projectId={projectId}
                           files={files}
                         />
@@ -910,6 +955,7 @@ const MessageRow = memo(function MessageRow({ message, projectId, files, focused
                       ) : (
                         ""
                       )}
+                      {display.reference && <KnowledgeReferenceCard reference={display.reference} />}
                       {message.attachments?.length ? (
                         <div className="message-files">
                           {message.attachments.map((file) => (
@@ -1401,7 +1447,20 @@ export default function Home() {
   const [reconciling, setReconciling] = useState(false);
   const [password, setPassword] = useState("");
   const [loginError, setLoginError] = useState("");
-  const [view, setView] = useState<View>("chat");
+  const [view, setCurrentView] = useState<View>("chat");
+  const setView = useCallback((next: View) => {
+    const url = new URL(window.location.href);
+    if (next === "knowledge") url.searchParams.set("knowledge", url.searchParams.get("knowledge") || "");
+    else { url.searchParams.delete("knowledge"); if (url.hash.startsWith("#kb-")) url.hash = ""; }
+    window.history.pushState({}, "", url);
+    setCurrentView(next);
+  }, []);
+  useEffect(() => {
+    const restore = () => setCurrentView(current => new URL(window.location.href).searchParams.has("knowledge") ? "knowledge" : current === "knowledge" ? "chat" : current);
+    const timer = setTimeout(restore, 0);
+    window.addEventListener("popstate", restore);
+    return () => { clearTimeout(timer); window.removeEventListener("popstate", restore); };
+  }, []);
   const [projects, setProjects] = useState<Project[]>([]);
   const [models, setModels] = useState<CodexModel[]>([]);
   const [projectId, setProjectId] = useState("default");
@@ -1412,6 +1471,7 @@ export default function Home() {
   const [files, setFiles] = useState<UploadedFile[]>([]);
   const [recordSearch, setRecordSearch] = useState("");
   const [showArchived, setShowArchived] = useState(false);
+  const [showArchivedProjects, setShowArchivedProjects] = useState(false);
   const [searchAllProjects, setSearchAllProjects] = useState(false);
   const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
   const [searching, setSearching] = useState(false);
@@ -1423,6 +1483,7 @@ export default function Home() {
   const [fileSearch, setFileSearch] = useState("");
   const [fileKind, setFileKind] = useState<"all" | "inbox" | "outbox">("all");
   const [draft, setDraft] = useState("");
+  const referenceDraft = useMemo(() => splitKnowledgeReference(draft), [draft]);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [focusedMessageId, setFocusedMessageId] = useState<string>();
   const [attachments, setAttachments] = useState<UploadedFile[]>([]);
@@ -1430,6 +1491,7 @@ export default function Home() {
   const [cliVersion, setCliVersion] = useState<CliVersionStatus>();
   const [usageWindows, setUsageWindows] = useState<UsageWindow[]>([]);
   const [resetCredits, setResetCredits] = useState<ResetCreditSummary>();
+  const [lunaReserveOffer, setLunaReserveOffer] = useState<LunaReserveOffer>();
   const [usageClock, setUsageClock] = useState(() => Date.now());
   const [resetDialogOpen, setResetDialogOpen] = useState(false);
   const [resetBusy, setResetBusy] = useState(false);
@@ -1506,6 +1568,14 @@ export default function Home() {
   }, []);
 
   const activeProject = projects.find((project) => project.id === projectId);
+  const availableProjects = useMemo(
+    () => projects.filter((project) => !project.archivedAt),
+    [projects],
+  );
+  const archivedProjects = useMemo(
+    () => projects.filter((project) => Boolean(project.archivedAt)),
+    [projects],
+  );
   const projectReadOnly = Boolean(activeProject?.archivedAt);
   const defaultModel = models.find((model) => model.isDefault) ?? models[0];
   const activeModel =
@@ -1703,6 +1773,7 @@ export default function Home() {
       };
       setUsageWindows(usageWindowsFrom(value.rateLimits ?? value.usage));
       setResetCredits(resetCreditSummaryFrom(value.rateLimits));
+      setLunaReserveOffer(lunaReserveOfferFrom(value.rateLimits));
       setUsageClock(Date.now());
     }
     if (versionResponse.status === "fulfilled")
@@ -2133,7 +2204,7 @@ export default function Home() {
       setPendingNavigation(undefined);
     }).catch(() => { if (!controller.signal.aborted) setNotice("无法打开目标任务"); });
     return () => controller.abort();
-  }, [pendingNavigation, projectId, updateRun]);
+  }, [pendingNavigation, projectId, updateRun, setView]);
 
   useEffect(() => {
     if (!authenticated) return;
@@ -2601,7 +2672,7 @@ export default function Home() {
         }),
       );
     return () => window.removeEventListener("palm-open-task", rememberTarget);
-  }, [authenticated]);
+  }, [authenticated, setView]);
 
   useEffect(() => {
     if (!authenticated || showArchived) return;
@@ -2634,7 +2705,7 @@ export default function Home() {
     } catch {
       window.localStorage.removeItem("palm:open-task");
     }
-  }, [authenticated, projectId, showArchived, threads, updateRun]);
+  }, [authenticated, projectId, showArchived, threads, updateRun, setView]);
 
   function openTaskNotice(taskNotice: TaskNotice) {
     setPendingNavigation({
@@ -3057,6 +3128,28 @@ export default function Home() {
     setNotice(`已切换到 ${model.displayName} · ${effort}`);
   }
 
+  function openQuizAssistantSettings() {
+    if (window.PalmNative?.openQuizAssistantSettings) {
+      window.PalmNative.openQuizAssistantSettings();
+      return;
+    }
+    setNotice("AI 刷题助手目前仅支持 Android 客户端");
+  }
+
+  async function enterLunaReserve() {
+    if (projectReadOnly) {
+      setNotice("项目已归档，请先恢复后再进入 Luna Reserve");
+      return;
+    }
+    const luna = models.find((model) => model.model === "gpt-5.6-luna");
+    if (!luna) {
+      setNotice("当前 Codex 未提供 Luna 模型，请先刷新模型列表");
+      return;
+    }
+    await saveModel(luna.model);
+    setNotice("已选择 Luna Reserve；后续任务将在主用量耗尽时使用 Luna");
+  }
+
   async function openThreadById(
     targetProjectId: string,
     targetThreadId: string,
@@ -3107,6 +3200,7 @@ export default function Home() {
     setView("chat");
     if (!restored.length)
       setNotice("已恢复任务上下文；旧消息格式暂无法完整展示");
+    return restored;
   }
 
   async function openThread(item: ProjectThread, focusHint = item.title) {
@@ -3228,9 +3322,43 @@ export default function Home() {
 
   function sendTask(event: FormEvent) {
     event.preventDefault();
-    const text =
-      draft.trim() || (attachments.length ? "请检查并处理我上传的附件。" : "");
-    startTurn(text, attachments, threadId, storageMaintenance);
+    const question = referenceDraft.question.trim() || (attachments.length ? "请检查并处理我上传的附件。" : "");
+    if (!question) return;
+    if (referenceDraft.reference && storageMaintenance) { setNotice('请先退出存储维护模式，再发送知识库问题'); return; }
+    try {
+      const text = referenceDraft.reference ? withKnowledgeReference(question, referenceDraft.reference) : question;
+      startTurn(text, attachments, threadId, storageMaintenance);
+    } catch (error) { setNotice((error as Error).message); }
+  }
+
+  function updateQuestion(question: string) {
+    try {
+      const value = replaceReferenceQuestion(draft, question);
+      if (value) window.localStorage.setItem(`palm:draft:${projectId}`, value);
+      else window.localStorage.removeItem(`palm:draft:${projectId}`);
+      setDraft(value);
+    } catch (error) { setNotice((error as Error).message); }
+  }
+
+  function stageKnowledgeReference(reference: KnowledgeReference): string | undefined {
+    if (!activeProject || attachmentsProjectRef.current !== projectId) return '项目正在切换，请稍后再试';
+    if (activeProject.archivedAt) return '当前项目已归档，请先切换到可用项目';
+    if (storageMaintenance) return '请先退出存储维护模式，再引用笔记';
+    try {
+      const value = withKnowledgeReference(referenceDraft.question || '请总结这份笔记的核心观点，并标注原文来源。', reference);
+      window.localStorage.setItem(`palm:draft:${projectId}`, value);
+      setDraft(value);
+      setView('chat');
+      setNotice('笔记已放入输入框，核对问题后点击发送');
+      return undefined;
+    } catch (error) { return (error as Error).message || '未能保存引用，请重试'; }
+  }
+
+  function removeKnowledgeReference() {
+    const question = referenceDraft.question;
+    if (question) window.localStorage.setItem(`palm:draft:${projectId}`, question);
+    else window.localStorage.removeItem(`palm:draft:${projectId}`);
+    setDraft(question);
   }
 
   async function retryTask(task: ProjectTask) {
@@ -3242,8 +3370,8 @@ export default function Home() {
       setNotice("请等待连接恢复或先停止当前任务");
       return;
     }
-    await openThreadById(task.projectId, task.threadId, task.title);
-    if (task.projectId !== projectId) return;
+    const restored = await openThreadById(task.projectId, task.threadId, task.title);
+    if (task.projectId !== projectId || !restored) return;
     const retryAttachments = (task.attachments ?? []).map(
       (attachmentPath) =>
         files.find((file) => file.path === attachmentPath) ?? {
@@ -3254,7 +3382,8 @@ export default function Home() {
           size: undefined,
         },
     );
-    startTurn(task.title, retryAttachments, task.threadId);
+    const original = restored.find(message => message.role === 'user' && message.turnId === task.turnId);
+    startTurn(original?.text || task.title, retryAttachments, task.threadId);
   }
 
   async function reconcileTasks(task: ProjectTask) {
@@ -3807,6 +3936,7 @@ export default function Home() {
             />
             <span>文件</span>
           </button>
+          <button className={`rail-button ${view === "knowledge" ? "active" : ""}`} aria-label="知识库" onClick={() => setView("knowledge")}><BookOpen size={21} weight={view === "knowledge" ? "fill" : "regular"} /><span>知识库</span></button>
         </nav>
         <button
           className="rail-avatar"
@@ -3822,7 +3952,7 @@ export default function Home() {
         </button>
       </aside>
       <section
-        className={`conversation ${draggingFiles ? "drag-active" : ""}`}
+        className={`conversation ${view === "knowledge" ? "knowledge-open" : ""} ${draggingFiles ? "drag-active" : ""}`}
         onDragEnter={dragEnter}
         onDragOver={(event) => {
           if (event.dataTransfer.types.includes("Files"))
@@ -3868,7 +3998,7 @@ export default function Home() {
                 type="button"
                 className="project-picker-trigger"
                 aria-label="选择项目"
-                aria-haspopup="listbox"
+                aria-haspopup="menu"
                 aria-expanded={openMenu === "project-picker"}
                 disabled={uploading}
                 onClick={() => {
@@ -3882,12 +4012,12 @@ export default function Home() {
                 <CaretDown size={14} weight="bold" />
               </button>
               {openMenu === "project-picker" && (
-                <div className="project-picker-menu" role="listbox">
-                  {projects.map((project) => (
+                <div className="project-picker-menu" role="menu">
+                  {availableProjects.map((project) => (
                     <button
                       type="button"
-                      role="option"
-                      aria-selected={project.id === projectId}
+                      role="menuitemradio"
+                      aria-checked={project.id === projectId}
                       key={project.id}
                       onClick={() => {
                         const pendingCount = attachments.length;
@@ -3901,9 +4031,47 @@ export default function Home() {
                       }}
                     >
                       <span>{project.name}</span>
-                      {project.archivedAt && <small>已归档</small>}
                     </button>
                   ))}
+                  {archivedProjects.length > 0 && (
+                    <div className="project-picker-archived">
+                      <button
+                        type="button"
+                        className="project-picker-archived-toggle"
+                        aria-expanded={showArchivedProjects}
+                        onClick={() => setShowArchivedProjects((current) => !current)}
+                      >
+                        <span>已归档</span>
+                        <small>{archivedProjects.length}</small>
+                        <CaretDown size={13} weight="bold" />
+                      </button>
+                      {showArchivedProjects && (
+                        <div role="group" aria-label="已归档项目">
+                          {archivedProjects.map((project) => (
+                            <button
+                              type="button"
+                              role="menuitemradio"
+                              aria-checked={project.id === projectId}
+                              key={project.id}
+                              onClick={() => {
+                                const pendingCount = attachments.length;
+                                setProjectId(project.id);
+                                setOpenMenu(undefined);
+                                if (pendingCount && project.id !== projectId) {
+                                  setNotice(
+                                    `已为 ${activeProject?.name ?? "当前项目"} 保留 ${pendingCount} 个待发送附件`,
+                                  );
+                                }
+                              }}
+                            >
+                              <span>{project.name}</span>
+                              <small>只读</small>
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </div>
               )}
             </div>
@@ -4061,7 +4229,9 @@ export default function Home() {
             />
             <span>文件</span>
           </button>
+          <button className={view === "knowledge" ? "active" : ""} onClick={() => setView("knowledge")}><BookOpen size={18} weight={view === "knowledge" ? "fill" : "regular"} /><span>知识库</span></button>
         </nav>
+        {view === "knowledge" && <Knowledge onReference={stageKnowledgeReference} referenceTarget={`${activeProject?.name || '当前项目'}的${threadId ? '当前对话' : '新对话'}`} replacingReference={Boolean(referenceDraft.reference)} />}
         {projectDialog && (
           <div
             className="dialog-backdrop"
@@ -4407,6 +4577,15 @@ export default function Home() {
           >
             {status.sudo?.available ? "Root 运维" : "完全访问"}
           </strong>
+          <button
+            className="quiz-assistant-settings"
+            type="button"
+            onClick={openQuizAssistantSettings}
+          >
+            <span>AI 刷题助手</span>
+            <small>在其他应用中使用悬浮 AI 解析题目</small>
+            <b>设置</b>
+          </button>
         </section>
         {view === "chat" && (
           <section
@@ -4994,11 +5173,7 @@ export default function Home() {
                         <button
                           key={task}
                           onClick={() => {
-                            setDraft(task);
-                            window.localStorage.setItem(
-                              `palm:draft:${projectId}`,
-                              task,
-                            );
+                            updateQuestion(task);
                           }}
                         >
                           {task}
@@ -5131,6 +5306,7 @@ message.role === "assistant" &&
               })}
             </div>
           )}
+          {referenceDraft.reference && <div className="knowledge-reference-tray"><KnowledgeReferenceCard reference={referenceDraft.reference} onRemove={removeKnowledgeReference} onPrompt={updateQuestion} /></div>}
           {(uploadFeedbacks.length > 0 || attachments.length > 0) && (
             <div className="attachment-tray">
               {uploadFeedbacks.map((item) => (
@@ -5254,13 +5430,9 @@ message.role === "assistant" &&
               </button>
             </div>
             <textarea
-              value={draft}
+              value={referenceDraft.question}
               onChange={(event) => {
-                const value = event.target.value;
-                setDraft(value);
-                if (value)
-                  window.localStorage.setItem(`palm:draft:${projectId}`, value);
-                else window.localStorage.removeItem(`palm:draft:${projectId}`);
+                updateQuestion(event.target.value);
               }}
               placeholder={
                 activeProject?.archivedAt
@@ -5295,7 +5467,7 @@ message.role === "assistant" &&
                   uploading ||
                   projectBusy ||
                   Boolean(activeProject?.archivedAt) ||
-                  (!draft.trim() && !attachments.length) ||
+                  (!referenceDraft.question.trim() && !attachments.length) ||
                   connection !== "已连接"
                 }
                 aria-label="发送"

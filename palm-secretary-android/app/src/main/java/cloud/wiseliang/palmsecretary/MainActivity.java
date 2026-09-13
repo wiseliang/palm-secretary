@@ -40,6 +40,8 @@ import android.webkit.WebViewClient;
 import android.widget.ProgressBar;
 import android.widget.Toast;
 
+import cloud.wiseliang.palmsecretary.quizassistant.QuizAssistantSettingsActivity;
+
 import java.util.Locale;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -330,6 +332,11 @@ public final class MainActivity extends Activity {
             } catch (Exception ignored) {
                 // Invalid web input must not affect the remaining share cache.
             }
+        }
+
+        @JavascriptInterface
+        public void openQuizAssistantSettings() {
+            runOnUiThread(() -> startActivity(new Intent(MainActivity.this, QuizAssistantSettingsActivity.class)));
         }
     }
 

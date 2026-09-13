@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Quiz Stage 2 Fixture</title>
+<style>
+  body { font: 18px/1.55 system-ui, sans-serif; margin: 32px; color: #172033; }
+  main { max-width: 680px; margin: auto; }
+  .option { display: block; margin: 18px 0; padding: 16px; border: 1px solid #ccd3df; border-radius: 12px; }
+  nav { display: flex; justify-content: space-between; margin-bottom: 30px; color: #667085; }
+  canvas { width: 100%; height: 420px; border: 1px solid #ccd3df; }
+</style>
+<main id="content"></main>
+<script>
+  const mode = new URLSearchParams(location.search).get('mode') || 'single';
+  const content = document.querySelector('#content');
+  const question = '<h2>测试设备中负责调节压力的主要部件是什么？</h2>';
+  const options = ['A. 过滤部件','B. 调压部件','C. 计量部件','D. 加热部件']
+    .map(value => `<label class="option">${value}</label>`).join('');
+  if (mode === 'single') content.innerHTML = question + options;
+  if (mode === 'noise') content.innerHTML = '<nav><span>上一题</span><span>3/20</span><span>收藏</span><span>下一题</span></nav>' + question + options;
+  if (mode === 'multi') content.innerHTML = '<p>多选题</p>' + question + ['A. 过滤','B. 调压','C. 计量','D. 加热','E. 安全切断','F. 放散'].map(value => `<label class="option"><input type="checkbox">${value}</label>`).join('');
+  if (mode === 'judge') content.innerHTML = '<h2>天然气的主要成分是甲烷。</h2><label class="option"><input type="radio" name="j">正确</label><label class="option"><input type="radio" name="j">错误</label>';
+  if (mode === 'partial') {
+    content.innerHTML = '<h2>选哪个？</h2><label class="option">A. 选项一</label><label class="option">B. 选项二</label>';
+    for (let index = 0; index < 1600; index += 1) content.insertAdjacentHTML('beforeend', `<span>辅助节点 ${index}</span>`);
+  }
+  if (mode === 'password') content.innerHTML = '<h2>账户验证</h2><label>密码<input type="password" value="local-test-only"></label>';
+  if (mode === 'canvas') { content.innerHTML = '<canvas width="680" height="420"></canvas>'; const c = content.querySelector('canvas').getContext('2d'); c.font='28px sans-serif'; c.fillText('Canvas-only fixture', 80, 180); }
+</script>
+</html>

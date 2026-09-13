@@ -13,6 +13,7 @@ export const config = {
   passwordHash: process.env.APP_PASSWORD_HASH?.trim() ?? '',
   sessionSecret: required('SESSION_SECRET'),
   workspace: path.resolve(process.env.WORKSPACE_ROOT ?? '/home/codex/workspace'),
+  knowledgeRoot: path.resolve(process.env.KNOWLEDGE_ROOT ?? path.join(process.env.WORKSPACE_ROOT ?? '/home/codex/workspace', 'projects', 'obsidian-vault')),
   codexBin: process.env.CODEX_BIN ?? '/home/codex/.local/bin/codex-proxy',
   codexArgsPrefix: (() => {
     try {
@@ -24,6 +25,7 @@ export const config = {
   })(),
   codexUserHome: process.env.CODEX_USER_HOME ?? '/home/codex',
   codexHome: process.env.CODEX_HOME ?? '/home/codex/.codex',
+  quizModel: process.env.QUIZ_MODEL?.trim() || 'gpt-5.6-sol',
   npmBin: process.env.NPM_BIN ?? '/usr/local/bin/npm',
   codexVersionCheckEnabled: process.env.CODEX_VERSION_CHECK_ENABLED !== '0',
   codexVersionCheckIntervalMs: Number(process.env.CODEX_VERSION_CHECK_INTERVAL_MS ?? 12 * 60 * 60_000),

@@ -75,6 +75,7 @@
 .header-project-menu > div { width: 216px; max-height: min(72dvh, 520px); overflow-y: auto; padding: 7px; }
 .record-actions-menu > div { width: 172px; padding: 6px; }
 .project-picker-menu > button,
+.project-picker-archived > div > button,
 .header-project-menu > div > button,
 .record-actions-menu > div > button {
   display: flex;
@@ -90,14 +91,55 @@
   font-size: 12px;
   cursor: pointer;
 }
-.project-picker-menu > button { justify-content: space-between; width: 100%; min-width: 0; overflow: hidden; }
-.project-picker-menu > button > span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.project-picker-menu > button > small { flex: none; }
-.project-picker-menu > button[aria-selected="true"],
+.project-picker-menu > button,
+.project-picker-archived > div > button { justify-content: space-between; width: 100%; min-width: 0; overflow: hidden; }
+.project-picker-menu > button > span,
+.project-picker-archived > div > button > span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.project-picker-menu > button > small,
+.project-picker-archived > div > button > small { flex: none; }
+.project-picker-menu > button[aria-checked="true"],
+.project-picker-archived > div > button[aria-checked="true"],
 .project-picker-menu > button:hover,
+.project-picker-archived > div > button:hover,
 .header-project-menu > div > button:hover,
 .record-actions-menu > div > button:hover { background: var(--accent-soft); color: var(--accent); }
 .project-picker-menu small { color: var(--warning); font-size: 10px; }
+.project-picker-archived {
+  margin-top: 5px;
+  padding-top: 5px;
+  border-top: 1px solid var(--line);
+}
+.project-picker-archived-toggle {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  min-height: 36px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: var(--radius-control);
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 11px;
+  font-weight: 650;
+  text-align: left;
+  cursor: pointer;
+}
+.project-picker-archived-toggle span { flex: 1; }
+.project-picker-archived-toggle small {
+  min-width: 20px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--canvas);
+  color: var(--muted);
+  text-align: center;
+}
+.project-picker-archived-toggle svg { transition: transform .16s ease; }
+.project-picker-archived-toggle[aria-expanded="true"] svg { transform: rotate(180deg); }
+.project-picker-archived-toggle:hover { background: var(--accent-soft); color: var(--accent); }
+.project-picker-archived > div { display: grid; }
+.project-picker-archived > div > button { color: var(--muted); }
 .task-definition { margin: 6px 0 0; color: var(--muted); font-size: 11px; line-height: 1.55; }
 
 .dialog-backdrop,
