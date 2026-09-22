@@ -7,16 +7,19 @@ import android.hardware.HardwareBuffer;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
+import android.util.Log;
 import android.view.Choreographer;
 import android.view.accessibility.AccessibilityNodeInfo;
 
 import cloud.wiseliang.palmsecretary.quizassistant.QuizAssistantCoordinator;
 import cloud.wiseliang.palmsecretary.quizassistant.QuizAssistantPreferences;
+import cloud.wiseliang.palmsecretary.BuildConfig;
 import cloud.wiseliang.palmsecretary.quizassistant.accessibility.AccessibilityTreeReader;
 import cloud.wiseliang.palmsecretary.quizassistant.model.QuizQuestionPreview;
 import cloud.wiseliang.palmsecretary.quizassistant.overlay.QuizOverlayController;
 
 public final class ScreenCaptureCoordinator {
+    private static final String TAG = "PalmQuizCapture";
     public interface Callback {
         void onReady(QuizImageProcessor.EncodedImage image, CropPlan plan, boolean needsConfirmation,
             long screenshotMs, long cropMs, long encodeMs);
@@ -84,6 +87,7 @@ public final class ScreenCaptureCoordinator {
                     if (hardware==null) throw new IllegalStateException("wrap failed");
                     software=hardware.copy(Bitmap.Config.ARGB_8888,false);
                 } catch (RuntimeException error) {
+                    if (BuildConfig.DEBUG) Log.w(TAG, "hardware buffer conversion failed", error);
                     finishFailure(callback,"无法处理当前题目画面。"); return;
                 } finally {
                     buffer.close();
@@ -93,11 +97,25 @@ public final class ScreenCaptureCoordinator {
                 try {
                     int originX=Build.VERSION.SDK_INT>=34?windowBounds.left:0;
                     int originY=Build.VERSION.SDK_INT>=34?windowBounds.top:0;
-                    QuizImageProcessor.EncodedImage encoded=new QuizImageProcessor().process(software,plan,originX,originY);
+                    CropPlan effectivePlan=plan;
+                    if (Build.VERSION.SDK_INT>=34 && plan.source==CropPlan.Source.APP_WINDOW) {
+                        // takeScreenshotOfWindow already returns only the target app window. Some OEMs
+                        // report Accessibility window bounds in display coordinates that do not map
+                        // exactly to the returned buffer, so use the complete window buffer here.
+                        effectivePlan=new CropPlan(0,0,software.getWidth(),software.getHeight(),
+                            plan.confidence,CropPlan.Source.APP_WINDOW);
+                        originX=0;
+                        originY=0;
+                    }
+                    QuizImageProcessor.EncodedImage encoded=new QuizImageProcessor().process(
+                        software,effectivePlan,originX,originY);
                     inProgress=false;
-                    callback.onReady(encoded,plan,!plan.reliable(),screenshotMs,encoded.cropMs,encoded.encodeMs);
-                } catch (RuntimeException error) { finishFailure(callback,error.getMessage()!=null&&error.getMessage().contains("large")
-                    ?"题目画面过大，无法上传解析。":"无法处理当前题目画面。"); }
+                    callback.onReady(encoded,effectivePlan,!effectivePlan.reliable(),screenshotMs,encoded.cropMs,encoded.encodeMs);
+                } catch (RuntimeException error) {
+                    if (BuildConfig.DEBUG) Log.w(TAG, "bitmap crop or encode failed", error);
+                    finishFailure(callback,error.getMessage()!=null&&error.getMessage().contains("large")
+                        ?"题目画面过大，无法上传解析。":"无法处理当前题目画面。");
+                }
                 finally { software.recycle(); }
             }
             @Override public void onFailure(int errorCode) { finishFailure(callback,AccessibilityScreenshotCapture.userMessage(errorCode)); }

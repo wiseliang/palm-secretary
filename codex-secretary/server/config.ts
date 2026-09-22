@@ -29,6 +29,7 @@ export const config = {
   npmBin: process.env.NPM_BIN ?? '/usr/local/bin/npm',
   codexVersionCheckEnabled: process.env.CODEX_VERSION_CHECK_ENABLED !== '0',
   codexVersionCheckIntervalMs: Number(process.env.CODEX_VERSION_CHECK_INTERVAL_MS ?? 12 * 60 * 60_000),
+  codexUpdateScript: path.resolve(process.env.CODEX_UPDATE_SCRIPT ?? 'deploy/update-codex-cli.sh'),
   proxyUrl: process.env.HTTPS_PROXY ?? 'http://127.0.0.1:7897',
   maxUploadBytes: Number(process.env.MAX_UPLOAD_BYTES ?? 104_857_600),
   taskStopFreeBytes: Number(process.env.TASK_STOP_FREE_BYTES ?? 4 * 1024 ** 3),

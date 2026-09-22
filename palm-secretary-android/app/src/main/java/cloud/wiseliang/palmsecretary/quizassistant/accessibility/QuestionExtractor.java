@@ -24,7 +24,8 @@ public final class QuestionExtractor {
         "^(?:https?://)?[\\w.-]+(?::\\d+)?/\\S+$", Pattern.CASE_INSENSITIVE);
     private static final Set<String> NOISE = new HashSet<>(Arrays.asList(
         "上一题", "下一题", "提交", "收藏", "解析", "答题卡", "退出", "返回",
-        "进度", "倒计时", "设置", "分享", "广告", "搜索", "导航栏", "确定", "取消"));
+        "进度", "倒计时", "设置", "分享", "广告", "搜索", "导航栏", "确定", "取消",
+        "交卷", "查看解析", "暂存", "未作答", "已作答"));
     private static final Set<String> TRUE_FALSE = new HashSet<>(Arrays.asList(
         "正确", "错误", "对", "错", "√", "×", "是", "否"));
 

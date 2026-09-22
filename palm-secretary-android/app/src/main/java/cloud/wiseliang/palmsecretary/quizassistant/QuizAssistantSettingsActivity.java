@@ -10,6 +10,7 @@ import android.net.Uri;
 import android.os.Bundle;
 import android.provider.Settings;
 import android.text.TextUtils;
+import android.view.View;
 import android.widget.ArrayAdapter;
 import android.widget.ListView;
 import android.widget.Switch;
@@ -48,6 +49,7 @@ public final class QuizAssistantSettingsActivity extends Activity {
     private Switch visionSwitch;
     private TextView serviceStatus;
     private ListView appList;
+    private TextView emptyApps;
     private final List<AppChoice> choices = new ArrayList<>();
     private boolean updatingSwitch;
 
@@ -56,14 +58,16 @@ public final class QuizAssistantSettingsActivity extends Activity {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_quiz_assistant_settings);
         preferences = new QuizAssistantPreferences(this);
-        enabledSwitch = findViewById(R.id.quiz_enabled_switch);
-        visionSwitch = findViewById(R.id.quiz_vision_switch);
-        serviceStatus = findViewById(R.id.quiz_service_status);
         appList = findViewById(R.id.quiz_app_list);
-        appList.setEmptyView(findViewById(R.id.quiz_empty_apps));
+        View settingsHeader = getLayoutInflater().inflate(R.layout.quiz_assistant_settings_header, appList, false);
+        appList.addHeaderView(settingsHeader, null, false);
+        enabledSwitch = settingsHeader.findViewById(R.id.quiz_enabled_switch);
+        visionSwitch = settingsHeader.findViewById(R.id.quiz_vision_switch);
+        serviceStatus = settingsHeader.findViewById(R.id.quiz_service_status);
+        emptyApps = settingsHeader.findViewById(R.id.quiz_empty_apps);
 
         findViewById(R.id.quiz_back).setOnClickListener(ignored -> finish());
-        findViewById(R.id.quiz_open_accessibility).setOnClickListener(ignored -> openAccessibilitySettings());
+        settingsHeader.findViewById(R.id.quiz_open_accessibility).setOnClickListener(ignored -> openAccessibilitySettings());
         enabledSwitch.setOnCheckedChangeListener((button, checked) -> {
             if (updatingSwitch) return;
             if (checked && !preferences.isPrivacyConfirmed()) {
@@ -172,12 +176,16 @@ public final class QuizAssistantSettingsActivity extends Activity {
         Collections.sort(choices, Comparator.comparing(choice -> choice.label, java.text.Collator.getInstance()));
         ArrayAdapter<AppChoice> adapter = new ArrayAdapter<>(this, android.R.layout.simple_list_item_multiple_choice, choices);
         appList.setAdapter(adapter);
+        emptyApps.setVisibility(choices.isEmpty() ? View.VISIBLE : View.GONE);
+        final int headerCount = appList.getHeaderViewsCount();
         Set<String> allowed = preferences.allowedPackages();
         for (int index = 0; index < choices.size(); index++) {
-            appList.setItemChecked(index, allowed.contains(choices.get(index).packageName));
+            appList.setItemChecked(index + headerCount, allowed.contains(choices.get(index).packageName));
         }
         appList.setOnItemClickListener((parent, view, position, id) -> {
-            AppChoice choice = choices.get(position);
+            int choiceIndex = position - headerCount;
+            if (choiceIndex < 0 || choiceIndex >= choices.size()) return;
+            AppChoice choice = choices.get(choiceIndex);
             preferences.setPackageAllowed(choice.packageName, appList.isItemChecked(position));
             QuizAssistantCoordinator.notifyPreferencesChanged();
         });

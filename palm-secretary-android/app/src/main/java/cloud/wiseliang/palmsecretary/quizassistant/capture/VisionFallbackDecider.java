@@ -14,8 +14,8 @@ public final class VisionFallbackDecider {
         Decision(Route route, String reason) { this.route = route; this.reason = reason; }
     }
 
-    private static final String[] VISUAL_WORDS = {"如图", "图中", "下图", "根据图示", "示意图",
-        "流程图", "看图", "根据图片", "图示设备", "图中仪表"};
+    private static final String[] VISUAL_WORDS = {"如图", "图中", "下图", "上图", "图示", "示意图",
+        "流程图", "曲线", "图表", "图片", "图像", "根据图", "结合图", "设备图", "看图"};
 
     public Decision decide(QuizQuestionPreview preview, List<NodeSnapshot> nodes,
             boolean visionEnabled, int sdkInt, boolean allowed, boolean sensitive,

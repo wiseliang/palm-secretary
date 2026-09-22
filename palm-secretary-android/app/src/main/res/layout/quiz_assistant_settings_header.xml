@@ -1,0 +1,121 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="vertical"
+    android:paddingLeft="20dp"
+    android:paddingTop="20dp"
+    android:paddingRight="20dp"
+    android:paddingBottom="12dp">
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:lineSpacingExtra="3dp"
+        android:text="@string/quiz_assistant_intro"
+        android:textColor="@color/palm_quiz_ink"
+        android:textSize="16sp" />
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="12dp"
+        android:background="@color/palm_quiz_blue_soft"
+        android:padding="14dp"
+        android:text="@string/quiz_assistant_stage_notice"
+        android:textColor="@color/palm_quiz_blue"
+        android:textSize="14sp" />
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="24dp"
+        android:text="隐私与识别"
+        android:textColor="@color/palm_quiz_ink"
+        android:textSize="17sp"
+        android:textStyle="bold" />
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="6dp"
+        android:lineSpacingExtra="3dp"
+        android:text="@string/quiz_assistant_privacy"
+        android:textColor="@color/palm_quiz_muted"
+        android:textSize="13sp" />
+
+    <Switch
+        android:id="@+id/quiz_enabled_switch"
+        android:layout_width="match_parent"
+        android:layout_height="52dp"
+        android:layout_marginTop="10dp"
+        android:gravity="center_vertical"
+        android:text="@string/quiz_assistant_enabled"
+        android:textColor="@color/palm_quiz_ink"
+        android:textSize="16sp" />
+
+    <Switch
+        android:id="@+id/quiz_vision_switch"
+        android:layout_width="match_parent"
+        android:layout_height="52dp"
+        android:gravity="center_vertical"
+        android:text="@string/quiz_vision_enabled"
+        android:textColor="@color/palm_quiz_ink"
+        android:textSize="16sp" />
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:lineSpacingExtra="2dp"
+        android:text="@string/quiz_vision_description"
+        android:textColor="@color/palm_quiz_muted"
+        android:textSize="13sp" />
+
+    <TextView
+        android:id="@+id/quiz_service_status"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="22dp"
+        android:textColor="@color/palm_quiz_ink"
+        android:textSize="15sp"
+        android:textStyle="bold" />
+
+    <Button
+        android:id="@+id/quiz_open_accessibility"
+        android:layout_width="match_parent"
+        android:layout_height="48dp"
+        android:layout_marginTop="10dp"
+        android:background="@drawable/quiz_primary_button_background"
+        android:text="@string/quiz_assistant_open_accessibility"
+        android:textAllCaps="false"
+        android:textColor="@color/palm_white"
+        android:textSize="15sp" />
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="30dp"
+        android:text="@string/quiz_assistant_whitelist_title"
+        android:textColor="@color/palm_quiz_ink"
+        android:textSize="18sp"
+        android:textStyle="bold" />
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="5dp"
+        android:lineSpacingExtra="2dp"
+        android:text="@string/quiz_assistant_whitelist_hint"
+        android:textColor="@color/palm_quiz_muted"
+        android:textSize="13sp" />
+
+    <TextView
+        android:id="@+id/quiz_empty_apps"
+        android:layout_width="match_parent"
+        android:layout_height="72dp"
+        android:gravity="center"
+        android:text="@string/quiz_assistant_no_apps"
+        android:textColor="@color/palm_quiz_muted"
+        android:textSize="14sp"
+        android:visibility="gone" />
+</LinearLayout>

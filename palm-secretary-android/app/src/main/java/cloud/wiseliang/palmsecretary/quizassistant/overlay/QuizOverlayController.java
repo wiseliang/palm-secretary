@@ -31,6 +31,7 @@ public final class QuizOverlayController {
     public void showAnalyzingSlow() { answerCard.showAnalyzingSlow(); }
     public void showAnalyzingVerySlow() { answerCard.showAnalyzingVerySlow(); }
     public void showCapturing() { answerCard.showCapturing(); }
+    public void showRecognizingText() { answerCard.showRecognizingText(); }
     public void showAnalyzingImage() { answerCard.showAnalyzingImage(); }
     public void showAnalyzingImageSlow() { answerCard.showAnalyzingImageSlow(); }
     public void hideForCapture() { answerCard.hide(); floatingBall.hide(); }

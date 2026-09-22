@@ -25,6 +25,10 @@ import cloud.wiseliang.palmsecretary.quizassistant.capture.CropPlan;
 import cloud.wiseliang.palmsecretary.quizassistant.capture.QuizImageProcessor;
 import cloud.wiseliang.palmsecretary.quizassistant.capture.ScreenCaptureCoordinator;
 import cloud.wiseliang.palmsecretary.quizassistant.capture.VisionFallbackDecider;
+import cloud.wiseliang.palmsecretary.quizassistant.ocr.LocalOcrEngine;
+import cloud.wiseliang.palmsecretary.quizassistant.ocr.OcrNodeAdapter;
+import cloud.wiseliang.palmsecretary.quizassistant.ocr.OcrResult;
+import cloud.wiseliang.palmsecretary.quizassistant.ocr.OcrRoutingDecider;
 
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -40,6 +44,7 @@ public final class QuizAssistantAccessibilityService extends AccessibilityServic
     private boolean requestInProgress;
     private String activeRequestId;
     private ScreenCaptureCoordinator captureCoordinator;
+    private LocalOcrEngine ocrEngine;
     private QuizImageProcessor.EncodedImage pendingVisionImage;
 
     @Override
@@ -47,6 +52,7 @@ public final class QuizAssistantAccessibilityService extends AccessibilityServic
         super.onServiceConnected();
         overlayController = new QuizOverlayController(this, this::captureQuestionOnce, this::ignoreActiveResult);
         captureCoordinator = new ScreenCaptureCoordinator(this, overlayController);
+        ocrEngine = new LocalOcrEngine();
         QuizAssistantCoordinator.attach(this);
         debug("connected");
         refreshOverlayState();
@@ -100,6 +106,8 @@ public final class QuizAssistantAccessibilityService extends AccessibilityServic
         requestInProgress = false;
         networkExecutor.shutdownNow();
         clearPendingImage();
+        if (ocrEngine != null) ocrEngine.close();
+        ocrEngine = null;
         captureCoordinator = null;
         overlayController = null;
         super.onDestroy();
@@ -179,6 +187,7 @@ public final class QuizAssistantAccessibilityService extends AccessibilityServic
             VisionFallbackDecider.Decision decision = new VisionFallbackDecider().decide(preview, tree.nodes,
                 new QuizAssistantPreferences(this).isVisionEnabled(), android.os.Build.VERSION.SDK_INT,
                 true, false, true);
+            debug("initial route="+decision.route.name());
             if (decision.route == VisionFallbackDecider.Route.TEXT_ONLY) {
                 startAnalysis(preview, true, startedAt, clientRequestId, accessibilityMs, extractorMs);
                 handedToNetwork = true;
@@ -208,20 +217,21 @@ public final class QuizAssistantAccessibilityService extends AccessibilityServic
             VisionFallbackDecider.Route route, long startedAt, String requestId,
             long accessibilityMs, long extractionMs) {
         activeRequestId=requestId;
+        String sourcePackage=foregroundPackage;
         captureCoordinator.capture(foregroundPackage,preview,tree,route,new ScreenCaptureCoordinator.Callback() {
             @Override public void onReady(QuizImageProcessor.EncodedImage image, CropPlan plan,
                     boolean needsConfirmation,long screenshotMs,long cropMs,long encodeMs) {
-                if (!requestId.equals(activeRequestId) || !QuizAssistantCoordinator.isPackageAllowed(
-                        QuizAssistantAccessibilityService.this,foregroundPackage)) { image.clear(); requestInProgress=false; return; }
+                if (!isActiveFor(requestId,sourcePackage)) { image.clear(); requestInProgress=false; return; }
                 if (needsConfirmation) {
                     pendingVisionImage=image;
                     requestInProgress=false;
                     overlayController.showVisionConfirmation(
-                        () -> { pendingVisionImage=null; startVisionAnalysis(preview,image,"vision",startedAt,
-                            requestId,accessibilityMs,extractionMs,screenshotMs,cropMs,encodeMs); },
+                        () -> { pendingVisionImage=null; requestInProgress=true;
+                            startOcrOrVision(preview,image,route,sourcePackage,startedAt,requestId,
+                                accessibilityMs,extractionMs,screenshotMs,cropMs,encodeMs); },
                         () -> { clearPendingImage(); activeRequestId=null; overlayController.showOverlay(); });
-                } else startVisionAnalysis(preview,image,route==VisionFallbackDecider.Route.HYBRID?"hybrid":"vision",
-                    startedAt,requestId,accessibilityMs,extractionMs,screenshotMs,cropMs,encodeMs);
+                } else startOcrOrVision(preview,image,route,sourcePackage,startedAt,requestId,
+                    accessibilityMs,extractionMs,screenshotMs,cropMs,encodeMs);
             }
             @Override public void onFailure(String message) {
                 requestInProgress=false;
@@ -230,6 +240,60 @@ public final class QuizAssistantAccessibilityService extends AccessibilityServic
                     QuizAssistantAccessibilityService.this::captureQuestionOnce);
             }
         });
+    }
+
+    private void startOcrOrVision(QuizQuestionPreview accessibilityPreview,
+            QuizImageProcessor.EncodedImage image, VisionFallbackDecider.Route route,
+            String sourcePackage, long startedAt, String requestId, long accessibilityMs,
+            long extractionMs, long screenshotMs, long cropMs, long encodeMs) {
+        boolean explicitVisualText=new VisionFallbackDecider().hasVisualCue(accessibilityPreview,
+            java.util.Collections.emptyList());
+        boolean runOcr=new OcrRoutingDecider().shouldRunOcr(
+            route == VisionFallbackDecider.Route.HYBRID,explicitVisualText);
+        if (!runOcr || ocrEngine == null) {
+            startVisionAnalysis(accessibilityPreview,image,route == VisionFallbackDecider.Route.HYBRID
+                ? "hybrid" : "vision",startedAt,requestId,accessibilityMs,extractionMs,
+                screenshotMs,cropMs,encodeMs);
+            return;
+        }
+        if (!isActiveFor(requestId,sourcePackage)) { image.clear(); requestInProgress=false; return; }
+        overlayController.showOverlay();
+        overlayController.showRecognizingText();
+        long ocrStartedAt=SystemClock.elapsedRealtime();
+        ocrEngine.recognize(image.bytes,new LocalOcrEngine.Callback() {
+            @Override public void onSuccess(OcrResult result) {
+                if (!isActiveFor(requestId,sourcePackage)) { image.clear(); requestInProgress=false; return; }
+                long extractionStartedAt=SystemClock.elapsedRealtime();
+                java.util.List<NodeSnapshot> nodes=new OcrNodeAdapter().adapt(result.lines);
+                QuizQuestionPreview preview=new QuestionExtractor().extract(nodes,false);
+                long ocrExtractionMs=SystemClock.elapsedRealtime()-extractionStartedAt;
+                boolean visual=new VisionFallbackDecider().hasVisualCue(preview,nodes);
+                OcrRoutingDecider.Route ocrRoute=new OcrRoutingDecider().decide(preview,visual);
+                debug("OCR result: lines="+result.lineCount+" blocks="+result.blockCount
+                    +" chars="+result.fullText.length()+" decodeMs="+result.decodeMs
+                    +" ocrMs="+result.processingMs+" extractionMs="+ocrExtractionMs
+                    +" confidence="+String.format(java.util.Locale.ROOT,"%.2f",preview.confidence)
+                    +" options="+preview.options.size()+" route="+(visual?"VISUAL_DEPENDENCY"
+                        :(ocrRoute==OcrRoutingDecider.Route.TEXT_API?"OCR_TEXT_SUCCESS":"OCR_FALLBACK_VISION")));
+                if (ocrRoute==OcrRoutingDecider.Route.TEXT_API) {
+                    image.clear();
+                    startAnalysis(preview,true,startedAt,requestId,accessibilityMs,
+                        extractionMs+ocrExtractionMs,"ocr");
+                } else startVisionAnalysis(accessibilityPreview,image,"vision",startedAt,requestId,
+                    accessibilityMs,extractionMs,screenshotMs,cropMs,encodeMs);
+            }
+            @Override public void onFailure() {
+                if (!isActiveFor(requestId,sourcePackage)) { image.clear(); requestInProgress=false; return; }
+                debug("OCR fallback: status=FAILED elapsedMs="+(SystemClock.elapsedRealtime()-ocrStartedAt));
+                startVisionAnalysis(accessibilityPreview,image,"vision",startedAt,requestId,
+                    accessibilityMs,extractionMs,screenshotMs,cropMs,encodeMs);
+            }
+        });
+    }
+
+    private boolean isActiveFor(String requestId,String sourcePackage) {
+        return requestId.equals(activeRequestId) && sourcePackage.equals(foregroundPackage)
+            && QuizAssistantCoordinator.isPackageAllowed(this,foregroundPackage);
     }
 
     private void startVisionAnalysis(QuizQuestionPreview preview, QuizImageProcessor.EncodedImage image,
@@ -264,6 +328,12 @@ public final class QuizAssistantAccessibilityService extends AccessibilityServic
 
     private void startAnalysis(QuizQuestionPreview preview, boolean alreadyReserved, long startedAt,
             String clientRequestId, long accessibilityMs, long extractionMs) {
+        startAnalysis(preview,alreadyReserved,startedAt,clientRequestId,accessibilityMs,extractionMs,
+            "accessibility");
+    }
+
+    private void startAnalysis(QuizQuestionPreview preview, boolean alreadyReserved, long startedAt,
+            String clientRequestId, long accessibilityMs, long extractionMs, String captureMode) {
         if (overlayController == null || (!alreadyReserved && requestInProgress)) return;
         if (!QuizAssistantCoordinator.isPackageAllowed(this, foregroundPackage)) {
             overlayController.hideOverlay();
@@ -271,7 +341,7 @@ public final class QuizAssistantAccessibilityService extends AccessibilityServic
             return;
         }
         requestInProgress = true;
-        QuizAnalysisRequest request = new QuizAnalysisRequest(clientRequestId, foregroundPackage, preview);
+        QuizAnalysisRequest request = new QuizAnalysisRequest(clientRequestId, foregroundPackage, preview,captureMode);
         activeRequestId = request.clientRequestId;
         String cookie = CookieManager.getInstance().getCookie("https://ai.wiseliang.cloud/");
         overlayController.showAnalyzing();

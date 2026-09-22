@@ -33,6 +33,19 @@ public class QuizJsonTest {
         assertFalse(json.has("cookie"));
     }
 
+    @Test public void ocrRequestContainsOnlyExtractedQuestionData() throws Exception {
+        QuizQuestionPreview preview = new QuizQuestionPreview("OCR 固定测试题？",
+            QuizQuestionPreview.QuestionType.SINGLE_CHOICE,
+            Arrays.asList(new QuizOptionPreview("A", "选项一"), new QuizOptionPreview("B", "选项二")),
+            0.9f, Collections.emptyList(), true);
+        JSONObject json = new QuizAnalysisRequest("fixed-request-id", "com.tencent.mm", preview, "ocr").toJson();
+        assertEquals("ocr", json.getString("captureMode"));
+        assertFalse(json.has("image"));
+        assertFalse(json.has("fullText"));
+        assertFalse(json.has("lines"));
+        assertFalse(json.has("bounds"));
+    }
+
     @Test public void parsesStructuredAnswerArray() throws Exception {
         QuizAnalysisResult result = QuizApiClient.parseResult(validJson());
         assertEquals(Collections.singletonList("B"), result.answer);

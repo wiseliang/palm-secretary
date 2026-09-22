@@ -48,6 +48,7 @@ final class AnswerCardController {
     void showAnalyzingSlow() { prepare("正在解析", "题目已识别，AI 正在生成解析…", "", null); }
     void showAnalyzingVerySlow() { prepare("正在解析", "这道题解析时间较长…", "", null); }
     void showCapturing() { prepare("正在读取题目画面", "仅处理当前应用中的题目区域…", "", null); }
+    void showRecognizingText() { prepare("正在识别题目文字", "正在本地识别题目文字…", "", null); }
     void showAnalyzingImage() { prepare("正在识别图片题", "AI 正在分析题目画面…", "", null); }
     void showAnalyzingImageSlow() { prepare("正在识别图片题", "图片题解析时间较长…", "", null); }
     void showSensitive() { prepare("已停止读取", "当前页面包含敏感内容，刷题助手不会读取。", "", null); }

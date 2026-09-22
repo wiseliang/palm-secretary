@@ -39,6 +39,7 @@ const outcome = { result, metrics: {
 } };
 
 assert.equal(quizAnalysisRequestSchema.safeParse(request).success, true);
+assert.equal(quizAnalysisRequestSchema.safeParse({ ...request, captureMode: 'ocr' }).success, true);
 assert.equal(quizAnalysisResultSchema.safeParse(result).success, true);
 assert.equal(quizAnalysisRequestSchema.safeParse({ ...request, options: [] }).success, false);
 assert.equal(quizAnalysisRequestSchema.safeParse({ ...request, question: 'x'.repeat(4001) }).success, false);

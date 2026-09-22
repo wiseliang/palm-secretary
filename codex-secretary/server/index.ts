@@ -25,6 +25,7 @@ import { TaskReconciler } from './task-reconciler.js';
 import { registerKnowledgeRoutes } from './knowledge-routes.js';
 import { QuizAnalyzer } from './quiz-analyzer.js';
 import { registerQuizRoutes } from './quiz-routes.js';
+import { createStorageCleanupPlan, executeStorageCleanup } from './storage-cleanup.js';
 
 const app = Fastify({ logger: { level: process.env.LOG_LEVEL ?? 'info' }, trustProxy: '127.0.0.1' });
 const bridge = new CodexBridge();
@@ -49,6 +50,7 @@ const cliVersionChecker = new CliVersionChecker({
   enabled: config.codexVersionCheckEnabled,
   intervalMs: config.codexVersionCheckIntervalMs,
 });
+let cliUpdateInFlight = false;
 function outputInstructions(projectId: string): string {
   const inbox = projects.inbox(projectId);
   const outbox = projects.outbox(projectId);
@@ -345,6 +347,64 @@ app.get('/api/usage', async (request, reply) => {
 app.get<{ Querystring: { refresh?: string } }>('/api/codex/version', async (request, reply) => {
   if (!requireOwner(request, reply)) return;
   return cliVersionChecker.get(request.query.refresh === '1');
+});
+
+app.post('/api/codex/update', async (request, reply) => {
+  if (!requireOwner(request, reply)) return;
+  if (cliUpdateInFlight) return reply.code(409).send({ error: 'Codex CLI 正在更新' });
+  if (projects.runningTaskIds().length > 0) {
+    return reply.code(409).send({ error: '有任务正在运行，请等待任务结束后再更新' });
+  }
+
+  const before = await cliVersionChecker.get(true);
+  if (before.state === 'unavailable' || !before.latestVersion) {
+    return reply.code(503).send({ error: before.error ?? '暂时无法确定最新版本' });
+  }
+  if (!before.updateAvailable) return { updated: false, version: before.installedVersion, status: before };
+
+  cliUpdateInFlight = true;
+  try {
+    const { stdout } = await execFileAsync('/bin/bash', [config.codexUpdateScript, before.latestVersion], {
+      cwd: path.dirname(config.codexUpdateScript),
+      timeout: 5 * 60_000,
+      maxBuffer: 1024 * 1024,
+      env: { ...process.env, HOME: config.codexUserHome, NPM_BIN: config.npmBin },
+    });
+    const installedVersion = stdout.trim().split(/\s+/).at(-1);
+    if (installedVersion !== before.latestVersion) throw new Error('更新脚本未返回预期版本');
+    await bridge.restart();
+    const status = await cliVersionChecker.get(true);
+    if (status.installedVersion !== before.latestVersion) throw new Error('更新后的版本验证失败');
+    app.log.info({ event: 'codex.cli.updated', from: before.installedVersion, to: status.installedVersion });
+    return { updated: true, version: status.installedVersion, status };
+  } catch (error) {
+    app.log.error({ event: 'codex.cli.update_failed', error: error instanceof Error ? error.message : String(error) });
+    return reply.code(500).send({ error: 'Codex CLI 更新失败，原版本仍可继续使用' });
+  } finally {
+    cliUpdateInFlight = false;
+  }
+});
+
+app.get('/api/storage/cleanup-plan', async (request, reply) => {
+  if (!requireOwner(request, reply)) return;
+  try {
+    return await createStorageCleanupPlan();
+  } catch (error) {
+    request.log.error({ err: error }, '生成磁盘清理计划失败');
+    return reply.code(503).send({ error: '暂时无法生成安全清理计划' });
+  }
+});
+
+app.post('/api/storage/cleanup', async (request, reply) => {
+  if (!requireOwner(request, reply)) return;
+  const parsed = z.object({ planId: z.string().length(24), confirmed: z.literal(true) }).safeParse(request.body);
+  if (!parsed.success) return reply.code(400).send({ error: '需要确认有效的清理计划' });
+  try {
+    return await executeStorageCleanup(parsed.data.planId, parsed.data.confirmed);
+  } catch (error) {
+    request.log.warn({ err: error }, '磁盘清理未执行');
+    return reply.code(409).send({ error: error instanceof Error ? error.message : '磁盘清理失败' });
+  }
 });
 
 app.post('/api/usage/reset', async (request, reply) => {

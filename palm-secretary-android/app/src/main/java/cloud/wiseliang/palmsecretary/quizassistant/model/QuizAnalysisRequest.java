@@ -11,15 +11,22 @@ public final class QuizAnalysisRequest {
     public final String clientRequestId;
     public final String sourcePackage;
     public final QuizQuestionPreview preview;
+    public final String captureMode;
 
     public QuizAnalysisRequest(String sourcePackage, QuizQuestionPreview preview) {
         this(UUID.randomUUID().toString(), sourcePackage, preview);
     }
 
     public QuizAnalysisRequest(String clientRequestId, String sourcePackage, QuizQuestionPreview preview) {
+        this(clientRequestId, sourcePackage, preview, "accessibility");
+    }
+
+    public QuizAnalysisRequest(String clientRequestId, String sourcePackage, QuizQuestionPreview preview,
+            String captureMode) {
         this.clientRequestId = clientRequestId;
         this.sourcePackage = sourcePackage;
         this.preview = preview;
+        this.captureMode = "ocr".equals(captureMode) ? "ocr" : "accessibility";
     }
 
     public JSONObject toJson() throws JSONException {
@@ -34,7 +41,7 @@ public final class QuizAnalysisRequest {
             options.put(new JSONObject().put("optionId", option.optionId).put("text", option.text));
         }
         value.put("options", options);
-        value.put("captureMode", "accessibility");
+        value.put("captureMode", captureMode);
         return value;
     }
 

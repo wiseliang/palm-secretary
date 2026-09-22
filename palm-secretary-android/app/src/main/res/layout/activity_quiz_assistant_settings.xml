@@ -7,14 +7,13 @@
 
     <LinearLayout
         android:layout_width="match_parent"
-        android:layout_height="wrap_content"
+        android:layout_height="64dp"
         android:background="@color/palm_white"
+        android:elevation="2dp"
         android:gravity="center_vertical"
         android:orientation="horizontal"
-        android:paddingLeft="12dp"
-        android:paddingTop="10dp"
-        android:paddingRight="18dp"
-        android:paddingBottom="10dp">
+        android:paddingLeft="8dp"
+        android:paddingRight="20dp">
 
         <Button
             android:id="@+id/quiz_back"
@@ -36,141 +35,16 @@
             android:textStyle="bold" />
     </LinearLayout>
 
-    <ScrollView
+    <ListView
+        android:id="@+id/quiz_app_list"
         android:layout_width="match_parent"
         android:layout_height="0dp"
         android:layout_weight="1"
-        android:fillViewport="true">
-
-        <LinearLayout
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:orientation="vertical"
-            android:paddingLeft="20dp"
-            android:paddingTop="16dp"
-            android:paddingRight="20dp"
-            android:paddingBottom="28dp">
-
-            <TextView
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:text="@string/quiz_assistant_intro"
-                android:textColor="@color/palm_quiz_ink"
-                android:textSize="16sp"
-                android:lineSpacingExtra="4dp" />
-
-            <TextView
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="12dp"
-                android:background="@color/palm_quiz_blue_soft"
-                android:padding="14dp"
-                android:text="@string/quiz_assistant_stage_notice"
-                android:textColor="@color/palm_quiz_blue"
-                android:textSize="14sp" />
-
-            <TextView
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="24dp"
-                android:text="隐私说明"
-                android:textColor="@color/palm_quiz_ink"
-                android:textSize="16sp"
-                android:textStyle="bold" />
-
-            <TextView
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="8dp"
-                android:text="@string/quiz_assistant_privacy"
-                android:textColor="@color/palm_quiz_muted"
-                android:textSize="14sp"
-                android:lineSpacingExtra="4dp" />
-
-            <Switch
-                android:id="@+id/quiz_enabled_switch"
-                android:layout_width="match_parent"
-                android:layout_height="56dp"
-                android:layout_marginTop="14dp"
-                android:gravity="center_vertical"
-                android:text="@string/quiz_assistant_enabled"
-                android:textColor="@color/palm_quiz_ink"
-                android:textSize="16sp" />
-
-            <Switch
-                android:id="@+id/quiz_vision_switch"
-                android:layout_width="match_parent"
-                android:layout_height="56dp"
-                android:layout_marginTop="8dp"
-                android:gravity="center_vertical"
-                android:text="@string/quiz_vision_enabled"
-                android:textColor="@color/palm_quiz_ink"
-                android:textSize="16sp" />
-
-            <TextView
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:text="@string/quiz_vision_description"
-                android:textColor="@color/palm_quiz_muted"
-                android:textSize="13sp" />
-
-            <TextView
-                android:id="@+id/quiz_service_status"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="18dp"
-                android:textColor="@color/palm_quiz_ink"
-                android:textSize="16sp"
-                android:textStyle="bold" />
-
-            <Button
-                android:id="@+id/quiz_open_accessibility"
-                android:layout_width="match_parent"
-                android:layout_height="48dp"
-                android:layout_marginTop="10dp"
-                android:background="@drawable/quiz_primary_button_background"
-                android:text="@string/quiz_assistant_open_accessibility"
-                android:textAllCaps="false"
-                android:textColor="@color/palm_white"
-                android:textSize="15sp" />
-
-            <TextView
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="30dp"
-                android:text="@string/quiz_assistant_whitelist_title"
-                android:textColor="@color/palm_quiz_ink"
-                android:textSize="18sp"
-                android:textStyle="bold" />
-
-            <TextView
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="5dp"
-                android:text="@string/quiz_assistant_whitelist_hint"
-                android:textColor="@color/palm_quiz_muted"
-                android:textSize="13sp" />
-
-            <ListView
-                android:id="@+id/quiz_app_list"
-                android:layout_width="match_parent"
-                android:layout_marginTop="12dp"
-                android:layout_height="wrap_content"
-                android:minHeight="180dp"
-                android:choiceMode="multipleChoice"
-                android:scrollbars="vertical"
-                android:overScrollMode="ifContentScrolls"
-                android:divider="#14000000"
-                android:dividerHeight="1dp" />
-
-            <TextView
-                android:id="@+id/quiz_empty_apps"
-                android:layout_width="match_parent"
-                android:layout_height="80dp"
-                android:gravity="center"
-                android:text="@string/quiz_assistant_no_apps"
-                android:textColor="@color/palm_quiz_muted"
-                android:textSize="14sp" />
-        </LinearLayout>
-    </ScrollView>
+        android:choiceMode="multipleChoice"
+        android:clipToPadding="false"
+        android:divider="#142750C5"
+        android:dividerHeight="1dp"
+        android:overScrollMode="ifContentScrolls"
+        android:paddingBottom="24dp"
+        android:scrollbars="vertical" />
 </LinearLayout>

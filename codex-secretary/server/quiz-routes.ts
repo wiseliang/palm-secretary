@@ -54,6 +54,7 @@ export function registerQuizRoutes(app: FastifyInstance, authorize: Authorize,
         questionType: input.questionType,
         optionCount: input.options.length,
         sourcePackage: input.sourcePackage,
+        captureMode: input.captureMode,
         authMs,
         schemaValidationMs,
         ...metrics,
@@ -80,6 +81,7 @@ export function registerQuizRoutes(app: FastifyInstance, authorize: Authorize,
         questionType: input.questionType,
         optionCount: input.options.length,
         sourcePackage: input.sourcePackage,
+        captureMode: input.captureMode,
         code,
         schemaValidationMs,
         ...metrics,
@@ -160,12 +162,15 @@ export function registerQuizRoutes(app: FastifyInstance, authorize: Authorize,
     } catch (error) {
       const reportedCode = error && typeof error === 'object' && 'code' in error ? String(error.code) : '';
       const code = reportedCode === 'MODEL_ERROR' || reportedCode === 'MODEL_OUTPUT_INVALID' ? reportedCode : 'SERVER_ERROR';
+      const validationIssue = error && typeof error === 'object' && 'metrics' in error
+        && error.metrics && typeof error.metrics === 'object' && 'validationIssue' in error.metrics
+        ? String(error.metrics.validationIssue) : undefined;
       if (temporaryDirectory) {
         await rm(temporaryDirectory,{recursive:true,force:true});
         temporaryDirectory='';
       }
       app.log.warn({requestId:input.clientRequestId,captureMode:input.captureMode,imageBytes:image.length,
-        code,totalMs:Date.now()-routeStartedAt,statusCode:code==='SERVER_ERROR'?503:502},'quiz vision request failed');
+        code,validationIssue,totalMs:Date.now()-routeStartedAt,statusCode:code==='SERVER_ERROR'?503:502},'quiz vision request failed');
       return reply.code(code === 'SERVER_ERROR' ? 503 : 502).send({code,error:error instanceof Error?error.message:'解析服务异常'});
     } finally {
       image.fill(0);

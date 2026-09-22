@@ -183,6 +183,14 @@ type ServerStatus = {
   };
   sudo?: { available: boolean };
 };
+type StorageCleanupPlan = {
+  planId: string;
+  currentRelease: string;
+  rollbackRelease?: string;
+  candidates: Array<{ name: string; sizeBytes: number; modifiedAt: string }>;
+  reclaimableBytes: number;
+  expiresInSeconds: number;
+};
 type CliVersionStatus = {
   state: "current" | "update_available" | "unavailable" | "disabled";
   installedVersion?: string;
@@ -1489,6 +1497,7 @@ export default function Home() {
   const [attachments, setAttachments] = useState<UploadedFile[]>([]);
   const [status, setStatus] = useState<ServerStatus>({});
   const [cliVersion, setCliVersion] = useState<CliVersionStatus>();
+  const [cliUpdateBusy, setCliUpdateBusy] = useState(false);
   const [usageWindows, setUsageWindows] = useState<UsageWindow[]>([]);
   const [resetCredits, setResetCredits] = useState<ResetCreditSummary>();
   const [lunaReserveOffer, setLunaReserveOffer] = useState<LunaReserveOffer>();
@@ -1496,6 +1505,9 @@ export default function Home() {
   const [resetDialogOpen, setResetDialogOpen] = useState(false);
   const [resetBusy, setResetBusy] = useState(false);
   const [storageMaintenance, setStorageMaintenance] = useState(false);
+  const [cleanupPlan, setCleanupPlan] = useState<StorageCleanupPlan>();
+  const [cleanupDialogOpen, setCleanupDialogOpen] = useState(false);
+  const [cleanupBusy, setCleanupBusy] = useState(false);
   const [runtimeOpen, setRuntimeOpen] = useState(false);
   const [openMenu, setOpenMenu] = useState<OpenMenu>();
   const [projectDialog, setProjectDialog] = useState<ProjectDialog>();
@@ -1779,6 +1791,44 @@ export default function Home() {
     if (versionResponse.status === "fulfilled")
       setCliVersion(versionResponse.value as CliVersionStatus);
   }, []);
+
+  async function openCleanupDialog() {
+    setCleanupDialogOpen(true);
+    setCleanupBusy(true);
+    setCleanupPlan(undefined);
+    try {
+      const response = await fetch('/api/storage/cleanup-plan');
+      const body = await response.json() as StorageCleanupPlan & { error?: string };
+      if (!response.ok) throw new Error(body.error ?? '预检失败');
+      setCleanupPlan(body);
+    } catch (error) {
+      setCleanupDialogOpen(false);
+      setNotice(error instanceof Error ? error.message : '暂时无法生成安全清理计划');
+    } finally {
+      setCleanupBusy(false);
+    }
+  }
+
+  async function confirmStorageCleanup() {
+    if (!cleanupPlan || cleanupBusy) return;
+    setCleanupBusy(true);
+    try {
+      const response = await fetch('/api/storage/cleanup', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ planId: cleanupPlan.planId, confirmed: true }),
+      });
+      const body = await response.json() as { releasedBytes?: number; removed?: string[]; error?: string };
+      if (!response.ok) throw new Error(body.error ?? '清理失败');
+      setCleanupDialogOpen(false);
+      setCleanupPlan(undefined);
+      setNotice(`安全清理完成，释放 ${bytes(body.releasedBytes)}，共移除 ${body.removed?.length ?? 0} 个旧版本`);
+      await loadDashboard();
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : '磁盘清理失败');
+    } finally {
+      setCleanupBusy(false);
+    }
+  }
 
   async function refreshCliVersion() {
     try {
@@ -3128,6 +3178,30 @@ export default function Home() {
     setNotice(`已切换到 ${model.displayName} · ${effort}`);
   }
 
+  async function updateCli() {
+    if (cliUpdateBusy) return;
+    setCliUpdateBusy(true);
+    setNotice("正在更新 Codex CLI，请稍候…");
+    try {
+      const response = await fetch("/api/codex/update", { method: "POST" });
+      const body = (await response.json().catch(() => ({}))) as {
+        error?: string;
+        updated?: boolean;
+        version?: string;
+        status?: CliVersionStatus;
+      };
+      if (!response.ok) throw new Error(body.error ?? "Codex CLI 更新失败");
+      if (body.status) setCliVersion(body.status);
+      setNotice(body.updated
+        ? `Codex CLI 已更新至 ${body.version ?? "最新版本"}`
+        : `Codex CLI ${body.version ?? ""} 已是最新版`);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "Codex CLI 更新失败");
+    } finally {
+      setCliUpdateBusy(false);
+    }
+  }
+
   function openQuizAssistantSettings() {
     if (window.PalmNative?.openQuizAssistantSettings) {
       window.PalmNative.openQuizAssistantSettings();
@@ -4152,15 +4226,18 @@ export default function Home() {
                 </button>
                 <button
                   className={cliVersion?.updateAvailable ? "cli-update-available" : undefined}
+                  disabled={cliUpdateBusy}
                   onClick={() => {
                     setOpenMenu(undefined);
-                    void refreshCliVersion();
+                    void (cliVersion?.updateAvailable ? updateCli() : refreshCliVersion());
                   }}
                   title={versionCheckLabel(cliVersion?.checkedAt)}
                 >
                   <ArrowClockwise size={17} weight={cliVersion?.updateAvailable ? "bold" : "regular"} />
-                  {cliVersion?.updateAvailable
-                    ? "Codex CLI 可更新"
+                  {cliUpdateBusy
+                    ? "Codex CLI 更新中…"
+                    : cliVersion?.updateAvailable
+                    ? "一键更新 Codex CLI"
                     : cliVersion?.state === "current"
                       ? "Codex CLI 已是最新版"
                       : "检查 Codex CLI 更新"}
@@ -4385,6 +4462,27 @@ export default function Home() {
                 >
                   {resetBusy ? "正在重置…" : "确认使用 1 张"}
                 </button>
+              </footer>
+            </section>
+          </div>
+        )}
+        {cleanupDialogOpen && (
+          <div className="dialog-backdrop" role="presentation">
+            <section className="project-dialog storage-cleanup-dialog" role="dialog" aria-modal="true" aria-labelledby="storage-cleanup-title">
+              <header>
+                <div><small>服务器磁盘</small><h2 id="storage-cleanup-title">确认安全清理</h2></div>
+                <button type="button" aria-label="关闭" disabled={cleanupBusy} onClick={() => setCleanupDialogOpen(false)}><X size={18} weight="bold" /></button>
+              </header>
+              {cleanupPlan ? <>
+                <div className="cleanup-space-summary"><strong>预计释放 {bytes(cleanupPlan.reclaimableBytes)}</strong><span>当前版本和一个完整回滚版本会自动保留</span></div>
+                <ul className="cleanup-target-list">
+                  {cleanupPlan.candidates.length ? cleanupPlan.candidates.map((item) => <li key={item.name}><span>{item.name}</span><strong>{bytes(item.sizeBytes)}</strong></li>) : <li><span>没有可安全清理的旧版本</span></li>}
+                </ul>
+                <p>受保护：当前 {cleanupPlan.currentRelease}{cleanupPlan.rollbackRelease ? `；回滚 ${cleanupPlan.rollbackRelease}` : '；暂无可用回滚版本'}。执行时会再次校验路径、运行进程和计划有效性。</p>
+              </> : <p role="status">正在自动检查可安全回收的空间…</p>}
+              <footer>
+                <button type="button" disabled={cleanupBusy} onClick={() => setCleanupDialogOpen(false)}>取消</button>
+                <button type="button" className="primary danger-confirm" disabled={cleanupBusy || !cleanupPlan || cleanupPlan.candidates.length === 0} onClick={() => void confirmStorageCleanup()}>{cleanupBusy ? '正在处理…' : '确认并清理'}</button>
               </footer>
             </section>
           </div>
@@ -4646,19 +4744,10 @@ export default function Home() {
             {connection === "已连接" && status.disk?.warning && (
               <button
                 type="button"
-                className={storageMaintenance ? "active" : ""}
-                onClick={() => {
-                  setStorageMaintenance((active) => !active);
-                  setView("chat");
-                  setNotice(
-                    storageMaintenance
-                      ? "已退出存储维护模式"
-                      : "已进入存储维护模式；请描述要检查或清理的磁盘问题",
-                  );
-                }}
+                onClick={() => void openCleanupDialog()}
               >
                 <Wrench size={15} weight="bold" />
-                {storageMaintenance ? "退出维护" : "开始维护"}
+                安全清理
               </button>
             )}
           </section>

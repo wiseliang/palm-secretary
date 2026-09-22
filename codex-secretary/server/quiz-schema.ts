@@ -21,7 +21,7 @@ export const quizAnalysisRequestSchema = z.object({
       ids.add(id);
     }
   }),
-  captureMode: z.literal('accessibility'),
+  captureMode: z.enum(['accessibility', 'ocr']),
 }).strict();
 
 export const quizVisionMetadataSchema = z.object({

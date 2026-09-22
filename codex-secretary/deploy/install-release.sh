@@ -6,6 +6,12 @@ if [[ ${EUID} -ne 0 ]]; then
   exit 1
 fi
 
+exec 9>/run/lock/palm-storage-cleanup.lock
+if ! flock --wait 5 9; then
+  echo "磁盘清理或其他部署正在执行，请稍后重试" >&2
+  exit 1
+fi
+
 SOURCE_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 RELEASE_ID=$(date -u +%Y%m%dT%H%M%SZ)
 RELEASE_DIR="/opt/palm-secretary/releases/${RELEASE_ID}"
@@ -28,11 +34,13 @@ fi
 install -d -o root -g root -m 0755 /opt/palm-secretary/releases
 install -d -o codex -g codex -m 0700 /home/codex/workspace /home/codex/workspace/inbox /home/codex/workspace/outbox /home/codex/workspace/projects /home/codex/workspace/.palm
 install -d -o root -g codex -m 0750 /etc/palm-secretary
+install -d -o root -g root -m 0755 /usr/local/libexec
 install -d -o codex -g codex -m 0750 "${RELEASE_DIR}"
 
 cp -a "${SOURCE_DIR}/app" "${SOURCE_DIR}/public" "${SOURCE_DIR}/server" "${SOURCE_DIR}/deploy" "${RELEASE_DIR}/"
 cp -a "${SOURCE_DIR}/package.json" "${SOURCE_DIR}/package-lock.json" "${SOURCE_DIR}/tsconfig.json" "${SOURCE_DIR}/tsconfig.server.json" "${SOURCE_DIR}/next.config.ts" "${SOURCE_DIR}/vite.config.ts" "${SOURCE_DIR}/eslint.config.mjs" "${SOURCE_DIR}/.openai" "${RELEASE_DIR}/"
 chown -R codex:codex "${RELEASE_DIR}"
+install -o root -g root -m 0755 "${RELEASE_DIR}/deploy/palm-storage-cleanup.mjs" /usr/local/libexec/palm-storage-cleanup
 
 if [[ ! -e /home/codex/workspace/AGENTS.md ]]; then
   install -o codex -g codex -m 0600 "${RELEASE_DIR}/deploy/workspace-AGENTS.md" /home/codex/workspace/AGENTS.md

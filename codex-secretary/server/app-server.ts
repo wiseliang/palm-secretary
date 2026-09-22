@@ -139,4 +139,18 @@ export class CodexBridge extends EventEmitter {
   async close(): Promise<void> {
     this.child?.kill('SIGTERM');
   }
+
+  async restart(): Promise<void> {
+    const child = this.child;
+    if (child) {
+      child.kill('SIGTERM');
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(() => {
+          if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+        }, 3_000);
+        child.once('close', () => { clearTimeout(timer); resolve(); });
+      });
+    }
+    await this.ready();
+  }
 }

@@ -52,7 +52,8 @@ public final class QuizApiClient {
             connection = (HttpURLConnection) url.openConnection();
             connection.setRequestMethod("POST");
             connection.setConnectTimeout(5_000);
-            connection.setReadTimeout(25_000);
+            // A valid text result may include one structured-output repair turn on the server.
+            connection.setReadTimeout(55_000);
             connection.setDoOutput(true);
             connection.setRequestProperty("Content-Type", "application/json; charset=utf-8");
             connection.setRequestProperty("Accept", "application/json");
@@ -95,7 +96,9 @@ public final class QuizApiClient {
             URL url=new URL(VISION_ENDPOINT);
             connection=(HttpURLConnection)url.openConnection();
             connection.setRequestMethod("POST"); connection.setConnectTimeout(5_000);
-            connection.setReadTimeout(45_000); connection.setDoOutput(true);
+            // Vision may require one server-side structured-output repair turn. Leave enough
+            // transport headroom after image upload so a valid response is not discarded.
+            connection.setReadTimeout(70_000); connection.setDoOutput(true);
             connection.setRequestProperty("Content-Type","multipart/form-data; boundary="+boundary);
             connection.setRequestProperty("Accept","application/json");
             connection.setRequestProperty("Cookie",cookie);
