@@ -4,7 +4,7 @@ ARCHIVE=/tmp/palm-history-0.17.1.tar
 echo "$1  $ARCHIVE" | sha256sum -c -
 OLD=$(readlink -f /opt/palm-secretary/current)
 NEW=/opt/palm-secretary/releases/history-0.17.1
-test ! -e "$NEW"
+test "$OLD" != "$NEW"
 install -d -m 0700 /root/palm-backup-history-0.17.1
 cp -a /home/codex/workspace/.palm /root/palm-backup-history-0.17.1/state
 cp -a /etc/nginx/conf.d/palm-secretary.conf /root/palm-backup-history-0.17.1/nginx.conf
@@ -12,7 +12,8 @@ printf '%s\n' "$OLD" > /root/palm-backup-history-0.17.1/previous-release
 install -d -o codex -g codex -m 0750 "$NEW"
 tar -xf "$ARCHIVE" -C "$NEW" --strip-components=1
 # Dependencies are unchanged; reuse installed Linux dependencies without mutation.
-ln -s "$OLD/node_modules" "$NEW/node_modules"
+ln -sfn "$OLD/node_modules" "$NEW/node_modules"
+cp -a "$OLD/.openai" "$NEW/"
 chown -R codex:codex "$NEW"
 sudo -u codex -H env NODE_ENV=production /usr/local/bin/npm --prefix "$NEW" run build
 sudo -u codex /usr/local/bin/node --experimental-strip-types "$NEW/tests/history-page.mjs"
