@@ -2029,7 +2029,7 @@ export default function Home() {
       const generation = ++snapshotGenerationRef.current;
       const revision = streamRevisionRef.current;
       const response = await fetch(
-        `/api/threads/${encodeURIComponent(targetThreadId)}?projectId=${encodeURIComponent(targetProjectId)}`,
+        `/api/threads/${encodeURIComponent(targetThreadId)}?projectId=${encodeURIComponent(targetProjectId)}&recent=1`,
       ).catch(() => null);
       if (!response?.ok) return false;
       const restored = messagesFromThread(await response.json());
@@ -2790,6 +2790,7 @@ export default function Home() {
   }
 
   function newConversation() {
+    setHistoryBefore(null);
     if (projectReadOnly) {
       setNotice("项目已归档，请先恢复后再新建任务");
       return;
@@ -3225,6 +3226,27 @@ export default function Home() {
   }
 
   const openingThreadRef = useRef<string | null>(null);
+  const [historyBefore, setHistoryBefore] = useState<string | null>(null);
+  const [loadingOlder, setLoadingOlder] = useState(false);
+
+  async function loadOlderHistory() {
+    if (!threadId || !historyBefore || loadingOlder) return;
+    const target = threadId;
+    const targetProject = projectId;
+    const generation = navigationGenerationRef.current;
+    setLoadingOlder(true);
+    try {
+      const response = await fetch(`/api/threads/${encodeURIComponent(target)}?projectId=${encodeURIComponent(targetProject)}&before=${encodeURIComponent(historyBefore)}`);
+      if (!response.ok) throw new Error("读取更早记录失败");
+      const body = await response.json() as { history?: { hasMore: boolean; before: string | null } };
+      if (generation !== navigationGenerationRef.current || threadIdRef.current !== target || projectIdRef.current !== targetProject) return;
+      const older = messagesFromThread(body);
+      setMessages(current => [...older.filter(item => !current.some(existing => existing.id === item.id)), ...current]);
+      setHistoryBefore(body.history?.hasMore ? body.history.before : null);
+    } catch {
+      if (generation === navigationGenerationRef.current) setNotice("读取更早记录失败，请重试");
+    } finally { setLoadingOlder(false); }
+  }
 
   async function openThreadById(
     targetProjectId: string,
@@ -3249,17 +3271,20 @@ export default function Home() {
     openingThreadRef.current = openingKey;
     setView("chat");
     setMessages([]);
+    setHistoryBefore(null);
     setNotice("正在读取历史任务…");
     try {
     const response = await fetch(
-      `/api/threads/${encodeURIComponent(targetThreadId)}?projectId=${encodeURIComponent(targetProjectId)}`,
+      `/api/threads/${encodeURIComponent(targetThreadId)}?projectId=${encodeURIComponent(targetProjectId)}&recent=1`,
     );
     if (!response.ok) {
       setNotice("读取任务失败");
       return;
     }
-    const restored = messagesFromThread(await response.json());
+    const body = await response.json() as { history?: { hasMore: boolean; before: string | null } };
+    const restored = messagesFromThread(body);
     if (navigationGeneration !== navigationGenerationRef.current || projectIdRef.current !== targetProjectId) return;
+    setHistoryBefore(body.history?.hasMore ? body.history.before : null);
     const hint = focusHint.trim().toLowerCase();
     const focused =
       (hint
@@ -5320,6 +5345,7 @@ export default function Home() {
               </>
             ) : (
               <section className="chat-list" aria-live="polite">
+                {historyBefore && <button disabled={loadingOlder} onClick={() => void loadOlderHistory()}>{loadingOlder ? "正在读取…" : "加载更早记录"}</button>}
                 {messages.map((message) => (
                   <MessageRow key={message.id} message={message} projectId={projectId}
                     files={files} focused={focusedMessageId === message.id} onNotice={setNotice}

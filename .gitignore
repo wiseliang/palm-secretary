@@ -53,3 +53,4 @@
 **/*.log
 **/*.tar
 **/tests/results/
+**/*.tsbuildinfo

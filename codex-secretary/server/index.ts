@@ -26,6 +26,7 @@ import { registerKnowledgeRoutes } from './knowledge-routes.js';
 import { QuizAnalyzer } from './quiz-analyzer.js';
 import { registerQuizRoutes } from './quiz-routes.js';
 import { createStorageCleanupPlan, executeStorageCleanup } from './storage-cleanup.js';
+import { historyPage } from './history-page.js';
 
 const app = Fastify({ logger: { level: process.env.LOG_LEVEL ?? 'info' }, trustProxy: '127.0.0.1' });
 const bridge = new CodexBridge();
@@ -577,16 +578,17 @@ app.get<{ Querystring: { q?: string; projectId?: string; all?: string } }>('/api
 });
 
 const historyReads = new Map<string, { expiresAt: number; promise: Promise<unknown> }>();
-app.get<{ Params: { id: string }; Querystring: { projectId?: string } }>('/api/threads/:id', async (request, reply) => {
+app.get<{ Params: { id: string }; Querystring: { projectId?: string; before?: string; recent?: string } }>('/api/threads/:id', async (request, reply) => {
   if (!requireOwner(request, reply)) return;
   const projectId = request.query.projectId ?? 'default';
   projects.assertThreadProject(request.params.id, projectId);
   const key = `${projectId}:${request.params.id}`;
+  const page = (value: unknown) => request.query.recent === '1' || request.query.before ? historyPage(value, request.query.before) : value;
   const existing = historyReads.get(key);
-  if (existing && existing.expiresAt > Date.now()) return existing.promise;
+  if (existing && existing.expiresAt > Date.now()) return page(await existing.promise);
   await bridge.ready();
   const readyRead = historyReads.get(key);
-  if (readyRead && readyRead.expiresAt > Date.now()) return readyRead.promise;
+  if (readyRead && readyRead.expiresAt > Date.now()) return page(await readyRead.promise);
   const entry = { expiresAt: Infinity, promise: bridge.call('thread/read', { threadId: request.params.id, includeTurns: true }) };
   historyReads.set(key, entry);
   try {
@@ -594,7 +596,7 @@ app.get<{ Params: { id: string }; Querystring: { projectId?: string } }>('/api/t
     entry.expiresAt = Date.now() + 1000;
     const timer = setTimeout(() => { if (historyReads.get(key) === entry) historyReads.delete(key); }, 1000);
     timer.unref();
-    return result;
+    return page(result);
   } catch (error) {
     if (historyReads.get(key) === entry) historyReads.delete(key);
     throw error;
