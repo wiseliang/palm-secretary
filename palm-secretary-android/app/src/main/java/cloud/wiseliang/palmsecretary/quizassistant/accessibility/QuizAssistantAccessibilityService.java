@@ -11,6 +11,7 @@ import android.content.Intent;
 import android.webkit.CookieManager;
 import android.view.accessibility.AccessibilityEvent;
 import android.view.accessibility.AccessibilityNodeInfo;
+import android.view.accessibility.AccessibilityWindowInfo;
 
 import cloud.wiseliang.palmsecretary.BuildConfig;
 import cloud.wiseliang.palmsecretary.MainActivity;
@@ -46,6 +47,42 @@ public final class QuizAssistantAccessibilityService extends AccessibilityServic
     private ScreenCaptureCoordinator captureCoordinator;
     private LocalOcrEngine ocrEngine;
     private QuizImageProcessor.EncodedImage pendingVisionImage;
+    private boolean foregroundRefreshPending;
+    private final Runnable foregroundRefresh = () -> {
+        foregroundRefreshPending = false;
+        refreshOverlayState();
+    };
+
+    private void scheduleForegroundRefresh() {
+        if (foregroundRefreshPending) return;
+        foregroundRefreshPending = true;
+        mainHandler.postDelayed(foregroundRefresh, 200);
+    }
+
+    private String activeApplicationPackage() {
+        AccessibilityNodeInfo root = getRootInActiveWindow();
+        if (root != null) {
+            try {
+                CharSequence name = root.getPackageName();
+                if (name != null && !getPackageName().contentEquals(name)
+                        && !isCurrentInputMethod(name.toString())) return name.toString();
+            } finally { root.recycle(); }
+        }
+        // Our accessibility overlay and the keyboard must not replace the app below them.
+        for (AccessibilityWindowInfo window : getWindows()) {
+            try {
+                if (window.getType() != AccessibilityWindowInfo.TYPE_APPLICATION
+                        || (!window.isActive() && !window.isFocused())) continue;
+                AccessibilityNodeInfo appRoot = window.getRoot();
+                if (appRoot == null) continue;
+                try {
+                    CharSequence name = appRoot.getPackageName();
+                    if (name != null) return name.toString();
+                } finally { appRoot.recycle(); }
+            } finally { window.recycle(); }
+        }
+        return null;
+    }
 
     @Override
     protected void onServiceConnected() {
@@ -56,15 +93,19 @@ public final class QuizAssistantAccessibilityService extends AccessibilityServic
         QuizAssistantCoordinator.attach(this);
         debug("connected");
         refreshOverlayState();
+        scheduleForegroundRefresh();
     }
 
     @Override
     public void onAccessibilityEvent(AccessibilityEvent event) {
-        if (event == null
-                || event.getEventType() != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
-                || event.getPackageName() == null) {
+        if (event == null) return;
+        int type = event.getEventType();
+        if (type == AccessibilityEvent.TYPE_WINDOWS_CHANGED
+                || type == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED) {
+            scheduleForegroundRefresh();
             return;
         }
+        if (type != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED || event.getPackageName() == null) return;
         String eventPackage = event.getPackageName().toString();
         CharSequence eventClass = event.getClassName();
         if (isCurrentInputMethod(eventPackage)) return;
@@ -76,6 +117,7 @@ public final class QuizAssistantAccessibilityService extends AccessibilityServic
         foregroundPackage = eventPackage;
         debug("foreground package=" + foregroundPackage);
         refreshOverlayState();
+        scheduleForegroundRefresh();
     }
 
     private boolean isCurrentInputMethod(String packageName) {
@@ -99,6 +141,8 @@ public final class QuizAssistantAccessibilityService extends AccessibilityServic
 
     @Override
     public void onDestroy() {
+        mainHandler.removeCallbacks(foregroundRefresh);
+        foregroundRefreshPending = false;
         debug("disconnected");
         hideAllOverlays();
         QuizAssistantCoordinator.detach(this);
@@ -115,9 +159,16 @@ public final class QuizAssistantAccessibilityService extends AccessibilityServic
 
     public void refreshOverlayState() {
         if (overlayController == null) return;
+        if (captureCoordinator == null || !captureCoordinator.isInProgress()) {
+            String activePackage = activeApplicationPackage();
+            if (activePackage != null) foregroundPackage = activePackage;
+        }
         boolean allowed = QuizAssistantCoordinator.isPackageAllowed(this, foregroundPackage);
         debug(allowed ? "whitelist hit; overlay show" : "whitelist miss; overlay hide");
-        if (allowed) overlayController.showOverlay();
+        if (allowed) {
+            if (captureCoordinator != null && captureCoordinator.isInProgress()) return;
+            overlayController.showOverlay();
+        }
         else {
             activeRequestId = null;
             requestInProgress = false;

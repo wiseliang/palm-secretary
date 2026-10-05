@@ -32,4 +32,8 @@ public final class QuizAssistantCoordinator {
         QuizAssistantAccessibilityService connected = service.get();
         if (connected != null) connected.refreshOverlayState();
     }
+
+    public static synchronized boolean isServiceConnected() {
+        return service.get() != null;
+    }
 }

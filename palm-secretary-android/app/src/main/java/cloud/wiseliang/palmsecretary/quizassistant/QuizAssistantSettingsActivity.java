@@ -130,8 +130,10 @@ public final class QuizAssistantSettingsActivity extends Activity {
         visionSwitch.setChecked(preferences.isVisionEnabled());
         updatingSwitch = false;
         boolean enabled = isAccessibilityServiceEnabled();
+        boolean connected = enabled && QuizAssistantCoordinator.isServiceConnected();
         serviceStatus.setText(enabled ? R.string.quiz_assistant_service_enabled : R.string.quiz_assistant_service_disabled);
-        serviceStatus.setTextColor(getColor(enabled ? R.color.palm_quiz_blue : R.color.palm_quiz_muted));
+        if (enabled && !connected) serviceStatus.setText("无障碍已开启，但服务未连接；请关闭后重新开启无障碍服务");
+        serviceStatus.setTextColor(getColor(connected ? R.color.palm_quiz_blue : R.color.palm_quiz_muted));
     }
 
     private boolean isAccessibilityServiceEnabled() {
