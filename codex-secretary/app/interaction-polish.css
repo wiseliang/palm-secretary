@@ -447,3 +447,16 @@
 @media (prefers-reduced-motion: reduce) {
   .project-dialog { scroll-behavior: auto; }
 }
+.model-bar .quiz-assistant-settings { flex: 0 0 220px; }
+.model-bar .quiz-assistant-settings span { white-space: nowrap; }
+.model-bar .quiz-assistant-settings small { min-width: 0; }
+@media (max-width: 759px) {
+  .model-bar.open { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, .7fr) 36px auto; gap: 10px 8px; align-items: center; }
+  .model-bar label { min-width: 0; }
+  .model-bar label select { width: 100%; max-width: none; }
+  .model-bar strong { margin-left: 0; padding: 6px; }
+  .model-bar .quiz-assistant-settings { grid-column: 1 / -1; width: 100%; min-height: 48px; padding: 8px 12px; }
+  .model-bar .quiz-assistant-settings span { font-size: 12px; }
+  .model-bar .quiz-assistant-settings small { font-size: 10px; }
+  .model-bar .quiz-assistant-settings b { font-size: 12px; }
+}

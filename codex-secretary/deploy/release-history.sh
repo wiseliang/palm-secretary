@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
-ARCHIVE=/tmp/palm-history-0.17.1.tar
+VERSION=${2:-0.17.1}
+[[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+ARCHIVE=/tmp/palm-history-${VERSION}.tar
 echo "$1  $ARCHIVE" | sha256sum -c -
 OLD=$(readlink -f /opt/palm-secretary/current)
-NEW=/opt/palm-secretary/releases/history-0.17.1
+NEW=/opt/palm-secretary/releases/history-${VERSION}
+BACKUP=/root/palm-backup-history-${VERSION}
 test "$OLD" != "$NEW"
-install -d -m 0700 /root/palm-backup-history-0.17.1
-cp -a /home/codex/workspace/.palm /root/palm-backup-history-0.17.1/state
-cp -a /etc/nginx/conf.d/palm-secretary.conf /root/palm-backup-history-0.17.1/nginx.conf
-printf '%s\n' "$OLD" > /root/palm-backup-history-0.17.1/previous-release
+install -d -m 0700 "$BACKUP"
+cp -a /home/codex/workspace/.palm "$BACKUP/state"
+cp -a /etc/nginx/conf.d/palm-secretary.conf "$BACKUP/nginx.conf"
+printf '%s\n' "$OLD" > "$BACKUP/previous-release"
 install -d -o codex -g codex -m 0750 "$NEW"
 tar -xf "$ARCHIVE" -C "$NEW" --strip-components=1
 # Dependencies are unchanged; reuse installed Linux dependencies without mutation.
@@ -24,7 +27,7 @@ if(state.tasks.some(t=>t.status==='running'||t.submissionPending))throw new Erro
 NODE
 rollback() {
   ln -sfn "$OLD" /opt/palm-secretary/current
-  cp /root/palm-backup-history-0.17.1/nginx.conf /etc/nginx/conf.d/palm-secretary.conf
+  cp "$BACKUP/nginx.conf" /etc/nginx/conf.d/palm-secretary.conf
   systemctl restart palm-secretary-api palm-secretary-web
   nginx -t && systemctl reload nginx
 }
