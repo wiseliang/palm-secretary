@@ -576,12 +576,29 @@ app.get<{ Querystring: { q?: string; projectId?: string; all?: string } }>('/api
   return { results };
 });
 
+const historyReads = new Map<string, { expiresAt: number; promise: Promise<unknown> }>();
 app.get<{ Params: { id: string }; Querystring: { projectId?: string } }>('/api/threads/:id', async (request, reply) => {
   if (!requireOwner(request, reply)) return;
   const projectId = request.query.projectId ?? 'default';
   projects.assertThreadProject(request.params.id, projectId);
+  const key = `${projectId}:${request.params.id}`;
+  const existing = historyReads.get(key);
+  if (existing && existing.expiresAt > Date.now()) return existing.promise;
   await bridge.ready();
-  return bridge.call('thread/read', { threadId: request.params.id, includeTurns: true });
+  const readyRead = historyReads.get(key);
+  if (readyRead && readyRead.expiresAt > Date.now()) return readyRead.promise;
+  const entry = { expiresAt: Infinity, promise: bridge.call('thread/read', { threadId: request.params.id, includeTurns: true }) };
+  historyReads.set(key, entry);
+  try {
+    const result = await entry.promise;
+    entry.expiresAt = Date.now() + 1000;
+    const timer = setTimeout(() => { if (historyReads.get(key) === entry) historyReads.delete(key); }, 1000);
+    timer.unref();
+    return result;
+  } catch (error) {
+    if (historyReads.get(key) === entry) historyReads.delete(key);
+    throw error;
+  }
 });
 
 app.get<{ Params: { id: string }; Querystring: { projectId?: string } }>('/api/threads/:id/export', async (request, reply) => {

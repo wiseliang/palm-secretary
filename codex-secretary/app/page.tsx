@@ -3224,11 +3224,15 @@ export default function Home() {
     setNotice("已选择 Luna Reserve；后续任务将在主用量耗尽时使用 Luna");
   }
 
+  const openingThreadRef = useRef<string | null>(null);
+
   async function openThreadById(
     targetProjectId: string,
     targetThreadId: string,
     focusHint = "",
   ) {
+    const openingKey = `${targetProjectId}:${targetThreadId}`;
+    if (openingThreadRef.current === openingKey) return;
     const navigationGeneration = ++navigationGenerationRef.current;
     snapshotGenerationRef.current++;
     if (targetProjectId !== projectId) {
@@ -3242,6 +3246,11 @@ export default function Home() {
       setProjectId(targetProjectId);
       return;
     }
+    openingThreadRef.current = openingKey;
+    setView("chat");
+    setMessages([]);
+    setNotice("正在读取历史任务…");
+    try {
     const response = await fetch(
       `/api/threads/${encodeURIComponent(targetThreadId)}?projectId=${encodeURIComponent(targetProjectId)}`,
     );
@@ -3272,9 +3281,15 @@ export default function Home() {
     setMessages(restored);
     setFocusedMessageId(focused?.id);
     setView("chat");
+    setNotice("");
     if (!restored.length)
       setNotice("已恢复任务上下文；旧消息格式暂无法完整展示");
     return restored;
+    } catch {
+      if (navigationGeneration === navigationGenerationRef.current) setNotice("读取历史任务失败，请重试");
+    } finally {
+      if (openingThreadRef.current === openingKey) openingThreadRef.current = null;
+    }
   }
 
   async function openThread(item: ProjectThread, focusHint = item.title) {
@@ -3337,6 +3352,10 @@ export default function Home() {
     targetThreadId = threadId,
     maintenance = false,
   ) {
+    if (openingThreadRef.current) {
+      setNotice("历史任务正在加载，请稍后发送");
+      return;
+    }
     if (activeProject?.archivedAt) {
       setNotice("项目已归档，请先恢复后再执行任务");
       return;
