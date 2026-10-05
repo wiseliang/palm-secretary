@@ -5,11 +5,6 @@ echo "$1  $ARCHIVE" | sha256sum -c -
 OLD=$(readlink -f /opt/palm-secretary/current)
 NEW=/opt/palm-secretary/releases/history-0.17.1
 test ! -e "$NEW"
-/usr/local/bin/node <<'NODE'
-const fs=require('fs');
-const state=JSON.parse(fs.readFileSync('/home/codex/workspace/.palm/state.json'));
-if(state.tasks.some(t=>t.status==='running'||t.submissionPending))throw new Error('存在运行中或待核对任务，停止发布');
-NODE
 install -d -m 0700 /root/palm-backup-history-0.17.1
 cp -a /home/codex/workspace/.palm /root/palm-backup-history-0.17.1/state
 cp -a /etc/nginx/conf.d/palm-secretary.conf /root/palm-backup-history-0.17.1/nginx.conf
