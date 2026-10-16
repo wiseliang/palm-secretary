@@ -164,7 +164,7 @@ public final class MainActivity extends Activity {
             @Override
             public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
                 Uri uri = request.getUrl();
-                if (isAllowed(uri)) return false;
+                if (isAllowed(uri) || isDirectDownload(uri)) return false;
                 openExternal(uri);
                 return true;
             }
@@ -367,7 +367,7 @@ public final class MainActivity extends Activity {
     private DownloadListener createDownloadListener() {
         return (url, userAgent, contentDisposition, mimeType, contentLength) -> {
             Uri uri = Uri.parse(url);
-            if (!isAllowed(uri)) {
+            if (!isAllowed(uri) && !isDirectDownload(uri)) {
                 openExternal(uri);
                 return;
             }
@@ -377,7 +377,7 @@ public final class MainActivity extends Activity {
                 DownloadManager.Request request = new DownloadManager.Request(uri);
                 request.setMimeType(resolvedMimeType);
                 request.addRequestHeader("User-Agent", userAgent);
-                String cookie = CookieManager.getInstance().getCookie(url);
+                String cookie = isAllowed(uri) ? CookieManager.getInstance().getCookie(url) : null;
                 if (cookie != null && !cookie.isEmpty()) request.addRequestHeader("Cookie", cookie);
                 request.setTitle(filename);
                 request.setDescription("掌心助理正在下载文件");
@@ -429,6 +429,16 @@ public final class MainActivity extends Activity {
     private boolean isAllowed(Uri uri) {
         return "https".equalsIgnoreCase(uri.getScheme())
             && APP_HOST.equals(uri.getHost() == null ? "" : uri.getHost().toLowerCase(Locale.ROOT));
+    }
+
+    private boolean isDirectDownload(Uri uri) {
+        return "https".equalsIgnoreCase(uri.getScheme())
+            && "download.wiseliang.cloud".equalsIgnoreCase(uri.getHost())
+            && (uri.getPort() == -1 || uri.getPort() == 443)
+            && uri.getUserInfo() == null && uri.getFragment() == null
+            && "/api/files/direct".equals(uri.getPath())
+            && uri.getQueryParameter("ticket") != null
+            && !uri.getQueryParameter("ticket").isEmpty();
     }
 
     private void openExternal(Uri uri) {

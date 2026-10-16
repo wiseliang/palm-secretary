@@ -6,20 +6,22 @@ echo "$1  $ARCHIVE" | sha256sum -c -
 OLD=$(readlink -f /opt/palm-secretary/current)
 NEW=/opt/palm-secretary/releases/direct-${VERSION}
 BACKUP=/root/palm-backup-direct-${VERSION}
-test ! -e "$NEW"
-test ! -e "$BACKUP"
+test "$OLD" != "$NEW"
 test ! -e /etc/systemd/system/palm-secretary-api.service.d/download-origin.conf
 test -e /etc/letsencrypt/live/download.wiseliang.cloud/fullchain.pem
 exec 9>/run/lock/palm-storage-cleanup.lock
 flock --wait 5 9
-install -d -m 0700 "$BACKUP"
-cp -a /home/codex/workspace/.palm "$BACKUP/state"
-cp -a /etc/palm-secretary/app.env "$BACKUP/app.env"
-cp -a /etc/nginx/conf.d/palm-download.conf "$BACKUP/nginx-download.conf"
-printf '%s\n' "$OLD" > "$BACKUP/previous-release"
+if test ! -e "$BACKUP"; then
+  install -d -m 0700 "$BACKUP"
+  cp -a /home/codex/workspace/.palm "$BACKUP/state"
+  cp -a /etc/palm-secretary/app.env "$BACKUP/app.env"
+  cp -a /etc/nginx/conf.d/palm-download.conf "$BACKUP/nginx-download.conf"
+  printf '%s\n' "$OLD" > "$BACKUP/previous-release"
+fi
+test "$(cat "$BACKUP/previous-release")" = "$OLD"
 install -d -o codex -g codex -m 0750 "$NEW"
 tar -xf "$ARCHIVE" -C "$NEW" --strip-components=1
-ln -s "$OLD/node_modules" "$NEW/node_modules"
+ln -sfn "$OLD/node_modules" "$NEW/node_modules"
 cp -a "$OLD/.openai" "$NEW/"
 chown -R codex:codex "$NEW"
 sudo -u codex -H env NODE_ENV=production /usr/local/bin/npm --prefix "$NEW" run build

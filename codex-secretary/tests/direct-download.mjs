@@ -17,6 +17,18 @@ await writeFile(path.join(workspace, '.palm/state.json'), JSON.stringify({versio
   projects:[{id:'default',name:'test',directory:'default',createdAt:now,updatedAt:now}],threads:[],tasks:[]}));
 await writeFile(path.join(workspace, 'projects/default/outbox/test.txt'), '0123456789');
 let child;
+async function stopChild() {
+  if (!child || child.exitCode !== null) return;
+  const current = child;
+  if (process.platform === 'win32') current.kill();
+  else process.kill(-current.pid, 'SIGTERM');
+  const timer = setTimeout(() => {
+    if (current.exitCode !== null) return;
+    if (process.platform === 'win32') current.kill('SIGKILL');
+    else process.kill(-current.pid, 'SIGKILL');
+  }, 3000);
+  try { await once(current,'exit'); } finally { clearTimeout(timer); }
+}
 try {
   for (const enabled of [true, false]) {
     const port = enabled ? 4597 : 4598;
@@ -27,7 +39,7 @@ try {
       WORKSPACE_ROOT:workspace, DOWNLOAD_ORIGIN:enabled ? origin : '', CODEX_BIN:process.execPath,
       CODEX_ARGS_PREFIX_JSON:JSON.stringify([path.join(root,'tests/mock-app-server.mjs')]),
       MOCK_LOG:path.join(workspace, 'mock.jsonl'), CODEX_VERSION_CHECK_ENABLED:'0', LOG_LEVEL:'info',
-    }, stdio:['ignore','pipe','pipe']});
+    }, stdio:['ignore','pipe','pipe'], detached:process.platform !== 'win32'});
     child.stdout.on('data', chunk => { logs += chunk; });
     child.stderr.on('data', chunk => { logs += chunk; });
     let healthy = false;
@@ -70,12 +82,11 @@ try {
       assert.equal((await fetch(direct)).status,401);
       assert.ok(!logs.includes(location.searchParams.get('ticket')), 'ticket leaked into logs');
     }
-    child.kill();
-    await once(child,'exit');
+    await stopChild();
     child = undefined;
   }
   console.log('DIRECT_DOWNLOAD_INTEGRATION_OK');
 } finally {
-  if (child && child.exitCode === null) { child.kill(); await once(child,'exit'); }
+  await stopChild();
   await rm(workspace,{recursive:true,force:true,maxRetries:5,retryDelay:100});
 }
