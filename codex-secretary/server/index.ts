@@ -27,6 +27,7 @@ import { QuizAnalyzer } from './quiz-analyzer.js';
 import { registerQuizRoutes } from './quiz-routes.js';
 import { createStorageCleanupPlan, executeStorageCleanup } from './storage-cleanup.js';
 import { historyPage } from './history-page.js';
+import { createDownloadTicket, verifyDownloadTicket, downloadRange } from './download-ticket.js';
 
 const app = Fastify({ logger: { level: process.env.LOG_LEVEL ?? 'info' }, trustProxy: '127.0.0.1' });
 const bridge = new CodexBridge();
@@ -919,12 +920,45 @@ app.get<{ Querystring: { path?: string; projectId?: string } }>('/api/files/down
   try {
     const filePath = projects.safeStoredPath(request.query.projectId ?? 'default', request.query.path);
     const handle = await projects.openStoredFile(request.query.projectId ?? 'default', request.query.path);
+    if (config.downloadOrigin) {
+      await handle.close();
+      const ticket = createDownloadTicket(config.sessionSecret, request.cookies.palm_session!,
+        request.query.projectId ?? 'default', request.query.path, config.downloadOrigin);
+      reply.header('Cache-Control', 'no-store').header('Referrer-Policy', 'no-referrer');
+      return reply.redirect(`${config.downloadOrigin}/api/files/direct?ticket=${encodeURIComponent(ticket)}`, 302);
+    }
     reply.header('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(displayFileName(path.basename(filePath)))}`);
     reply.header('X-Content-Type-Options', 'nosniff');
     return reply.send(handle.createReadStream());
   } catch {
     return reply.code(404).send({ error: '文件不存在' });
   }
+});
+
+// Suppress request URL logging: the query contains a short-lived bearer ticket.
+app.get<{ Querystring: { ticket?: string } }>('/api/files/direct', { logLevel: 'silent' }, async (request, reply) => {
+  reply.header('Cache-Control', 'private, no-store').header('Referrer-Policy', 'no-referrer');
+  if (!config.downloadOrigin) return reply.code(404).send({ error: '未启用直连下载' });
+  const ticket = verifyDownloadTicket(request.query.ticket, config.sessionSecret, config.downloadOrigin);
+  if (!ticket || !sessions.validDownloadReference(ticket.sessionHash, ticket.expiresAt)) {
+    return reply.code(401).send({ error: '下载链接已失效，请从掌心助理重新下载' });
+  }
+  try {
+    const filePath = projects.safeStoredPath(ticket.projectId, ticket.path);
+    const handle = await projects.openStoredFile(ticket.projectId, ticket.path);
+    const { size } = await handle.stat();
+    const range = downloadRange(request.headers.range, size);
+    if (range === false) {
+      await handle.close();
+      return reply.code(416).header('Content-Range', `bytes */${size}`).send();
+    }
+    reply.header('Content-Type', 'application/octet-stream')
+      .header('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(displayFileName(path.basename(filePath)))}`)
+      .header('X-Content-Type-Options', 'nosniff').header('Accept-Ranges', 'bytes')
+      .header('Content-Length', range ? range.end - range.start + 1 : size);
+    if (range) reply.code(206).header('Content-Range', `bytes ${range.start}-${range.end}/${size}`);
+    return reply.send(handle.createReadStream(range || undefined));
+  } catch { return reply.code(404).send({ error: '文件不存在' }); }
 });
 
 app.get<{ Querystring: { path?: string; projectId?: string } }>('/api/files/preview', async (request, reply) => {

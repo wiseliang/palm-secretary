@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { downloadOrigin } from './download-ticket.js';
 
 function required(name: string): string {
   const value = process.env[name]?.trim();
@@ -10,6 +11,7 @@ export const config = {
   host: process.env.APP_HOST ?? '127.0.0.1',
   port: Number(process.env.APP_PORT ?? 4511),
   origin: process.env.APP_ORIGIN?.replace(/\/$/, '') ?? 'http://localhost:3000',
+  downloadOrigin: downloadOrigin(process.env.DOWNLOAD_ORIGIN),
   passwordHash: process.env.APP_PASSWORD_HASH?.trim() ?? '',
   sessionSecret: required('SESSION_SECRET'),
   workspace: path.resolve(process.env.WORKSPACE_ROOT ?? '/home/codex/workspace'),

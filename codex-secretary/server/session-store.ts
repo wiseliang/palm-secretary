@@ -25,6 +25,11 @@ export class SessionStore {
     return Boolean(token && verifySession(token, this.secret) && !this.revoked[this.key(token)]);
   }
 
+  // Only call after verifying a signed download ticket; never accept arbitrary hashes from clients.
+  validDownloadReference(hash: string, expiresAt: number): boolean {
+    return /^[a-f0-9]{64}$/.test(hash) && expiresAt > Date.now() && !this.revoked[hash];
+  }
+
   async revoke(token: string): Promise<void> {
     for (const [key, expiry] of Object.entries(this.revoked)) {
       if (expiry <= Date.now()) delete this.revoked[key];
