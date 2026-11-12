@@ -9,6 +9,8 @@ on:
         type: boolean
         default: false
   push:
+    tags:
+      - "android-v*"
     branches:
       - main
     paths:
@@ -55,13 +57,14 @@ jobs:
           if-no-files-found: error
           retention-days: 30
       - name: Publish downloadable prerelease
-        if: github.event_name == 'workflow_dispatch' && inputs.publish
+        if: (github.event_name == 'workflow_dispatch' && inputs.publish) || startsWith(github.ref, 'refs/tags/android-v')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           VERSION=$(sed -n "s/.*versionName ['\"]\([^'\"]*\).*/\1/p" app/build.gradle | head -1)
           test -n "$VERSION"
           TAG="android-v$VERSION"
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then test "$GITHUB_REF_NAME" = "$TAG"; fi
           ASSET="palm-secretary-v$VERSION-android-beta.apk"
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "Release $TAG 已存在；同版本安装包禁止覆盖，请先提升 versionName。" >&2
