@@ -180,6 +180,9 @@ function setSocketThread(socket: SocketLike, threadId: string): void {
   socketThreads.set(socket, threadId);
 }
 
+// Keep accepted steer requests briefly so a lost WebSocket receipt can be replayed.
+const steerRequests = new Map<string, { text: string; result: Promise<unknown>; expiresAt: number }>();
+
 const inputQuestions = z.array(z.object({
   id: z.string(), question: z.string(), isSecret: z.boolean().optional(),
   options: z.array(z.object({ label: z.string() })).nullable().optional(),
@@ -187,6 +190,18 @@ const inputQuestions = z.array(z.object({
 const pendingInput = new Map<number, {
   threadId: string; turnId: string; questions: z.infer<typeof inputQuestions>;
 }>();
+
+function sendInputSnapshot(socket: SocketLike, threadId: string) {
+  const latest = [...pendingInput].filter(([, prompt]) => prompt.threadId === threadId).at(-1);
+  socket.send(JSON.stringify({
+    type: 'turn.inputSnapshot',
+    payload: { threadId, prompt: latest ? { id: latest[0], ...latest[1] } : null },
+  }));
+}
+
+function publishInputSnapshot(threadId: string) {
+  for (const socket of threadSockets.get(threadId) ?? []) sendInputSnapshot(socket, threadId);
+}
 
 bridge.on('message', async (message: Record<string, unknown>) => {
   if (typeof message.id === 'number' && typeof message.method === 'string') {
@@ -214,10 +229,22 @@ bridge.on('message', async (message: Record<string, unknown>) => {
     }
     return;
   }
-  if (threadId && ['turn/completed', 'turn/failed', 'turn/interrupted'].includes(String(message.method))) {
-    for (const [id, prompt] of pendingInput) {
-      if (prompt.threadId === threadId && prompt.turnId === eventTurnId) pendingInput.delete(id);
+  if (threadId && message.method === 'serverRequest/resolved') {
+    const requestId = paramsRecord?.requestId;
+    if (typeof requestId === 'number' && pendingInput.get(requestId)?.threadId === threadId) {
+      pendingInput.delete(requestId);
+      publishInputSnapshot(threadId);
     }
+  }
+  if (threadId && ['turn/completed', 'turn/failed', 'turn/interrupted'].includes(String(message.method))) {
+    let changed = false;
+    for (const [id, prompt] of pendingInput) {
+      if (prompt.threadId === threadId && (!eventTurnId || prompt.turnId === eventTurnId)) {
+        pendingInput.delete(id);
+        changed = true;
+      }
+    }
+    if (changed) publishInputSnapshot(threadId);
   }
   if (threadId && message.method === 'item/completed') {
     await projects.recordTaskExecution(threadId, eventTurnId, paramsRecord?.item).catch((error) => {
@@ -1077,9 +1104,7 @@ app.get('/api/ws', { websocket: true }, (socket, request) => {
       if (message.type === 'thread.subscribe') {
         projects.assertThreadProject(message.threadId, message.projectId);
         setSocketThread(socket, message.threadId);
-        for (const [id, prompt] of pendingInput) {
-          if (prompt.threadId === message.threadId) socket.send(JSON.stringify({ type: 'turn.input', payload: { id, ...prompt } }));
-        }
+        sendInputSnapshot(socket, message.threadId);
         return;
       }
       if (message.type === 'turn.start' && bridgeRecoveryPending) {
@@ -1102,15 +1127,29 @@ app.get('/api/ws', { websocket: true }, (socket, request) => {
         for (const peer of threadSockets.get(message.threadId) ?? []) {
           peer.send(JSON.stringify({ type: 'turn.inputAnswered', payload: { id: message.id } }));
         }
+        publishInputSnapshot(message.threadId);
         return;
       }
       if (message.type === 'turn.steer') {
         projects.assertThreadProject(message.threadId, message.projectId);
-        await bridge.call('turn/steer', {
-          threadId: message.threadId,
-          expectedTurnId: message.turnId,
-          input: [{ type: 'text', text: message.text, text_elements: [] }],
-        });
+        const key = JSON.stringify([message.projectId, message.threadId, message.turnId, message.clientRequestId]);
+        const now = Date.now();
+        for (const [id, entry] of steerRequests) {
+          if (entry.expiresAt <= now) steerRequests.delete(id);
+        }
+        let entry = steerRequests.get(key);
+        if (entry && entry.text !== message.text) throw new Error('追加指令的请求编号已用于其他内容');
+        if (!entry) {
+          if (steerRequests.size >= 512) throw new Error('追加指令过多，请稍后再试');
+          const result = bridge.call('turn/steer', {
+            threadId: message.threadId,
+            expectedTurnId: message.turnId,
+            input: [{ type: 'text', text: message.text, text_elements: [] }],
+          });
+          entry = { text: message.text, result, expiresAt: now + 5 * 60_000 };
+          steerRequests.set(key, entry);
+        }
+        await entry.result;
         socket.send(JSON.stringify({ type: 'turn.steered', payload: { threadId: message.threadId, id: message.clientRequestId } }));
         return;
       }

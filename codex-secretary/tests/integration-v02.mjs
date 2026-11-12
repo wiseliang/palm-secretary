@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { once } from 'node:events';
 import { mkdir, readFile, rm, stat, utimes, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import WebSocket from 'ws';
@@ -26,6 +27,7 @@ const testPassword = 'integration-password-v02';
 const testPasswordHash = await hashPassword(testPassword);
 const child = spawn(process.execPath, ['dist-server/index.js'], {
   cwd: root,
+  detached: process.platform !== 'win32',
   env: {
     ...process.env,
     APP_HOST: '127.0.0.1', APP_PORT: String(port), APP_ORIGIN: `http://127.0.0.1:${port}`,
@@ -226,10 +228,103 @@ try {
   if (((await (await api(`/api/tasks?projectId=${encodeURIComponent(project.id)}`)).json()).tasks).some((task) => task.threadId === accepted.threadId)) throw new Error('删除对话后关联任务仍残留');
   const css = await readFile(path.join(root, 'app', 'globals.css'), 'utf8');
   if (!css.includes('--sticky-context-offset') || !css.includes('--mobile-tabs-height') || !css.includes('top: var(--sticky-context-offset)')) throw new Error('冻结栏未使用统一偏移变量');
+  async function exchange(handle) {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/api/ws`, { headers: { ...commonHeaders, Cookie: sessionCookie } });
+    try {
+      return await new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('实时交互测试超时')), 5000);
+        ws.on('message', raw => {
+          try {
+            const event = JSON.parse(raw.toString());
+            if (event.type === 'error') throw new Error(event.message);
+            const result = handle(event, payload => ws.send(JSON.stringify(payload)));
+            if (result !== undefined) { clearTimeout(timer); resolve(result); }
+          } catch (error) { clearTimeout(timer); reject(error); }
+        });
+        ws.on('error', error => { clearTimeout(timer); reject(error); });
+      });
+    } finally { ws.close(); }
+  }
+  let liveThread;
+  let liveTurn;
+  const steerId = crypto.randomUUID();
+  let steerAcknowledged = false;
+  let livePrompt;
+  const prompt = await exchange((event, send) => {
+    if (event.type === 'ready') send({ type: 'turn.start', projectId: project.id, text: '测试运行中改变方向' });
+    if (event.type === 'turn.accepted') {
+      liveThread = event.threadId;
+      liveTurn = event.payload.turn.id;
+      send({ type: 'turn.steer', projectId: project.id, threadId: liveThread, turnId: liveTurn, clientRequestId: steerId, text: '改为询问示例选项' });
+    }
+    if (event.type === 'turn.steered') steerAcknowledged = event.payload.id === steerId;
+    if (event.type === 'turn.input') livePrompt = event.payload;
+    if (steerAcknowledged && livePrompt) return livePrompt;
+  });
+  if (!steerAcknowledged || prompt.turnId !== liveTurn) throw new Error('追加指令未在原轮次送达');
+  await exchange((event, send) => {
+    if (event.type === 'ready') send({ type: 'turn.steer', projectId: project.id, threadId: liveThread, turnId: liveTurn, clientRequestId: steerId, text: '改为询问示例选项' });
+    if (event.type === 'turn.steered' && event.payload.id === steerId) return true;
+  });
+  const liveRequests = (await readFile(logFile, 'utf8')).trim().split('\n').map(line => JSON.parse(line));
+  if (liveRequests.filter(request => request.method === 'turn/steer' && request.params.expectedTurnId === liveTurn).length !== 1) {
+    throw new Error('重放追加指令导致同一任务收到两次指令');
+  }
+  let answerAcknowledged = false;
+  let answerSent = false;
+  await exchange((event, send) => {
+    if (event.type === 'ready') send({ type: 'thread.subscribe', projectId: project.id, threadId: liveThread });
+    if (event.type === 'turn.inputSnapshot' && !answerSent) {
+      answerSent = true;
+      if (event.payload.prompt?.id !== prompt.id) throw new Error('重连未恢复原提问');
+      send({ type: 'turn.answer', projectId: project.id, threadId: liveThread, id: prompt.id, answers: { choice: '示例回答' } });
+    }
+    if (event.type === 'turn.inputAnswered') answerAcknowledged = event.payload.id === prompt.id;
+    if (event.type === 'codex.event' && event.payload?.method === 'item/agentMessage/delta') {
+      if (!answerAcknowledged || event.payload.params.delta !== 'FOLLOWED_NEW_DIRECTION' || event.payload.params.turnId !== liveTurn) throw new Error('回答后未在原轮次按新方向继续');
+      return true;
+    }
+  });
+  await exchange((event, send) => {
+    if (event.type === 'ready') send({ type: 'thread.subscribe', projectId: project.id, threadId: liveThread });
+    if (event.type === 'turn.inputSnapshot') {
+      if (event.payload.prompt !== null) throw new Error('已回答的问题在重连后重新出现');
+      return true;
+    }
+  });
+  let withdrawnThread;
+  let withdrawnTurn;
+  let promptWithdrawn = false;
+  await exchange((event, send) => {
+    if (event.type === 'ready') send({ type: 'turn.start', projectId: project.id, text: '测试运行中改变方向' });
+    if (event.type === 'turn.accepted') {
+      withdrawnThread = event.threadId;
+      withdrawnTurn = event.payload.turn.id;
+      send({ type: 'turn.steer', projectId: project.id, threadId: withdrawnThread, turnId: withdrawnTurn, clientRequestId: crypto.randomUUID(), text: '改为询问示例选项' });
+    }
+    if (event.type === 'turn.input') send({ type: 'turn.interrupt', threadId: withdrawnThread, turnId: withdrawnTurn });
+    if (event.type === 'turn.inputSnapshot' && event.payload.threadId === withdrawnThread && event.payload.prompt === null) promptWithdrawn = true;
+    if (event.type === 'codex.event' && event.payload?.method === 'serverRequest/resolved') {
+      if (!promptWithdrawn) throw new Error('Codex 撤回后网页仍显示原提问');
+      return true;
+    }
+  });
+  console.log('PALM_LIVE_INTERACTION_OK');
   console.log('PALM_V012_INTEGRATION_OK');
 } finally {
-  child.kill('SIGTERM');
-  await new Promise((resolve) => child.once('exit', resolve));
+  if (child.exitCode === null && child.signalCode === null) {
+    const exited = once(child, 'exit');
+    const signal = (name) => {
+      if (process.platform === 'win32') child.kill(name);
+      else {
+        try { process.kill(-child.pid, name); }
+        catch (error) { if (error.code !== 'ESRCH') throw error; }
+      }
+    };
+    const timeout = setTimeout(() => signal('SIGKILL'), 3000);
+    try { signal('SIGTERM'); await exited; }
+    finally { clearTimeout(timeout); }
+  }
   await rm(workspace, { recursive: true, force: true, maxRetries: 5, retryDelay: 150 });
   if (stderr) process.stderr.write(stderr);
 }

@@ -4,6 +4,8 @@ import path from 'node:path';
 
 let threadNumber = 0;
 const threadTurns = new Map();
+const liveTurns = new Map();
+const questionId = 1000000;
 const logFile = process.env.MOCK_LOG;
 
 function send(value) { process.stdout.write(`${JSON.stringify(value)}\n`); }
@@ -27,9 +29,43 @@ createInterface({ input: process.stdin }).on('line', async (line) => {
   }
   if (message.method === 'thread/resume') return send({ id: message.id, result: { thread: { id: message.params.threadId } } });
   if (message.method === 'thread/read') return send({ id: message.id, result: { thread: { id: message.params.threadId, turns: threadTurns.get(message.params.threadId) ?? [] } } });
-  if (message.method === 'turn/interrupt') return send({ id: message.id, result: {} });
+  if (message.method === 'turn/interrupt') {
+    const { threadId, turnId } = message.params;
+    send({ id: message.id, result: {} });
+    if (liveTurns.get(threadId) === turnId) {
+      liveTurns.delete(threadId);
+      send({ method: 'serverRequest/resolved', params: { threadId, requestId: questionId } });
+      send({ method: 'turn/interrupted', params: { threadId, turn: { id: turnId, status: 'interrupted' } } });
+    }
+    return;
+  }
+  if (message.id === questionId && message.result) {
+    const answer = message.result.answers?.choice?.answers?.[0];
+    for (const [threadId, turnId] of liveTurns) {
+      liveTurns.delete(threadId);
+      send({ method: 'item/agentMessage/delta', params: { threadId, turnId, delta: answer === '示例回答' ? 'FOLLOWED_NEW_DIRECTION' : 'INVALID_ANSWER' } });
+      send({ method: 'turn/completed', params: { threadId, turn: { id: turnId, status: 'completed' } } });
+    }
+    return;
+  }
+  if (message.method === 'turn/steer') {
+    const { threadId, expectedTurnId, input } = message.params;
+    if (liveTurns.get(threadId) !== expectedTurnId || input?.[0]?.text !== '改为询问示例选项') {
+      return send({ id: message.id, error: { message: 'Unexpected steer' } });
+    }
+    send({ id: message.id, result: { turnId: expectedTurnId } });
+    send({ id: questionId, method: 'item/tool/requestUserInput', params: {
+      threadId, turnId: expectedTurnId, questions: [{ id: 'choice', question: '请选择示例选项' }],
+    } });
+    return;
+  }
   if (message.method === 'turn/start') {
     const turnId = `turn-${Date.now()}`;
+    if (message.params.input?.[0]?.text === '测试运行中改变方向') {
+      liveTurns.set(message.params.threadId, turnId);
+      send({ id: message.id, result: { turn: { id: turnId, status: 'inProgress' } } });
+      return;
+    }
     if (!process.env.MOCK_EARLY_COMPLETION) send({ id: message.id, result: process.env.MOCK_LOST_START_RESPONSE ? {} : { turn: { id: turnId, status: 'inProgress' } } });
     setTimeout(async () => {
       const outbox = path.join(message.params.cwd, 'outbox');

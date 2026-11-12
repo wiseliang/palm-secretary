@@ -1497,9 +1497,18 @@ export default function Home() {
   const referenceDraft = useMemo(() => splitKnowledgeReference(draft), [draft]);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [focusedMessageId, setFocusedMessageId] = useState<string>();
-  const [steerDelivery, setSteerDelivery] = useState<{ id: string; threadId: string; text: string; status: string }>();
-  const steerPending = useRef<{ id: string; threadId: string; text: string; timer: ReturnType<typeof setTimeout> } | null>(null);
+  type SteerEntry = { id: string; projectId: string; threadId: string; turnId: string; text: string; status: string };
+  const [steerDeliveries, setSteerDeliveries] = useState<SteerEntry[]>([]);
+  const steerPending = useRef<(Omit<SteerEntry, "status"> & { timer: ReturnType<typeof setTimeout> }) | null>(null);
+  const setSteerDelivery = useCallback((entry: SteerEntry) => {
+    setSteerDeliveries(current => current.some(item => item.id === entry.id)
+      ? current.map(item => item.id === entry.id ? entry : item)
+      : [...current.slice(-49), entry]);
+  }, []);
   const latestSteerDraft = useRef("");
+  const [answerDelivery, setAnswerDelivery] = useState<{ id: number; status: string }>();
+  const answerTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const answerInFlight = useRef<number | undefined>(undefined);
   const [inputPrompt, setInputPrompt] = useState<{
     id: number; threadId: string; turnId: string;
     questions: { id: string; question: string; isSecret?: boolean; options?: { label: string }[] | null }[];
@@ -2318,6 +2327,13 @@ export default function Home() {
         }
         reconnectAttemptRef.current = 0;
         setConnection("已连接");
+        const steer = steerPending.current;
+        if (steer?.projectId === projectId && steer.threadId === threadIdRef.current) {
+          socket.send(JSON.stringify({
+            type: "turn.steer", clientRequestId: steer.id,
+            projectId, threadId: steer.threadId, turnId: steer.turnId, text: steer.text,
+          }));
+        }
         if (threadIdRef.current) {
           socket.send(
             JSON.stringify({
@@ -2396,13 +2412,39 @@ export default function Home() {
           setNotice("收到无法识别的服务器消息");
           return;
         }
+        if (message.type === "turn.inputSnapshot") {
+          if (message.payload?.threadId !== threadIdRef.current) return;
+          const prompt = (message.payload?.prompt ?? undefined) as typeof inputPrompt;
+          setInputPrompt(prompt);
+          if (answerInFlight.current !== undefined && answerInFlight.current !== prompt?.id) {
+            clearTimeout(answerTimer.current);
+            answerInFlight.current = undefined;
+          }
+          return;
+        }
         if (message.type === "turn.input") {
           const prompt = message.payload as typeof inputPrompt;
           if (prompt?.threadId === threadIdRef.current) setInputPrompt(prompt);
           return;
         }
         if (message.type === "turn.inputAnswered") {
-          setInputPrompt((current) => current?.id === message.payload?.id ? undefined : current);
+          const id = message.payload?.id;
+          if (answerInFlight.current === id) {
+            clearTimeout(answerTimer.current);
+            answerInFlight.current = undefined;
+            setNotice("回答已接收");
+          }
+          setInputPrompt((current) => current?.id === id ? undefined : current);
+          if (typeof id === "number") setAnswerDelivery({ id, status: "回答已接收，助理继续执行" });
+          return;
+        }
+        if (message.type === "error" && message.operation === "turn.answer") {
+          const id = answerInFlight.current;
+          if (id !== undefined) {
+            clearTimeout(answerTimer.current);
+            answerInFlight.current = undefined;
+            setAnswerDelivery({ id, status: message.message ?? "回答发送失败" });
+          }
           return;
         }
         if (message.type === "error" && message.operation === "turn.steer") {
@@ -2421,7 +2463,9 @@ export default function Home() {
             steerPending.current = null;
             setSteerDelivery({ ...pending, status: "已接收" });
             if (threadIdRef.current === pending.threadId && latestSteerDraft.current.trim() === pending.text) {
-              updateQuestion("");
+              latestSteerDraft.current = "";
+              setDraft("");
+              window.localStorage.removeItem(`palm:draft:${pending.projectId}`);
             }
           }
           return;
@@ -2488,6 +2532,9 @@ export default function Home() {
           return;
         }
         if (message.type === "codex.offline") {
+          setInputPrompt(undefined);
+          clearTimeout(answerTimer.current);
+          answerInFlight.current = undefined;
           setConnection("正在重连");
           setNotice("Codex 服务正在恢复连接");
           void loadProjectData(projectIdRef.current);
@@ -2654,6 +2701,7 @@ export default function Home() {
     loadDashboard,
     loadProjectData,
     handleFinishedTask,
+    setSteerDelivery,
     updateRun,
     projectId,
     recoverFinishedTasks,
@@ -3507,7 +3555,7 @@ export default function Home() {
         }
         if (steerPending.current) return;
         const id = crypto.randomUUID();
-        const entry = { id, threadId, text };
+        const entry = { id, projectId, threadId, turnId, text };
         const timer = setTimeout(() => {
           if (steerPending.current?.id !== id) return;
           steerPending.current = null;
@@ -5423,7 +5471,8 @@ export default function Home() {
               <section className="chat-list" aria-live="polite">
                 {historyBefore && <button disabled={loadingOlder} onClick={() => void loadOlderHistory()}>{loadingOlder ? "正在读取…" : "加载更早记录"}</button>}
                 {messages.map((message) => (
-                  <MessageRow key={message.id} message={message} projectId={projectId}
+                  <div key={message.id}>
+                  <MessageRow message={message} projectId={projectId}
                     files={files} focused={focusedMessageId === message.id} onNotice={setNotice}
                     development={
 message.role === "assistant" &&
@@ -5442,7 +5491,61 @@ message.role === "assistant" &&
                           />
                         )
                     } />
+                  {message.role === "user" && steerDeliveries.some(entry =>
+                    entry.threadId === threadId && entry.turnId === message.turnId &&
+                    entry.text === message.text && entry.status !== "发送中"
+                  ) && <p className="composer-note" role="status">调整方向 · 已进入对话记录</p>}
+                  </div>
                 ))}
+                {steerDeliveries.filter(entry => entry.threadId === threadId &&
+                  !messages.some(message =>
+                    message.role === "user" && message.turnId === entry.turnId && message.text === entry.text
+                  )).map(entry => (
+                    <div key={entry.id}>
+                      <MessageRow message={{ id: entry.id, role: "user", text: entry.text }}
+                        projectId={projectId} files={files} focused={false} onNotice={setNotice} />
+                      <p className="composer-note" role="status">调整方向 · {entry.status === "已接收" ? "已送达，等待助理处理" : entry.status}</p>
+                    </div>
+                  ))}
+          {running && inputPrompt && inputPrompt.threadId === threadId && (!turnId || inputPrompt.turnId === turnId) && (
+            <form key={inputPrompt.id} className="composer-note" onSubmit={(event) => {
+              event.preventDefault();
+              if (socketRef.current?.readyState !== WebSocket.OPEN) return;
+              if (answerInFlight.current === inputPrompt.id) return;
+              const id = inputPrompt.id;
+              answerInFlight.current = id;
+              setAnswerDelivery({ id, status: "正在提交回答…" });
+              clearTimeout(answerTimer.current);
+              answerTimer.current = setTimeout(() => {
+                if (answerInFlight.current !== id) return;
+                answerInFlight.current = undefined;
+                setAnswerDelivery({ id, status: "未收到确认，请核对任务进度" });
+              }, 15000);
+              const answers = Object.fromEntries(new FormData(event.currentTarget));
+              socketRef.current.send(JSON.stringify({
+                type: "turn.answer", projectId, threadId, id: inputPrompt.id, answers,
+              }));
+            }}>
+              <strong>助理正在等待你的回答</strong>
+              {inputPrompt.questions.map((question) => (
+                <div key={question.id}>
+                  <label>
+                    {question.question}
+                    <input name={question.id} required autoComplete="off"
+                      type={question.isSecret ? "password" : "text"}
+                      list={!question.isSecret && question.options?.length ? `input-${inputPrompt.id}-${question.id}` : undefined} />
+                  </label>
+                  {!question.isSecret && question.options?.length ? (
+                    <datalist id={`input-${inputPrompt.id}-${question.id}`}>
+                      {question.options.map(({ label }) => <option key={label} value={label} />)}
+                    </datalist>
+                  ) : null}
+                </div>
+              ))}
+              <button type="submit" disabled={connection !== "已连接" || (answerDelivery?.id === inputPrompt.id && answerDelivery.status === "正在提交回答…")}>提交回答</button>
+              {answerDelivery?.id === inputPrompt.id && <span role="status">{answerDelivery.status}</span>}
+            </form>
+          )}
               </section>
             )}
           </div>
@@ -5598,37 +5701,6 @@ message.role === "assistant" &&
               </section>
             </>
           )}
-          {running && inputPrompt && inputPrompt.threadId === threadId && inputPrompt.turnId === turnId && (
-            <form key={inputPrompt.id} className="composer-note" onSubmit={(event) => {
-              event.preventDefault();
-              if (socketRef.current?.readyState !== WebSocket.OPEN) return;
-              const answers = Object.fromEntries(new FormData(event.currentTarget));
-              socketRef.current.send(JSON.stringify({
-                type: "turn.answer", projectId, threadId, id: inputPrompt.id, answers,
-              }));
-            }}>
-              <strong>助理正在等待你的回答</strong>
-              {inputPrompt.questions.map((question) => (
-                <div key={question.id}>
-                  <label>
-                    {question.question}
-                    <input name={question.id} required autoComplete="off"
-                      type={question.isSecret ? "password" : "text"}
-                      list={!question.isSecret && question.options?.length ? `input-${inputPrompt.id}-${question.id}` : undefined} />
-                  </label>
-                  {!question.isSecret && question.options?.length ? (
-                    <datalist id={`input-${inputPrompt.id}-${question.id}`}>
-                      {question.options.map(({ label }) => <option key={label} value={label} />)}
-                    </datalist>
-                  ) : null}
-                </div>
-              ))}
-              <button type="submit" disabled={connection !== "已连接"}>提交回答</button>
-            </form>
-          )}
-          {steerDelivery?.threadId === threadId && steerDelivery && (
-            <p className="composer-note" role="status">补充指令 · {steerDelivery.status}：{steerDelivery.text}</p>
-          )}
           <form className="composer" onSubmit={sendTask}>
             <input
               ref={fileRef}
@@ -5674,6 +5746,12 @@ message.role === "assistant" &&
               value={referenceDraft.question}
               onChange={(event) => {
                 updateQuestion(event.target.value);
+              }}
+              onKeyDown={(event) => {
+                if (event.key !== "Enter" || event.shiftKey || event.nativeEvent.isComposing ||
+                  !window.matchMedia("(pointer: fine)").matches) return;
+                event.preventDefault();
+                event.currentTarget.form?.querySelector<HTMLButtonElement>(".send-button")?.click();
               }}
               placeholder={
                 activeProject?.archivedAt
