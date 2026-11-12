@@ -41,6 +41,16 @@ export function mergeSnapshot<T extends SyncMessage>(current: T[], snapshot: T[]
     const merged = { ...live, ...stored, id: live.id, text };
     next[index] = JSON.stringify(merged) === JSON.stringify(live) ? live : merged;
   }
+  // Server snapshots carry the authoritative item order. Correct matched slots
+  // without dropping optimistic messages absent from this snapshot.
+  const ordered = [...matched].sort((a, b) => a - b);
+  const snapshotOrder = snapshot.map(stored => next.find(live =>
+    live.id === stored.id || (live.itemId && live.itemId === stored.itemId && live.turnId === stored.turnId) ||
+    (!live.itemId && live.turnId === stored.turnId && live.role === stored.role && live.text === stored.text)))
+    .filter((item): item is T => !!item);
+  if (snapshotOrder.length === ordered.length && new Set(snapshotOrder).size === ordered.length) {
+    ordered.forEach((slot, i) => { next[slot] = snapshotOrder[i]; });
+  }
   return next.length === current.length && next.every((item, i) => item === current[i]) ? current : next;
 }
 

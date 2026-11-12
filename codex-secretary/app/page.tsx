@@ -1494,6 +1494,9 @@ export default function Home() {
   const referenceDraft = useMemo(() => splitKnowledgeReference(draft), [draft]);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [focusedMessageId, setFocusedMessageId] = useState<string>();
+  const [steerDelivery, setSteerDelivery] = useState<{ id: string; threadId: string; text: string; status: string }>();
+  const steerPending = useRef<{ id: string; threadId: string; text: string; timer: ReturnType<typeof setTimeout> } | null>(null);
+  const latestSteerDraft = useRef("");
   const [inputPrompt, setInputPrompt] = useState<{
     id: number; threadId: string; turnId: string;
     questions: { id: string; question: string; isSecret?: boolean; options?: { label: string }[] | null }[];
@@ -2393,8 +2396,25 @@ export default function Home() {
           setInputPrompt((current) => current?.id === message.payload?.id ? undefined : current);
           return;
         }
+        if (message.type === "error" && message.operation === "turn.steer") {
+          const pending = steerPending.current;
+          if (pending && pending.id === message.clientRequestId) {
+            clearTimeout(pending.timer);
+            steerPending.current = null;
+            setSteerDelivery({ ...pending, status: message.message || "发送失败" });
+          }
+          return;
+        }
         if (message.type === "turn.steered") {
-          if (message.payload?.threadId === threadIdRef.current) setNotice("补充指令已发送");
+          const pending = steerPending.current;
+          if (pending && message.payload?.id === pending.id) {
+            clearTimeout(pending.timer);
+            steerPending.current = null;
+            setSteerDelivery({ ...pending, status: "已接收" });
+            if (threadIdRef.current === pending.threadId && latestSteerDraft.current.trim() === pending.text) {
+              updateQuestion("");
+            }
+          }
           return;
         }
         if (message.type === "turn.accepted") {
@@ -2520,6 +2540,15 @@ export default function Home() {
             ? rpc.params.threadId
             : undefined;
         if (eventThreadId && eventThreadId !== threadIdRef.current) return;
+        if (rpc.method === "item/started") {
+          const item = rpc.params?.item as { id?: string; type?: string } | undefined;
+          const turnId = String(rpc.params?.turnId ?? "");
+          if (item?.type === "agentMessage" && item.id && turnId) {
+            const itemId = item.id;
+            flushDeltas();
+            setMessages(items => applyAgentText(items, { turnId, itemId, text: "" }));
+          }
+        }
         if (rpc.method === "item/started" || rpc.method === "item/completed") {
           const step = executionStep(
             rpc.params?.item,
@@ -3467,7 +3496,17 @@ export default function Home() {
         if (!threadId || !turnId || socketRef.current?.readyState !== WebSocket.OPEN) {
           throw new Error("当前任务尚未就绪，请稍后再试");
         }
-        socketRef.current.send(JSON.stringify({ type: "turn.steer", projectId, threadId, turnId, text }));
+        if (steerPending.current) return;
+        const id = crypto.randomUUID();
+        const entry = { id, threadId, text };
+        const timer = setTimeout(() => {
+          if (steerPending.current?.id !== id) return;
+          steerPending.current = null;
+          setSteerDelivery({ ...entry, status: "未收到确认，请先核对任务进展" });
+        }, 15000);
+        steerPending.current = { ...entry, timer };
+        setSteerDelivery({ ...entry, status: "发送中" });
+        socketRef.current.send(JSON.stringify({ type: "turn.steer", clientRequestId: id, projectId, threadId, turnId, text }));
         return;
       }
       startTurn(text, attachments, threadId, storageMaintenance);
@@ -3475,6 +3514,7 @@ export default function Home() {
   }
 
   function updateQuestion(question: string) {
+    latestSteerDraft.current = question;
     try {
       const value = replaceReferenceQuestion(draft, question);
       if (value) window.localStorage.setItem(`palm:draft:${projectId}`, value);
@@ -5574,6 +5614,9 @@ message.role === "assistant" &&
               ))}
               <button type="submit" disabled={connection !== "已连接"}>提交回答</button>
             </form>
+          )}
+          {steerDelivery?.threadId === threadId && steerDelivery && (
+            <p className="composer-note" role="status">补充指令 · {steerDelivery.status}：{steerDelivery.text}</p>
           )}
           <form className="composer" onSubmit={sendTask}>
             <input

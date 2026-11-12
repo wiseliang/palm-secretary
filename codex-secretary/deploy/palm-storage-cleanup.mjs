@@ -31,7 +31,13 @@ async function inventory() {
     entries.push({ name, path: resolved, modifiedAt: info.mtime.toISOString(), sizeBytes: await directorySize(resolved) });
   }
   entries.sort((a, b) => b.modifiedAt.localeCompare(a.modifiedAt));
-  const rollback = entries.find((entry) => entry.path !== current && entry.sizeBytes >= 100 * 1024 * 1024);
+  const pinned = await realpath('/opt/palm-secretary/rollback').catch(error => {
+    if (error?.code === 'ENOENT') return undefined;
+    throw error;
+  });
+  if (pinned && path.dirname(pinned) !== root) fail('rollback 不在发布目录中');
+  const rollback = entries.find((entry) => entry.path === pinned && entry.path !== current)
+    ?? entries.find((entry) => entry.path !== current && entry.sizeBytes >= 100 * 1024 * 1024);
   const protectedNames = new Set([path.basename(current), rollback?.name].filter(Boolean));
   const candidates = entries.filter((entry) => !protectedNames.has(entry.name));
   const fingerprint = JSON.stringify({ current: path.basename(current), rollback: rollback?.name, candidates: candidates.map(({ name, sizeBytes, modifiedAt }) => ({ name, sizeBytes, modifiedAt })) });

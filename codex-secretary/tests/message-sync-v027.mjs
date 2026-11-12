@@ -20,6 +20,8 @@ assert.equal(messages[0].id, 'placeholder');
 assert.equal(messages[0].text, 'final', 'authoritative completion can correct streamed text');
 assert.equal(applyAgentText(messages, { turnId: 't', itemId: 'one', text: 'late' }), messages);
 assert.equal(mergeSnapshot(messages, messages), messages);
+const reversed = [messages[1], messages[0]];
+assert.deepEqual(mergeSnapshot(reversed, messages).map(item => item.itemId), ['one', 'two'], 'snapshot corrects out-of-order live replies');
 console.log('PALM_V027_MESSAGE_SYNC_OK');
 
 const { readFileSync } = await import('node:fs');

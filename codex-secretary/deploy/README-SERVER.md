@@ -34,3 +34,12 @@
 - “完整访问”仅指 Codex 沙箱；进程仍是无 sudo 的 `codex` 普通用户，并继续受 systemd 的可写路径约束。
 - 项目数据持久化在 `/home/codex/workspace/.palm/state.json`，项目目录位于 `/home/codex/workspace/projects/`。
 - 模型列表由当前 ChatGPT Plus 登录的 `model/list` 实时提供；每个项目独立保存模型与推理强度。
+
+For application updates on an existing server, run
+`sudo bash codex-secretary/deploy/release-from-git.sh` from a clean checkout of the
+reviewed commit. This command is separate from first-time installation. It
+builds from tracked source, installs independent dependencies, runs download
+checks, and records the Git revision and checksums. It shares the storage
+cleanup lock, refuses to switch while tasks are running or pending
+reconciliation, and restores the previous release if startup checks fail.
+After success, the previous release is explicitly protected from cleanup.

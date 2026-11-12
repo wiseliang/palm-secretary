@@ -1028,7 +1028,7 @@ app.delete<{ Querystring: { path?: string; projectId?: string } }>('/api/files',
 const clientMessage = z.discriminatedUnion('type', [
   z.object({ type: z.literal('turn.start'), clientRequestId: z.string().uuid().optional(), projectId: z.string().min(1).max(64), threadId: z.string().optional(), text: z.string().min(1).max(50_000), attachments: z.array(z.string()).max(10).optional(), maintenance: z.literal('storage').optional() }),
   z.object({ type: z.literal('turn.answer'), id: z.number().int(), projectId: z.string(), threadId: z.string(), answers: z.record(z.string(), z.string().max(10000)) }),
-  z.object({ type: z.literal('turn.steer'), projectId: z.string().min(1).max(64), threadId: z.string(), turnId: z.string(), text: z.string().trim().min(1).max(50_000) }),
+  z.object({ type: z.literal('turn.steer'), clientRequestId: z.string().uuid(), projectId: z.string().min(1).max(64), threadId: z.string(), turnId: z.string(), text: z.string().trim().min(1).max(50_000) }),
   z.object({ type: z.literal('turn.interrupt'), threadId: z.string(), turnId: z.string() }),
   z.object({ type: z.literal('thread.subscribe'), projectId: z.string().min(1).max(64), threadId: z.string() }),
 ]);
@@ -1055,7 +1055,7 @@ app.get('/api/ws', { websocket: true }, (socket, request) => {
       if (!parsed.success) throw new Error('消息格式无效');
       const message = parsed.data;
       operation = message.type;
-      clientRequestId = message.type === 'turn.start' ? message.clientRequestId : undefined;
+      clientRequestId = message.type === 'turn.start' || message.type === 'turn.steer' ? message.clientRequestId : undefined;
       app.log.info({ event: message.type }, '收到已认证的 WebSocket 操作');
       if (message.type === 'thread.subscribe') {
         projects.assertThreadProject(message.threadId, message.projectId);
@@ -1094,7 +1094,7 @@ app.get('/api/ws', { websocket: true }, (socket, request) => {
           expectedTurnId: message.turnId,
           input: [{ type: 'text', text: message.text, text_elements: [] }],
         });
-        socket.send(JSON.stringify({ type: 'turn.steered', payload: { threadId: message.threadId } }));
+        socket.send(JSON.stringify({ type: 'turn.steered', payload: { threadId: message.threadId, id: message.clientRequestId } }));
         return;
       }
       if (message.type === 'turn.interrupt') {
