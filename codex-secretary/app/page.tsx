@@ -7,6 +7,7 @@ import {
   memo,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -184,10 +185,12 @@ type ServerStatus = {
   sudo?: { available: boolean };
 };
 type StorageCleanupPlan = {
+  currentCli?: string;
+  rollbackCli?: string;
   planId: string;
   currentRelease: string;
   rollbackRelease?: string;
-  candidates: Array<{ name: string; sizeBytes: number; modifiedAt: string }>;
+  candidates: Array<{ name: string; sizeBytes: number; modifiedAt: string; category?: 'releases' | 'codex' }>;
   reclaimableBytes: number;
   expiresInSeconds: number;
 };
@@ -1515,6 +1518,12 @@ export default function Home() {
   const [cleanupPlan, setCleanupPlan] = useState<StorageCleanupPlan>();
   const [cleanupDialogOpen, setCleanupDialogOpen] = useState(false);
   const [cleanupBusy, setCleanupBusy] = useState(false);
+  useLayoutEffect(() => {
+    if (view !== 'history') return;
+    document.querySelector('.panel-stage')?.scrollTo({ top: 0, behavior: 'instant' });
+    window.scrollTo({ top: 0, behavior: 'instant' });
+  }, [view]);
+  const [cleanupSelection, setCleanupSelection] = useState<'releases' | 'codex' | 'both'>('releases');
   const [runtimeOpen, setRuntimeOpen] = useState(false);
   const [openMenu, setOpenMenu] = useState<OpenMenu>();
   const [projectDialog, setProjectDialog] = useState<ProjectDialog>();
@@ -1822,7 +1831,7 @@ export default function Home() {
     try {
       const response = await fetch('/api/storage/cleanup', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ planId: cleanupPlan.planId, confirmed: true }),
+        body: JSON.stringify({ planId: cleanupPlan.planId, confirmed: true, selection: cleanupSelection }),
       });
       const body = await response.json() as { releasedBytes?: number; removed?: string[]; error?: string };
       if (!response.ok) throw new Error(body.error ?? '清理失败');
@@ -4583,15 +4592,17 @@ export default function Home() {
                 <button type="button" aria-label="关闭" disabled={cleanupBusy} onClick={() => setCleanupDialogOpen(false)}><X size={18} weight="bold" /></button>
               </header>
               {cleanupPlan ? <>
-                <div className="cleanup-space-summary"><strong>预计释放 {bytes(cleanupPlan.reclaimableBytes)}</strong><span>当前版本和一个完整回滚版本会自动保留</span></div>
+                <label>清理内容 <select disabled={cleanupBusy} value={cleanupSelection} onChange={event => setCleanupSelection(event.target.value as 'releases' | 'codex' | 'both')}><option value="releases">掌心助理历史版本</option><option value="codex">Codex CLI 历史版本</option><option value="both">全部历史版本</option></select></label>
+                <div className="cleanup-space-summary"><strong>预计释放 {bytes(cleanupPlan.candidates.filter(item => cleanupSelection === 'both' || (item.category ?? 'releases') === cleanupSelection).reduce((sum, item) => sum + item.sizeBytes, 0))}</strong><span>当前版本和一个完整回滚版本会自动保留</span></div>
                 <ul className="cleanup-target-list">
-                  {cleanupPlan.candidates.length ? cleanupPlan.candidates.map((item) => <li key={item.name}><span>{item.name}</span><strong>{bytes(item.sizeBytes)}</strong></li>) : <li><span>没有可安全清理的旧版本</span></li>}
+                  {cleanupPlan.candidates.filter(item => cleanupSelection === 'both' || (item.category ?? 'releases') === cleanupSelection).map((item) => <li key={`${item.category}-${item.name}`}><span>{item.category === 'codex' ? 'Codex CLI ' : ''}{item.name}</span><strong>{bytes(item.sizeBytes)}</strong></li>)}
+                  {!cleanupPlan.candidates.some(item => cleanupSelection === 'both' || (item.category ?? 'releases') === cleanupSelection) && <li>没有可安全清理的旧版本</li>}
                 </ul>
-                <p>受保护：当前 {cleanupPlan.currentRelease}{cleanupPlan.rollbackRelease ? `；回滚 ${cleanupPlan.rollbackRelease}` : '；暂无可用回滚版本'}。执行时会再次校验路径、运行进程和计划有效性。</p>
+                <p>掌心助理：当前 {cleanupPlan.currentRelease}；回滚 {cleanupPlan.rollbackRelease ?? '无'}。Codex CLI：当前 {cleanupPlan.currentCli ?? '未知'}；回滚 {cleanupPlan.rollbackCli ?? '无'}。正在使用的版本不会删除。</p>
               </> : <p role="status">正在自动检查可安全回收的空间…</p>}
               <footer>
                 <button type="button" disabled={cleanupBusy} onClick={() => setCleanupDialogOpen(false)}>取消</button>
-                <button type="button" className="primary danger-confirm" disabled={cleanupBusy || !cleanupPlan || cleanupPlan.candidates.length === 0} onClick={() => void confirmStorageCleanup()}>{cleanupBusy ? '正在处理…' : '确认并清理'}</button>
+                <button type="button" className="primary danger-confirm" disabled={cleanupBusy || !cleanupPlan?.candidates.some(item => cleanupSelection === 'both' || (item.category ?? 'releases') === cleanupSelection)} onClick={() => void confirmStorageCleanup()}>{cleanupBusy ? '正在处理…' : '确认并清理'}</button>
               </footer>
             </section>
           </div>
@@ -5695,7 +5706,7 @@ message.role === "assistant" &&
                 className="send-button"
                 disabled={
                   uploading ||
-                  projectBusy ||
+                  (running ? !turnId || !referenceDraft.question.trim() : projectBusy) ||
                   Boolean(activeProject?.archivedAt) ||
                   (!referenceDraft.question.trim() && !attachments.length) ||
                   connection !== "已连接"

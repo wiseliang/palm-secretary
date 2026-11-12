@@ -1,6 +1,9 @@
 package cloud.wiseliang.palmsecretary.quizassistant.overlay;
 
 import android.content.Context;
+import android.os.Build;
+import android.hardware.display.DisplayManager;
+import android.view.Display;
 import android.view.WindowManager;
 
 import cloud.wiseliang.palmsecretary.quizassistant.accessibility.AccessibilityTreeReader;
@@ -12,9 +15,15 @@ public final class QuizOverlayController {
     private final AnswerCardController answerCard;
 
     public QuizOverlayController(Context context, Runnable manualCapture, Runnable dismissed) {
-        WindowManager windowManager = (WindowManager) context.getSystemService(Context.WINDOW_SERVICE);
-        answerCard = new AnswerCardController(context, windowManager, manualCapture, dismissed);
-        floatingBall = new FloatingBallController(context, windowManager, manualCapture::run);
+        // Bind both overlays to a fresh accessibility window context for this connection.
+        // A service's cached WindowManager can retain an invalid token after rebinding.
+        Context overlayContext = Build.VERSION.SDK_INT >= 30
+            ? context.createWindowContext(((DisplayManager) context.getSystemService(Context.DISPLAY_SERVICE))
+                .getDisplay(Display.DEFAULT_DISPLAY), WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY, null)
+            : context;
+        WindowManager windowManager = (WindowManager) overlayContext.getSystemService(Context.WINDOW_SERVICE);
+        answerCard = new AnswerCardController(overlayContext, windowManager, manualCapture, dismissed);
+        floatingBall = new FloatingBallController(overlayContext, windowManager, manualCapture::run);
     }
 
     public void showOverlay() {

@@ -19,6 +19,7 @@ import { readGitSnapshot } from './development-status.js';
 import { enrichDevelopmentResultWithGithub } from './github-status.js';
 import { resolveModelSelection, type CodexModel } from './model-selection.js';
 import { CliVersionChecker } from './cli-version.js';
+import { cleanupCliVersions, loadUpdateScript } from './cli-update.js';
 import { SessionStore } from './session-store.js';
 import { submissionEvidence, turnStatus } from './task-reconciliation.js';
 import { TaskReconciler } from './task-reconciler.js';
@@ -378,19 +379,25 @@ app.get<{ Querystring: { refresh?: string } }>('/api/codex/version', async (requ
 app.post('/api/codex/update', async (request, reply) => {
   if (!requireOwner(request, reply)) return;
   if (cliUpdateInFlight) return reply.code(409).send({ error: 'Codex CLI 正在更新' });
-  if (projects.runningTaskIds().length > 0) {
+  if (projects.runningTaskIds().length > 0 || startingProjects.size > 0) {
     return reply.code(409).send({ error: '有任务正在运行，请等待任务结束后再更新' });
   }
 
-  const before = await cliVersionChecker.get(true);
+  cliUpdateInFlight = true;
+  const before = await cliVersionChecker.get(true).catch(() => undefined);
+  if (!before) { cliUpdateInFlight = false; return reply.code(503).send({ error: '版本检查失败，请重试' }); }
   if (before.state === 'unavailable' || !before.latestVersion) {
+    cliUpdateInFlight = false;
     return reply.code(503).send({ error: before.error ?? '暂时无法确定最新版本' });
   }
-  if (!before.updateAvailable) return { updated: false, version: before.installedVersion, status: before };
+  if (!before.updateAvailable) { cliUpdateInFlight = false; return { updated: false, version: before.installedVersion, status: before }; }
 
   cliUpdateInFlight = true;
+  let previousProxy: Buffer | undefined;
   try {
-    const { stdout } = await execFileAsync('/bin/bash', [config.codexUpdateScript, before.latestVersion], {
+    previousProxy = await readFile(config.codexBin);
+    const script = await loadUpdateScript(config.codexUpdateScript);
+    const { stdout } = await execFileAsync('/bin/bash', ['-c', script, 'palm-cli-update', before.latestVersion], {
       cwd: path.dirname(config.codexUpdateScript),
       timeout: 5 * 60_000,
       maxBuffer: 1024 * 1024,
@@ -401,9 +408,17 @@ app.post('/api/codex/update', async (request, reply) => {
     await bridge.restart();
     const status = await cliVersionChecker.get(true);
     if (status.installedVersion !== before.latestVersion) throw new Error('更新后的版本验证失败');
+    const removedVersions = await cleanupCliVersions(path.join(config.codexHome, 'packages/npm'),
+      [status.installedVersion!, before.installedVersion!]).catch(() => []);
     app.log.info({ event: 'codex.cli.updated', from: before.installedVersion, to: status.installedVersion });
-    return { updated: true, version: status.installedVersion, status };
+    return { updated: true, version: status.installedVersion, status, removedVersions };
   } catch (error) {
+    const rollback = `${config.codexBin}.rollback-${randomUUID()}`;
+    if (previousProxy) await import('node:fs/promises').then(async ({ writeFile }) => {
+      await writeFile(rollback, previousProxy!, { mode: 0o700 });
+      await rename(rollback, config.codexBin);
+      await bridge.restart();
+    }).catch(() => app.log.error({ event: 'codex.cli.rollback_failed' }));
     app.log.error({ event: 'codex.cli.update_failed', error: error instanceof Error ? error.message : String(error) });
     return reply.code(500).send({ error: 'Codex CLI 更新失败，原版本仍可继续使用' });
   } finally {
@@ -423,10 +438,11 @@ app.get('/api/storage/cleanup-plan', async (request, reply) => {
 
 app.post('/api/storage/cleanup', async (request, reply) => {
   if (!requireOwner(request, reply)) return;
-  const parsed = z.object({ planId: z.string().length(24), confirmed: z.literal(true) }).safeParse(request.body);
+  const parsed = z.object({ planId: z.string().length(24), confirmed: z.literal(true), selection: z.enum(['releases', 'codex', 'both']).default('releases') }).safeParse(request.body);
   if (!parsed.success) return reply.code(400).send({ error: '需要确认有效的清理计划' });
   try {
-    return await executeStorageCleanup(parsed.data.planId, parsed.data.confirmed);
+    if (cliUpdateInFlight) return reply.code(409).send({ error: 'Codex 更新期间不能清理版本' });
+    return await executeStorageCleanup(parsed.data.planId, parsed.data.confirmed, parsed.data.selection);
   } catch (error) {
     request.log.warn({ err: error }, '磁盘清理未执行');
     return reply.code(409).send({ error: error instanceof Error ? error.message : '磁盘清理失败' });
@@ -1056,6 +1072,7 @@ app.get('/api/ws', { websocket: true }, (socket, request) => {
       const message = parsed.data;
       operation = message.type;
       clientRequestId = message.type === 'turn.start' || message.type === 'turn.steer' ? message.clientRequestId : undefined;
+      if (message.type === 'turn.start' && cliUpdateInFlight) throw new Error('Codex CLI 正在更新，请稍后提交任务');
       app.log.info({ event: message.type }, '收到已认证的 WebSocket 操作');
       if (message.type === 'thread.subscribe') {
         projects.assertThreadProject(message.threadId, message.projectId);
@@ -1134,6 +1151,7 @@ app.get('/api/ws', { websocket: true }, (socket, request) => {
       if (disk.tasksPaused && !storageMaintenance) throw new Error('磁盘可用空间低于安全线；请开启“存储维护模式”后再执行清理任务');
       if (storageMaintenance && message.attachments?.length) throw new Error('存储维护模式不接收新附件，请直接说明要检查或清理的内容');
       if (startingProjects.has(message.projectId) || projects.hasRunningTask(message.projectId)) throw new Error('当前项目已有任务正在运行，请等待完成后再开始新任务');
+      if (cliUpdateInFlight) throw new Error('Codex CLI 正在更新，请稍后提交任务');
       startingProjects.add(message.projectId);
       projectReserved = true;
       let threadId = message.threadId;

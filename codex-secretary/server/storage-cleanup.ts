@@ -30,7 +30,7 @@ export async function createStorageCleanupPlan(): Promise<StorageCleanupPlan> {
   return value;
 }
 
-export async function executeStorageCleanup(planId: string, confirmed: boolean): Promise<unknown> {
+export async function executeStorageCleanup(planId: string, confirmed: boolean, selection = 'releases'): Promise<unknown> {
   if (!confirmed) throw new Error('需要人工确认');
   if (cleanupInFlight) throw new Error('已有清理任务正在执行');
   if (!latestPlan || latestPlan.expiresAt < Date.now() || latestPlan.value.planId !== planId) {
@@ -38,7 +38,7 @@ export async function executeStorageCleanup(planId: string, confirmed: boolean):
   }
   cleanupInFlight = true;
   try {
-    const result = await runHelper('execute', planId);
+    const result = await runHelper('execute', planId, selection);
     latestPlan = undefined;
     return result;
   } finally {

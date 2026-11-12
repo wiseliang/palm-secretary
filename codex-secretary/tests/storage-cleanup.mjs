@@ -6,7 +6,7 @@ const server = await readFile(new URL('../server/storage-cleanup.ts', import.met
 const routes = await readFile(new URL('../server/index.ts', import.meta.url), 'utf8');
 const page = await readFile(new URL('../app/page.tsx', import.meta.url), 'utf8');
 
-assert.match(helper, /path\.dirname\(target\) !== await realpath\(releasesRoot\)/, '执行前必须阻止越界路径');
+assert.match(helper, /path\.dirname\(target\) !== await realpath\(allowedRoot\)/, '执行前必须阻止越界路径');
 assert.match(helper, /target === await realpath\(currentLink\)/, '执行前必须再次保护 current');
 assert.match(helper, /await inUse\(target\)/, '删除前必须检查运行进程');
 assert.match(helper, /rollback = entries\.find/, '必须保留完整回滚版本');

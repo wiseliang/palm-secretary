@@ -181,6 +181,15 @@ button { color: inherit; }
 .record-actions button:hover { border-color: var(--jade); color: var(--jade); }
 .record-actions button.danger:hover { border-color: #b54747; color: #b54747; }
 .record-list strong, .file-list strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+.file-list article > div:first-child { min-width: 0; }
+.file-list strong { white-space: normal; overflow: visible; overflow-wrap: anywhere; text-overflow: clip; }
+@media (max-width: 759px) {
+  .file-list article { display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; }
+  .file-list article > div:first-child { width: 100%; grid-template-columns: auto minmax(0, 1fr); align-items: baseline; gap: 6px 8px; }
+  .file-list article > div:first-child > strong { grid-column: 2; min-width: 0; line-height: 1.6; }
+  .file-list article > div:first-child > span:last-child { grid-column: 2; }
+  .file-list article > div:last-child { justify-content: flex-end; flex-wrap: wrap; }
+}
 .record-list span, .file-list span { color: var(--muted); font-size: 10px; }
 .file-list article { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .file-list article > div:first-child { min-width: 0; display: grid; gap: 5px; }
