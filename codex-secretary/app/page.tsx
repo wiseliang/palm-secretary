@@ -5646,7 +5646,7 @@ message.role === "assistant" &&
               >
                 <Stop size={15} weight="fill" />
               </button>
-            ) : (
+            )}
               <button
                 type="submit"
                 className="send-button"
