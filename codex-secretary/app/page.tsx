@@ -1494,6 +1494,10 @@ export default function Home() {
   const referenceDraft = useMemo(() => splitKnowledgeReference(draft), [draft]);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [focusedMessageId, setFocusedMessageId] = useState<string>();
+  const [inputPrompt, setInputPrompt] = useState<{
+    id: number; threadId: string; turnId: string;
+    questions: { id: string; question: string; isSecret?: boolean; options?: { label: string }[] | null }[];
+  }>();
   const [attachments, setAttachments] = useState<UploadedFile[]>([]);
   const [status, setStatus] = useState<ServerStatus>({});
   const [cliVersion, setCliVersion] = useState<CliVersionStatus>();
@@ -2369,7 +2373,7 @@ export default function Home() {
           type: string;
           threadId?: string;
           message?: string;
-          operation?: "turn.start" | "turn.interrupt" | "thread.subscribe" | "unknown";
+          operation?: "turn.start" | "turn.answer" | "turn.steer" | "turn.interrupt" | "thread.subscribe" | "unknown";
           clientRequestId?: string;
           replayed?: boolean;
           payload?: Record<string, unknown>;
@@ -2378,6 +2382,19 @@ export default function Home() {
           message = JSON.parse(event.data) as typeof message;
         } catch {
           setNotice("收到无法识别的服务器消息");
+          return;
+        }
+        if (message.type === "turn.input") {
+          const prompt = message.payload as typeof inputPrompt;
+          if (prompt?.threadId === threadIdRef.current) setInputPrompt(prompt);
+          return;
+        }
+        if (message.type === "turn.inputAnswered") {
+          setInputPrompt((current) => current?.id === message.payload?.id ? undefined : current);
+          return;
+        }
+        if (message.type === "turn.steered") {
+          if (message.payload?.threadId === threadIdRef.current) setNotice("补充指令已发送");
           return;
         }
         if (message.type === "turn.accepted") {
@@ -3445,6 +3462,14 @@ export default function Home() {
     if (referenceDraft.reference && storageMaintenance) { setNotice('请先退出存储维护模式，再发送知识库问题'); return; }
     try {
       const text = referenceDraft.reference ? withKnowledgeReference(question, referenceDraft.reference) : question;
+      if (running) {
+        if (attachments.length || referenceDraft.reference) throw new Error("运行中仅支持追加文字");
+        if (!threadId || !turnId || socketRef.current?.readyState !== WebSocket.OPEN) {
+          throw new Error("当前任务尚未就绪，请稍后再试");
+        }
+        socketRef.current.send(JSON.stringify({ type: "turn.steer", projectId, threadId, turnId, text }));
+        return;
+      }
       startTurn(text, attachments, threadId, storageMaintenance);
     } catch (error) { setNotice((error as Error).message); }
   }
@@ -5522,6 +5547,34 @@ message.role === "assistant" &&
               </section>
             </>
           )}
+          {running && inputPrompt && inputPrompt.threadId === threadId && inputPrompt.turnId === turnId && (
+            <form key={inputPrompt.id} className="composer-note" onSubmit={(event) => {
+              event.preventDefault();
+              if (socketRef.current?.readyState !== WebSocket.OPEN) return;
+              const answers = Object.fromEntries(new FormData(event.currentTarget));
+              socketRef.current.send(JSON.stringify({
+                type: "turn.answer", projectId, threadId, id: inputPrompt.id, answers,
+              }));
+            }}>
+              <strong>助理正在等待你的回答</strong>
+              {inputPrompt.questions.map((question) => (
+                <div key={question.id}>
+                  <label>
+                    {question.question}
+                    <input name={question.id} required autoComplete="off"
+                      type={question.isSecret ? "password" : "text"}
+                      list={!question.isSecret && question.options?.length ? `input-${inputPrompt.id}-${question.id}` : undefined} />
+                  </label>
+                  {!question.isSecret && question.options?.length ? (
+                    <datalist id={`input-${inputPrompt.id}-${question.id}`}>
+                      {question.options.map(({ label }) => <option key={label} value={label} />)}
+                    </datalist>
+                  ) : null}
+                </div>
+              ))}
+              <button type="submit" disabled={connection !== "已连接"}>提交回答</button>
+            </form>
+          )}
           <form className="composer" onSubmit={sendTask}>
             <input
               ref={fileRef}
@@ -5577,14 +5630,14 @@ message.role === "assistant" &&
                       projectRunningTask.threadId !== threadId
                     ? "本项目另一任务正在执行…"
                     : running
-                      ? "任务执行中…"
+                      ? "回复助理或调整任务方向…"
                       : "告诉 Codex 要完成什么…"
               }
               disabled={Boolean(activeProject?.archivedAt)}
               rows={1}
               aria-label="任务内容"
             />
-            {running ? (
+            {running && (
               <button
                 type="button"
                 className="stop-button"
@@ -5608,7 +5661,6 @@ message.role === "assistant" &&
               >
                 <ArrowUp size={19} weight="bold" />
               </button>
-            )}
           </form>
           <p className={`composer-note delivery-${deliveryState}`}>
             <span className="desktop-upload-hint">可拖入文件 · </span>

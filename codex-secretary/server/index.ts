@@ -179,6 +179,14 @@ function setSocketThread(socket: SocketLike, threadId: string): void {
   socketThreads.set(socket, threadId);
 }
 
+const inputQuestions = z.array(z.object({
+  id: z.string(), question: z.string(), isSecret: z.boolean().optional(),
+  options: z.array(z.object({ label: z.string() })).nullable().optional(),
+})).min(1);
+const pendingInput = new Map<number, {
+  threadId: string; turnId: string; questions: z.infer<typeof inputQuestions>;
+}>();
+
 bridge.on('message', async (message: Record<string, unknown>) => {
   if (typeof message.id === 'number' && typeof message.method === 'string') {
     if (message.method === 'item/commandExecution/requestApproval' || message.method === 'item/fileChange/requestApproval') {
@@ -195,6 +203,21 @@ bridge.on('message', async (message: Record<string, unknown>) => {
   const eventTurnId = typeof eventTurn?.id === 'string'
     ? eventTurn.id
     : typeof paramsRecord?.turnId === 'string' ? paramsRecord.turnId : undefined;
+  if (threadId && eventTurnId && typeof message.id === 'number' && message.method === 'item/tool/requestUserInput') {
+    const questions = inputQuestions.safeParse(paramsRecord?.questions);
+    if (!questions.success) { bridge.respond(message.id, { answers: {} }); return; }
+    const prompt = { threadId, turnId: eventTurnId, questions: questions.data };
+    pendingInput.set(message.id, prompt);
+    for (const socket of threadSockets.get(threadId) ?? []) {
+      socket.send(JSON.stringify({ type: 'turn.input', payload: { id: message.id, ...prompt } }));
+    }
+    return;
+  }
+  if (threadId && ['turn/completed', 'turn/failed', 'turn/interrupted'].includes(String(message.method))) {
+    for (const [id, prompt] of pendingInput) {
+      if (prompt.threadId === threadId && prompt.turnId === eventTurnId) pendingInput.delete(id);
+    }
+  }
   if (threadId && message.method === 'item/completed') {
     await projects.recordTaskExecution(threadId, eventTurnId, paramsRecord?.item).catch((error) => {
       app.log.warn({ err: error }, '任务执行记录写入失败');
@@ -251,6 +274,7 @@ const publishBridgeOnline = () => {
   broadcast({ type: 'codex.online' });
 };
 bridge.on('offline', (details) => {
+  pendingInput.clear();
   const generation = ++bridgeRecoveryGeneration;
   bridgeWasOffline = true;
   bridgeRecoveryPending = true;
@@ -927,9 +951,18 @@ app.get<{ Querystring: { path?: string; projectId?: string } }>('/api/files/down
       reply.header('Cache-Control', 'no-store').header('Referrer-Policy', 'no-referrer');
       return reply.redirect(`${config.downloadOrigin}/api/files/direct?ticket=${encodeURIComponent(ticket)}`, 302);
     }
-    reply.header('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(displayFileName(path.basename(filePath)))}`);
-    reply.header('X-Content-Type-Options', 'nosniff');
-    return reply.send(handle.createReadStream());
+    const { size } = await handle.stat();
+    const range = downloadRange(request.headers.range, size);
+    if (range === false) {
+      await handle.close();
+      return reply.code(416).header('Content-Range', `bytes */${size}`).send();
+    }
+    reply.header('Content-Type', 'application/octet-stream')
+      .header('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(displayFileName(path.basename(filePath)))}`)
+      .header('X-Content-Type-Options', 'nosniff').header('Accept-Ranges', 'bytes')
+      .header('Content-Length', range ? range.end - range.start + 1 : size);
+    if (range) reply.code(206).header('Content-Range', `bytes ${range.start}-${range.end}/${size}`);
+    return reply.send(handle.createReadStream(range || undefined));
   } catch {
     return reply.code(404).send({ error: '文件不存在' });
   }
@@ -994,6 +1027,8 @@ app.delete<{ Querystring: { path?: string; projectId?: string } }>('/api/files',
 
 const clientMessage = z.discriminatedUnion('type', [
   z.object({ type: z.literal('turn.start'), clientRequestId: z.string().uuid().optional(), projectId: z.string().min(1).max(64), threadId: z.string().optional(), text: z.string().min(1).max(50_000), attachments: z.array(z.string()).max(10).optional(), maintenance: z.literal('storage').optional() }),
+  z.object({ type: z.literal('turn.answer'), id: z.number().int(), projectId: z.string(), threadId: z.string(), answers: z.record(z.string(), z.string().max(10000)) }),
+  z.object({ type: z.literal('turn.steer'), projectId: z.string().min(1).max(64), threadId: z.string(), turnId: z.string(), text: z.string().trim().min(1).max(50_000) }),
   z.object({ type: z.literal('turn.interrupt'), threadId: z.string(), turnId: z.string() }),
   z.object({ type: z.literal('thread.subscribe'), projectId: z.string().min(1).max(64), threadId: z.string() }),
 ]);
@@ -1013,7 +1048,7 @@ app.get('/api/ws', { websocket: true }, (socket, request) => {
 
   socket.on('message', async (raw) => {
     let clientRequestId: string | undefined;
-    let operation: 'turn.start' | 'turn.interrupt' | 'thread.subscribe' | 'unknown' = 'unknown';
+    let operation: 'turn.start' | 'turn.answer' | 'turn.steer' | 'turn.interrupt' | 'thread.subscribe' | 'unknown' = 'unknown';
     try {
       if (!authenticated(request)) { socket.close(1008, 'unauthorized'); return; }
       const parsed = clientMessage.safeParse(JSON.parse(raw.toString()));
@@ -1025,6 +1060,9 @@ app.get('/api/ws', { websocket: true }, (socket, request) => {
       if (message.type === 'thread.subscribe') {
         projects.assertThreadProject(message.threadId, message.projectId);
         setSocketThread(socket, message.threadId);
+        for (const [id, prompt] of pendingInput) {
+          if (prompt.threadId === message.threadId) socket.send(JSON.stringify({ type: 'turn.input', payload: { id, ...prompt } }));
+        }
         return;
       }
       if (message.type === 'turn.start' && bridgeRecoveryPending) {
@@ -1033,6 +1071,32 @@ app.get('/api/ws', { websocket: true }, (socket, request) => {
       await bridge.ready();
       if (!authenticated(request)) { socket.close(1008, 'unauthorized'); return; }
       app.log.info({ event: message.type }, 'Codex App Server 已就绪');
+      if (message.type === 'turn.answer') {
+        projects.assertThreadProject(message.threadId, message.projectId);
+        const prompt = pendingInput.get(message.id);
+        if (!prompt || prompt.threadId !== message.threadId) throw new Error('提问已结束或已回答');
+        const answers = Object.fromEntries(prompt.questions.map(({ id }) => {
+          const answer = Object.hasOwn(message.answers, id) && message.answers[id];
+          if (!answer || !answer.trim()) throw new Error('请回答所有问题');
+          return [id, { answers: [answer] }];
+        }));
+        bridge.respond(message.id, { answers });
+        pendingInput.delete(message.id);
+        for (const peer of threadSockets.get(message.threadId) ?? []) {
+          peer.send(JSON.stringify({ type: 'turn.inputAnswered', payload: { id: message.id } }));
+        }
+        return;
+      }
+      if (message.type === 'turn.steer') {
+        projects.assertThreadProject(message.threadId, message.projectId);
+        await bridge.call('turn/steer', {
+          threadId: message.threadId,
+          expectedTurnId: message.turnId,
+          input: [{ type: 'text', text: message.text, text_elements: [] }],
+        });
+        socket.send(JSON.stringify({ type: 'turn.steered', payload: { threadId: message.threadId } }));
+        return;
+      }
       if (message.type === 'turn.interrupt') {
         await bridge.call('turn/interrupt', { threadId: message.threadId, turnId: message.turnId });
         return;
