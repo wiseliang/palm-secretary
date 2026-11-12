@@ -24,6 +24,9 @@ run /usr/local/bin/npm ci --include=dev --no-audit --no-fund
 run /usr/local/bin/npm run build
 run /usr/local/bin/node tests/download-ticket.mjs
 run /usr/local/bin/node tests/direct-download.mjs
+run /usr/local/bin/node tests/cli-update.mjs
+run /usr/local/bin/node tests/cli-cleanup.mjs
+run /usr/local/bin/node tests/storage-cleanup.mjs
 state=/home/codex/workspace/.palm
 /usr/local/bin/node -e 'const s=require(process.argv[1]); if(s.tasks.some(t=>t.status==="running"||t.submissionPending)) throw Error("????????????")' "$state/state.json"
 backup="/root/palm-backup-$(basename "$new")"
